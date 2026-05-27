@@ -216,7 +216,22 @@ box64context_t *NewBox64Context(int argc)
     context->exit_bridge = AddBridge(context->system, NULL, NULL, 0, NULL);
     // get handle to box64 itself
     #ifndef STATICBUILD
+    #ifdef ANDROID
+    // On Android with isolated linker namespaces, dlopen(NULL, ...) called from
+    // within our shared library cannot find wrapper symbols (my_*) because the
+    // library is loaded in a non-default namespace. Use dladdr + RTLD_NOLOAD to
+    // get a handle to the library that actually contains the wrappers.
+    {
+        Dl_info _box64_dl_info;
+        context->box64lib = NULL;
+        if (dladdr((void*)NewBox64Context, &_box64_dl_info) && _box64_dl_info.dli_fname)
+            context->box64lib = dlopen(_box64_dl_info.dli_fname, RTLD_NOW | RTLD_NOLOAD);
+        if (!context->box64lib)
+            context->box64lib = dlopen(NULL, RTLD_NOW|RTLD_GLOBAL);
+    }
+    #else
     context->box64lib = dlopen(NULL, RTLD_NOW|RTLD_GLOBAL);
+    #endif
     #endif
     context->dlprivate = NewDLPrivate();
 

@@ -368,7 +368,11 @@ else()
     set(DYNAREC OFF)
 endif()
 
-set(BOX64_ROOT ${CMAKE_SOURCE_DIR})
+if(NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+  set(BOX64_ROOT ${CMAKE_CURRENT_SOURCE_DIR})
+else()
+  set(BOX64_ROOT ${CMAKE_SOURCE_DIR})
+endif()
 
 add_definitions(-std=gnu11 -funwind-tables -fvisibility=hidden)
 
@@ -1288,18 +1292,37 @@ endif()
 set_source_files_properties(${OS_LINUX_SRC} ${ELFLOADER_SRC} ${INTERPRETER} ${WRAPPEDS} ${WRAPPEDS32} PROPERTIES COMPILE_OPTIONS "${CFLAGS}")
 
 # creates git_head.h
-if(DYNAREC)
-    add_custom_command(
-        OUTPUT "${BOX64_ROOT}/src/git_head.h"
-        COMMAND sh -c "echo \\\#define GITREV \\\"$(git rev-parse --short HEAD)\\\">\"${BOX64_ROOT}/src/git_head.h\""
-        DEPENDS ${DYNAREC_SRC} ${DYNAREC_ASM} ${DYNAREC_PASS} ${ELFLOADER_SRC} ${INTERPRETER} ${WRAPPEDS} ${WRAPPEDS32} ${WRAPPEDS_HEAD} ${WRAPPEDS32_HEAD}
-        VERBATIM)
+if(NOGIT)
+    # NOGIT mode: no sh/git available (e.g. Windows build). Write a stub at configure
+    # time and use cmake -E touch as the no-op regeneration command.
+    file(WRITE "${BOX64_ROOT}/src/git_head.h" "#define GITREV \"\"\n")
+    if(DYNAREC)
+        add_custom_command(
+            OUTPUT "${BOX64_ROOT}/src/git_head.h"
+            COMMAND ${CMAKE_COMMAND} -E touch "${BOX64_ROOT}/src/git_head.h"
+            DEPENDS ${DYNAREC_SRC} ${DYNAREC_ASM} ${DYNAREC_PASS} ${ELFLOADER_SRC} ${INTERPRETER} ${WRAPPEDS} ${WRAPPEDS32} ${WRAPPEDS_HEAD} ${WRAPPEDS32_HEAD}
+            VERBATIM)
+    else()
+        add_custom_command(
+            OUTPUT "${BOX64_ROOT}/src/git_head.h"
+            COMMAND ${CMAKE_COMMAND} -E touch "${BOX64_ROOT}/src/git_head.h"
+            DEPENDS ${ELFLOADER_SRC} ${INTERPRETER} ${WRAPPEDS} ${WRAPPEDS32} ${WRAPPEDS_HEAD} ${WRAPPEDS32_HEAD}
+            VERBATIM)
+    endif()
 else()
-    add_custom_command(
-        OUTPUT "${BOX64_ROOT}/src/git_head.h"
-        COMMAND sh -c "echo \\\#define GITREV \\\"$(git rev-parse --short HEAD)\\\">\"${BOX64_ROOT}/src/git_head.h\""
-        DEPENDS ${ELFLOADER_SRC} ${INTERPRETER} ${WRAPPEDS} ${WRAPPEDS32} ${WRAPPEDS_HEAD} ${WRAPPEDS32_HEAD}
-        VERBATIM)
+    if(DYNAREC)
+        add_custom_command(
+            OUTPUT "${BOX64_ROOT}/src/git_head.h"
+            COMMAND sh -c "echo \\\#define GITREV \\\"$(git rev-parse --short HEAD)\\\">\"${BOX64_ROOT}/src/git_head.h\""
+            DEPENDS ${DYNAREC_SRC} ${DYNAREC_ASM} ${DYNAREC_PASS} ${ELFLOADER_SRC} ${INTERPRETER} ${WRAPPEDS} ${WRAPPEDS32} ${WRAPPEDS_HEAD} ${WRAPPEDS32_HEAD}
+            VERBATIM)
+    else()
+        add_custom_command(
+            OUTPUT "${BOX64_ROOT}/src/git_head.h"
+            COMMAND sh -c "echo \\\#define GITREV \\\"$(git rev-parse --short HEAD)\\\">\"${BOX64_ROOT}/src/git_head.h\""
+            DEPENDS ${ELFLOADER_SRC} ${INTERPRETER} ${WRAPPEDS} ${WRAPPEDS32} ${WRAPPEDS_HEAD} ${WRAPPEDS32_HEAD}
+            VERBATIM)
+    endif()
 endif()
 
 add_custom_target(generate_git_head_target
@@ -1379,12 +1402,12 @@ if(_x86_64 OR _aarch64 OR _ppc64le)
 endif()
 
 if(NOT _x86 AND NOT _x86_64)
-  file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
-  file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/share/box64)
-  configure_file(${CMAKE_SOURCE_DIR}/tests/box64-bash ${CMAKE_BINARY_DIR}/bin/box64-bash COPYONLY)
-  configure_file(${CMAKE_SOURCE_DIR}/system/box64-python ${CMAKE_BINARY_DIR}/bin/box64-python COPYONLY)
-  configure_file(${CMAKE_SOURCE_DIR}/system/sitecustomize.py ${CMAKE_BINARY_DIR}/share/box64/sitecustomize.py COPYONLY)
-  file(CHMOD ${CMAKE_BINARY_DIR}/bin/box64-python
+  file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/bin)
+  file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/share/box64)
+  configure_file(${CMAKE_CURRENT_SOURCE_DIR}/tests/box64-bash ${CMAKE_CURRENT_BINARY_DIR}/bin/box64-bash COPYONLY)
+  configure_file(${CMAKE_CURRENT_SOURCE_DIR}/system/box64-python ${CMAKE_CURRENT_BINARY_DIR}/bin/box64-python COPYONLY)
+  configure_file(${CMAKE_CURRENT_SOURCE_DIR}/system/sitecustomize.py ${CMAKE_CURRENT_BINARY_DIR}/share/box64/sitecustomize.py COPYONLY)
+  file(CHMOD ${CMAKE_CURRENT_BINARY_DIR}/bin/box64-python
       FILE_PERMISSIONS
       OWNER_READ OWNER_WRITE OWNER_EXECUTE
       GROUP_READ GROUP_EXECUTE
@@ -1392,9 +1415,9 @@ if(NOT _x86 AND NOT _x86_64)
   if(NOT TERMUX)
    install(TARGETS ${BOX64} RUNTIME DESTINATION bin)
     if(NOT NO_LIB_INSTALL)
-     install(PROGRAMS ${CMAKE_SOURCE_DIR}/tests/box64-bash DESTINATION bin)
-     install(PROGRAMS ${CMAKE_SOURCE_DIR}/system/box64-python DESTINATION bin)
-     install(FILES ${CMAKE_SOURCE_DIR}/system/sitecustomize.py DESTINATION share/box64)
+     install(PROGRAMS ${CMAKE_CURRENT_SOURCE_DIR}/tests/box64-bash DESTINATION bin)
+     install(PROGRAMS ${CMAKE_CURRENT_SOURCE_DIR}/system/box64-python DESTINATION bin)
+     install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/system/sitecustomize.py DESTINATION share/box64)
     endif()
   else()
    install(TARGETS ${BOX64} RUNTIME DESTINATION ${TERMUX_PATH}/usr/bin)

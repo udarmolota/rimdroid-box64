@@ -29,7 +29,9 @@ void EXPORT my___libc_init(x64emu_t* emu, void* raw_args , void (*onexit)(void) 
     SetRBP(emu, Pop64(emu));    // restore RBP
     emu->quit = 1; // finished!
 }
-#else
+#endif
+// my___libc_start_main must be compiled on all platforms including Android, because
+// Linux x86_64 ELFs (e.g. Unity games) call __libc_start_main as their entry point.
 EXPORT int32_t my___libc_start_main(x64emu_t* emu, int (*main) (int, char * *, char * *), int argc, char * * ubp_av, void (*init) (void), void (*fini) (void), void (*rtld_fini) (void), void (* stack_end))
 {
     (void)argc; (void)ubp_av; (void)fini; (void)rtld_fini; (void)stack_end;
@@ -137,6 +139,5 @@ int32_t EXPORT my32___libc_start_main(x64emu_t* emu, int *(main) (int, char * *,
     emu->quit = 1; // finished!
     return 0;
 }
-#endif
 #endif
 #endif
