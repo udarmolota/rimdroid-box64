@@ -900,6 +900,165 @@ static int getSymbolInDataMaps(library_t*lib, const char* name, int noweak, uint
     }
     return 0;
 }
+
+#ifdef ANDROID
+// Android bionic compatibility shims for missing glibc-internal symbols.
+// These stubs are returned by getSymbolInSymbolMaps when bionic does not
+// export the names the x86_64 ELF expects.
+
+#include <ctype.h>
+#include <sys/wait.h>
+#include <sys/resource.h>
+
+// __ctype_b_loc — glibc ctype flag table (unsigned short, 384 entries, ptr to index 128)
+// Flag bits match glibc's <bits/ctype.h>: upper=0x100 lower=0x200 alpha=0x400 digit=0x800
+// xdigit=0x1000 space=0x2000 print=0x4000 graph=0x8000 blank=0x01 cntrl=0x02 punct=0x04 alnum=0x08
+static unsigned short _abctype_b_table[384];
+static unsigned short *_abctype_b_ptr = NULL;
+static const unsigned short **android__ctype_b_loc(void) {
+    if(!_abctype_b_ptr) {
+        for(int i = 0; i < 384; i++) {
+            int c = i - 128;
+            unsigned short v = 0;
+            if(c >= 0 && c <= 255) {
+                unsigned char uc = (unsigned char)c;
+                if(isupper(uc)) v |= 0x0100;
+                if(islower(uc)) v |= 0x0200;
+                if(isalpha(uc)) v |= 0x0400;
+                if(isdigit(uc)) v |= 0x0800;
+                if(isxdigit(uc)) v |= 0x1000;
+                if(isspace(uc)) v |= 0x2000;
+                if(isprint(uc)) v |= 0x4000;
+                if(isgraph(uc)) v |= 0x8000;
+                if(isblank(uc)) v |= 0x0001;
+                if(iscntrl(uc)) v |= 0x0002;
+                if(ispunct(uc)) v |= 0x0004;
+                if(isalnum(uc)) v |= 0x0008;
+            }
+            _abctype_b_table[i] = v;
+        }
+        _abctype_b_ptr = &_abctype_b_table[128];
+    }
+    return (const unsigned short **)&_abctype_b_ptr;
+}
+
+// __ctype_tolower_loc / __ctype_toupper_loc — int32 case-conversion tables
+static int32_t _abctype_tolower_table[384];
+static int32_t *_abctype_tolower_ptr = NULL;
+static const int32_t **android__ctype_tolower_loc(void) {
+    if(!_abctype_tolower_ptr) {
+        for(int i = 0; i < 384; i++) {
+            int c = i - 128;
+            _abctype_tolower_table[i] = (c >= 0 && c <= 255) ? (int32_t)tolower((unsigned char)c) : c;
+        }
+        _abctype_tolower_ptr = &_abctype_tolower_table[128];
+    }
+    return (const int32_t **)&_abctype_tolower_ptr;
+}
+static int32_t _abctype_toupper_table[384];
+static int32_t *_abctype_toupper_ptr = NULL;
+static const int32_t **android__ctype_toupper_loc(void) {
+    if(!_abctype_toupper_ptr) {
+        for(int i = 0; i < 384; i++) {
+            int c = i - 128;
+            _abctype_toupper_table[i] = (c >= 0 && c <= 255) ? (int32_t)toupper((unsigned char)c) : c;
+        }
+        _abctype_toupper_ptr = &_abctype_toupper_table[128];
+    }
+    return (const int32_t **)&_abctype_toupper_ptr;
+}
+
+// pthread_setcanceltype/state — bionic has no thread cancellation, stub succeeds silently
+static int android_pthread_setcancel(int val, int *old) {
+    (void)val; if(old) *old = 0; return 0;
+}
+
+// __assert_fail(msg, file, line, func) — bionic uses __assert2(file,line,func,msg)
+static void android__assert_fail(const char *msg, const char *file, unsigned int line, const char *func) {
+    fprintf(stderr, "%s:%u: %s: Assertion '%s' failed.\n", file, line, func, msg);
+    abort();
+}
+
+// __rawmemchr — like memchr but no length limit (caller guarantees char exists)
+static void *android__rawmemchr(const void *s, int c) {
+    const unsigned char *p = (const unsigned char *)s;
+    while(*p != (unsigned char)c) ++p;
+    return (void *)p;
+}
+
+// __fdelt_chk — glibc bounds-check for fd_set slot; abort on out-of-range fd
+static long android__fdelt_chk(long d) {
+    if(d < 0 || d >= 1024) abort();
+    return d / (long)(8 * sizeof(long));
+}
+
+// gettext / textdomain stubs — no libintl on Android, return string as-is
+static char *android_gettext_stub(const char *s) { return (char *)s; }
+static char *android_textdomain_stub(const char *s) { return (char *)(s ? s : "messages"); }
+
+// getdtablesize — POSIX maximum fd count
+static int android_getdtablesize(void) { return 1024; }
+
+// wait3 — not exported by bionic, emulate with wait4
+static pid_t android_wait3(int *status, int options, struct rusage *rusage) {
+    return wait4(-1, status, options, rusage);
+}
+
+// wordexp — bionic has no wordexp; return WRDE_NOSPACE so callers skip expansion
+static int android_wordexp_stub(const char *w, void *p, int f) {
+    (void)w; (void)p; (void)f; return 4;
+}
+
+static void *android_symbol_fallback(const char *name) {
+    // errno location
+    if(!strcmp(name, "__errno_location") || !strcmp(name, "__h_errno_location"))
+        return dlsym(RTLD_DEFAULT, "__errno");
+    // ctype tables
+    if(!strcmp(name, "__ctype_b_loc"))       return android__ctype_b_loc;
+    if(!strcmp(name, "__ctype_tolower_loc")) return android__ctype_tolower_loc;
+    if(!strcmp(name, "__ctype_toupper_loc")) return android__ctype_toupper_loc;
+    // locale functions: bionic exports these without the __ prefix
+    if(!strcmp(name, "__nl_langinfo_l"))  return dlsym(RTLD_DEFAULT, "nl_langinfo_l");
+    if(!strcmp(name, "__strtof_l"))       return dlsym(RTLD_DEFAULT, "strtof_l");
+    if(!strcmp(name, "__strtod_l"))       return dlsym(RTLD_DEFAULT, "strtod_l");
+    if(!strcmp(name, "__strcoll_l"))      return dlsym(RTLD_DEFAULT, "strcoll_l");
+    if(!strcmp(name, "__strxfrm_l"))      return dlsym(RTLD_DEFAULT, "strxfrm_l");
+    if(!strcmp(name, "__strftime_l"))     return dlsym(RTLD_DEFAULT, "strftime_l");
+    if(!strcmp(name, "__wcscoll_l"))      return dlsym(RTLD_DEFAULT, "wcscoll_l");
+    if(!strcmp(name, "__wcsxfrm_l"))      return dlsym(RTLD_DEFAULT, "wcsxfrm_l");
+    if(!strcmp(name, "__wcsftime_l"))     return dlsym(RTLD_DEFAULT, "wcsftime_l");
+    if(!strcmp(name, "__iswctype_l"))     return dlsym(RTLD_DEFAULT, "iswctype_l");
+    if(!strcmp(name, "__wctype_l"))       return dlsym(RTLD_DEFAULT, "wctype_l");
+    if(!strcmp(name, "__uselocale"))      return dlsym(RTLD_DEFAULT, "uselocale");
+    if(!strcmp(name, "__newlocale"))      return dlsym(RTLD_DEFAULT, "newlocale");
+    if(!strcmp(name, "__freelocale"))     return dlsym(RTLD_DEFAULT, "freelocale");
+    if(!strcmp(name, "__duplocale"))      return dlsym(RTLD_DEFAULT, "duplocale");
+    if(!strcmp(name, "__towlower_l"))     return dlsym(RTLD_DEFAULT, "towlower_l");
+    if(!strcmp(name, "__towupper_l"))     return dlsym(RTLD_DEFAULT, "towupper_l");
+    if(!strcmp(name, "__xpg_strerror_r")) return dlsym(RTLD_DEFAULT, "strerror_r");
+    if(!strcmp(name, "__strtok_r"))       return dlsym(RTLD_DEFAULT, "strtok_r");
+    if(!strcmp(name, "__xpg_basename"))   return dlsym(RTLD_DEFAULT, "basename");
+    // pthread cancellation: no-op (bionic doesn't support it)
+    if(!strcmp(name, "pthread_setcanceltype") || !strcmp(name, "pthread_setcancelstate"))
+        return android_pthread_setcancel;
+    // assert
+    if(!strcmp(name, "__assert_fail")) return android__assert_fail;
+    // raw memory / fd check
+    if(!strcmp(name, "__rawmemchr"))  return android__rawmemchr;
+    if(!strcmp(name, "__fdelt_chk"))  return android__fdelt_chk;
+    // gettext (no i18n on Android)
+    if(!strcmp(name, "gettext") || !strcmp(name, "ngettext") || !strcmp(name, "dgettext") || !strcmp(name, "dcgettext"))
+        return android_gettext_stub;
+    if(!strcmp(name, "textdomain") || !strcmp(name, "bindtextdomain") || !strcmp(name, "bind_textdomain_codeset"))
+        return android_textdomain_stub;
+    // misc
+    if(!strcmp(name, "getdtablesize")) return android_getdtablesize;
+    if(!strcmp(name, "wait3"))         return android_wait3;
+    if(!strcmp(name, "wordexp"))       return android_wordexp_stub;
+    return NULL;
+}
+#endif // ANDROID
+
 static int getSymbolInSymbolMaps(library_t*lib, const char* name, int noweak, uintptr_t *addr, uintptr_t *size, int* weak)
 {
     const khint_t hash = kh_hash(symbolmap, name);
@@ -990,12 +1149,8 @@ static int getSymbolInSymbolMaps(library_t*lib, const char* name, int noweak, ui
                 symbol = GetNativeSymbolUnversioned(lib->w.lib, newname);
             }
             #ifdef ANDROID
-            // On Android, bionic renamed some glibc internal functions.
-            // __errno_location() -> __errno() : both return int*, same calling convention.
-            if(!symbol) {
-                if(!strcmp(name, "__errno_location") || !strcmp(name, "__h_errno_location"))
-                    symbol = dlsym(lib->w.lib, "__errno");
-            }
+            if(!symbol)
+                symbol = android_symbol_fallback(name);
             #endif
             #endif
             if(!symbol) {
