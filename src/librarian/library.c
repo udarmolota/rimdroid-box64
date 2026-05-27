@@ -1222,6 +1222,10 @@ static int getSymbolInSymbolMaps(library_t*lib, const char* name, int noweak, ui
                     strcat(newname, name);
                     symbol = GetNativeSymbolUnversioned(lib->w.lib, newname);
                 }
+                #ifdef ANDROID
+                if(!symbol)
+                    symbol = android_symbol_fallback(name);
+                #endif
                 #endif
                 if(!symbol) {
                     printf_dump(LOG_INFO, "Warning, function %s not found in lib %s\n", name, lib->name);
