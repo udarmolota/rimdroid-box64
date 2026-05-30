@@ -3466,6 +3466,24 @@ void ctSetup()
 }
 #endif
 
+// RimDroid: Android's bionic libc lacks bcmp and getprotobyname_r, which
+// RimWorld 1.6's Mono (libmonobdwgc-2.0.so) imports.  As plain GO entries box64
+// tried to resolve them from native libc and failed ("Symbol not found" → PLT
+// relocation error → "Failed to load mono").  Provide them here (GOM) so box64
+// exports its own implementations.
+EXPORT int my_bcmp(void* a, void* b, size_t n)
+{
+    return memcmp(a, b, n);   // bcmp: 0 == equal, like memcmp; callers only test ==0
+}
+EXPORT int my_getprotobyname_r(void* name, void* result_buf, void* buf, size_t buflen, void* result)
+{
+    // Stub: no /etc/protocols database under emulation.  Report "not found"
+    // (return 0, *result = NULL) — enough for Mono to load; rarely called at startup.
+    (void)name; (void)result_buf; (void)buf; (void)buflen;
+    if (result) *(void**)result = NULL;
+    return 0;
+}
+
 EXPORT void my___register_frame_info(void* a, void* b)
 {
     // nothing
