@@ -254,8 +254,15 @@ static void applyCustomRules()
 
 #ifndef _WIN32
     if (box64env.dynarec_perf_map) {
-        char pathname[32];
-        snprintf(pathname, sizeof(pathname), "/tmp/perf-%d.map", getpid());
+        char pathname[512];
+        // On Android /tmp is not writable; write next to HOME (the game dir,
+        // app-writable) so the perf map can be pulled for JIT->guest symbol
+        // correlation.  Falls back to /tmp on a normal Linux host.
+        const char* home = getenv("HOME");
+        if (home && home[0])
+            snprintf(pathname, sizeof(pathname), "%s/perf-%d.map", home, getpid());
+        else
+            snprintf(pathname, sizeof(pathname), "/tmp/perf-%d.map", getpid());
         SET_BOX64ENV(dynarec_perf_map_fd, open(pathname, O_CREAT | O_RDWR | O_APPEND, S_IRUSR | S_IWUSR));
     }
     if (box64env.emulated_libs && my_context) {

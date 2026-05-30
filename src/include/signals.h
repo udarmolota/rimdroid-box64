@@ -8,14 +8,23 @@
 typedef void (*sighandler_t)(int);
 
 #ifdef ANDROID
+// `act`/`oldact` point at the GUEST's (x86_64 Linux glibc) sigaction struct,
+// whose ABI is FIXED regardless of host: handler at offset 0 (8 bytes), then
+// __sigset_t sa_mask (128 bytes) at offset 8, then sa_flags (4 bytes) at offset
+// 136, then sa_restorer at offset 144.  The previous Android definition mirrored
+// bionic's layout (sa_flags at offset 0), so box64 read handler and flags from
+// swapped offsets — registering a garbage handler (e.g. 0x20000000 taken from
+// sa_mask bytes) and storming on every guest SIGSEGV (Mono uses SIGSEGV for null
+// checks).  Use an explicit 128-byte mask so offsets match x86_64 even on bionic
+// (whose own sigset_t is only 8 bytes).
 typedef struct x64_sigaction_s {
-	int sa_flags;
 	union {
 	  sighandler_t _sa_handler;
 	  void (*_sa_sigaction)(int, siginfo_t *, void *);
-	} _u;
-	sigset_t sa_mask;
-	void (*sa_restorer)(void);
+	} _u;                          // offset 0   (8 bytes)
+	unsigned long sa_mask[16];     // offset 8   (128 bytes = x86_64 __sigset_t)
+	uint32_t sa_flags;             // offset 136
+	void (*sa_restorer)(void);     // offset 144
 } x64_sigaction_t;
 #else
 typedef struct x64_sigaction_s {

@@ -15,6 +15,7 @@
 #ifndef ANDROID
 #include <execinfo.h>
 #endif
+#include <fcntl.h>
 
 #include "x64_signals.h"
 #include "os.h"
@@ -84,10 +85,43 @@ uint64_t RunFunctionHandler(x64emu_t* emu, int* exit, int dynarec, x64_ucontext_
         va_list va;
         va_start (va, nargs);
         int sig = va_arg(va, int);
+        siginfo_t* _info = NULL;
+        if(nargs >= 2) _info = va_arg(va, siginfo_t*);
         va_end (va);
         printf_log(LOG_NONE, "%04d|Warning, calling Signal %d function handler %s\n", GetTID(), sig, fnc?"SIG_IGN":"SIG_DFL");
         if(fnc==0) {
             printf_log(LOG_NONE, "Unhandled signal caught, aborting\n");
+            { const char* _h=getenv("HOME"); char _p[512],_b[256];
+              snprintf(_p,sizeof(_p),"%s/abort_site.log",_h?_h:"/data/local/tmp");
+              int _f=open(_p,O_WRONLY|O_CREAT|O_APPEND,0644);
+              if(_f>=0){
+                  void* _si_addr = _info ? _info->si_addr : (void*)-1UL;
+                  int _si_code  = _info ? _info->si_code  : -1;
+                  int _n=snprintf(_b,sizeof(_b),
+                      "ABORT: SIG_DFL sig=%d RIP=0x%lx RSP=0x%lx si_addr=%p si_code=%d\n",
+                      sig,(unsigned long)R_RIP,(unsigned long)R_RSP,_si_addr,_si_code);
+                  write(_f,_b,_n);
+                  // Dump /proc/self/maps so we can see what is actually mapped at crash time
+                  { int _fm=open("/proc/self/maps",O_RDONLY);
+                    if(_fm>=0){ char _mb[512]; int _nr;
+                        _nr=snprintf(_mb,sizeof(_mb),"=== /proc/self/maps (sig=%d RIP=0x%lx) ===\n",sig,(unsigned long)R_RIP);
+                        write(_f,_mb,_nr);
+                        while((_nr=read(_fm,_mb,sizeof(_mb)))>0) write(_f,_mb,_nr);
+                        close(_fm);
+                    }
+                  }
+                  close(_f);
+              }
+            }
+            // Fix SIGABRT recursion: abort() → SIGABRT → box64 handler → here (sig=SIGABRT) → abort() → ...
+            // Break the loop by resetting SIGABRT to SIG_DFL before raising, so OS writes a tombstone.
+            if(sig == SIGABRT) {
+                struct sigaction _dfl; memset(&_dfl,0,sizeof(_dfl));
+                _dfl.sa_handler = SIG_DFL;
+                sigaction(SIGABRT, &_dfl, NULL);
+                raise(SIGABRT);
+                _exit(134); // fallback
+            }
             abort();
         }
         return 0;
@@ -769,6 +803,58 @@ extern int box64_exit_code;
 
 void my_box64signalhandler(int32_t sig, siginfo_t* info, void * ucntx)
 {
+    // --- RimDroid: per-signal file logging, GATED (RIMDROID_SIGLOG=1) ---------
+    // box64's normal bridge mechanism faults thousands of times (si_addr in the
+    // 0x3b34xxxx bridge region, si_code=2) and handles each internally.  Logging
+    // every one to signal_debug.log + crash_signal.log (open/write/close ×2 per
+    // signal) added catastrophic overhead — ~34k faults during init alone, which
+    // is the real reason runs "hung"/crawled.  OFF by default; enable only to
+    // capture a specific crash.  (The fatal-crash path still records sigsegv_fault.log.)
+    static int rd_siglog = -1;
+    if (rd_siglog < 0) { const char* _e = getenv("RIMDROID_SIGLOG"); rd_siglog = (_e && _e[0]=='1') ? 1 : 0; }
+    if (rd_siglog) {
+        const char* sname = "?";
+        int raw_sig = sig;
+        if(raw_sig == SIGILL)       sname = "SIGILL";
+        else if(raw_sig == SIGBUS)  sname = "SIGBUS";
+        else if(raw_sig == SIGSEGV) sname = "SIGSEGV";
+        else if(raw_sig == SIGABRT) sname = "SIGABRT";
+        void* fault_addr = info ? info->si_addr : (void*)-1;
+        int si_code = info ? info->si_code : -1;
+        ucontext_t* _up = (ucontext_t*)ucntx;
+#ifdef __aarch64__
+        void* native_pc = _up ? (void*)_up->uc_mcontext.pc : (void*)-1;
+#else
+        void* native_pc = (void*)-1;
+#endif
+        const char* home = getenv("HOME");
+        char path[512];
+        snprintf(path, sizeof(path), "%s/signal_debug.log", home ? home : "/data/local/tmp");
+        int fd = open(path, O_WRONLY|O_CREAT|O_APPEND, 0644);
+        if(fd >= 0) {
+            char buf[256];
+            int n = snprintf(buf, sizeof(buf),
+                "=== SIGNAL %d (%s) addr=%p code=%d native_pc=%p ===\n",
+                raw_sig, sname, fault_addr, si_code, native_pc);
+            write(fd, buf, n);
+            close(fd);
+        }
+        // Write SIGSEGV/SIGBUS/SIGILL to separate crash file as well
+        if(raw_sig == SIGSEGV || raw_sig == SIGBUS || raw_sig == SIGILL) {
+            char path2[512];
+            snprintf(path2, sizeof(path2), "%s/crash_signal.log", home ? home : "/data/local/tmp");
+            int fd2 = open(path2, O_WRONLY|O_CREAT|O_APPEND, 0644);
+            if(fd2 >= 0) {
+                char buf2[512];
+                int n2 = snprintf(buf2, sizeof(buf2),
+                    "=== %s si_addr=%p si_code=%d native_pc=%p tid=%d ===\n",
+                    sname, fault_addr, si_code, native_pc, GetTID());
+                write(fd2, buf2, n2);
+                close(fd2);
+            }
+        }
+    }
+    // -------------------------------------------------------------------------
     sig = signal_to_x64(sig);
     // sig==X64_SIGSEGV || sig==X64_SIGBUS || sig==X64_SIGILL || sig==X64_SIGABRT here!
     int log_minimum = (BOX64ENV(showsegv))?LOG_NONE:((((sig==X64_SIGSEGV) || (sig==X64_SIGILL)) && my_context->is_sigaction[sig])?LOG_DEBUG:LOG_INFO);
@@ -818,6 +904,24 @@ void my_box64signalhandler(int32_t sig, siginfo_t* info, void * ucntx)
     int db_searched = 0;
     uintptr_t x64pc = (uintptr_t)-1;
     x64pc = R_RIP;
+    // --- RimDroid: log x86_64 RIP into signal_debug.log ---
+    {
+        const char* home2 = getenv("HOME");
+        char path2[512];
+        snprintf(path2, sizeof(path2), "%s/signal_debug.log", home2 ? home2 : "/data/local/tmp");
+        int fd2 = open(path2, O_WRONLY|O_CREAT|O_APPEND, 0644);
+        if(fd2 >= 0) {
+            char buf2[256];
+            int n2 = snprintf(buf2, sizeof(buf2),
+                "    x86_64 RIP=0x%lx RSP=0x%lx tid=%d\n",
+                (unsigned long)x64pc,
+                (unsigned long)R_RSP,
+                GetTID());
+            write(fd2, buf2, n2);
+            close(fd2);
+        }
+    }
+    // --------------------------------------------------------
     if(((sig==X64_SIGBUS) && ((addr!=pc) || ((sig==X64_SIGSEGV) && emu->segs[_CS]==0x23 && ((uintptr_t)addr>>32)==0xffffffff)))
 #ifdef RV64
     || ((sig==X64_SIGSEGV) && (addr==pc) && (info->si_code==2) && (!checkMutex(is_memprot_locked) && getProtection_fast((uintptr_t)addr)==(PROT_READ|PROT_WRITE|PROT_EXEC)))
@@ -1319,6 +1423,25 @@ dynarec_log(/*LOG_DEBUG*/LOG_INFO, "%04d|Repeated SIGSEGV with Access error on %
         }
     }
     relockMutex(Locks);
+    // --- RimDroid: log SIGSEGV fault info to dedicated file ---
+    if(sig == X64_SIGSEGV) {
+        const char* _sh = getenv("HOME");
+        char _sp[512];
+        snprintf(_sp, sizeof(_sp), "%s/sigsegv_fault.log", _sh ? _sh : "/data/local/tmp");
+        int _sfd = open(_sp, O_WRONLY|O_CREAT|O_APPEND, 0644);
+        if(_sfd >= 0) {
+            char _sbuf[512];
+            int _sn = snprintf(_sbuf, sizeof(_sbuf),
+                "SIGSEGV: addr=%p code=%d x64_RIP=0x%lx x64_RSP=0x%lx native_pc=%p tid=%d handler=0x%lx\n",
+                (void*)info->si_addr, info->si_code,
+                (unsigned long)x64pc, (unsigned long)R_RSP,
+                pc, tid,
+                (unsigned long)my_context->signals[sig]);
+            write(_sfd, _sbuf, _sn);
+            close(_sfd);
+        }
+    }
+    // ----------------------------------------------------------
     if(my_context->signals[sig] && my_context->signals[sig]!=1) {
         my_sigactionhandler_oldcode(emu, sig, my_context->is_sigaction[sig]?0:1, info, ucntx, &old_code, db, x64pc);
         return;
@@ -1330,12 +1453,39 @@ dynarec_log(/*LOG_DEBUG*/LOG_INFO, "%04d|Repeated SIGSEGV with Access error on %
     }
 }
 
+// RimDroid: async-signal-safe trace for Mono Boehm-GC stop-the-world signals
+// (SIG_SUSPEND=SIGPWR/30, SIG_THR_RESTART=SIGXCPU/24).  Writes to $HOME/gc_signal.log.
+static void rd_gctrace(int sig, const char* what) {
+    if (sig != X64_SIGPWR && sig != X64_SIGXCPU) return;
+    // Off by default: this writes a file per GC signal (thousands during a
+    // GC-heavy load) and badly slows the run.  Enable with RIMDROID_GCTRACE=1
+    // only for diagnosing the GC suspend/restart handshake.
+    static int en = -1;
+    if (en < 0) { const char* e = getenv("RIMDROID_GCTRACE"); en = (e && e[0]=='1') ? 1 : 0; }
+    if (!en) return;
+    const char* home = getenv("HOME");
+    char path[512];
+    snprintf(path, sizeof(path), "%s/gc_signal.log", home ? home : "/data/local/tmp");
+    int fd = open(path, O_WRONLY|O_CREAT|O_APPEND, 0644);
+    if (fd >= 0) {
+        char buf[160];
+        int n = snprintf(buf, sizeof(buf), "GCSIG sig=%d tid=%d %s handler=%p\n",
+                         sig, GetTID(), what,
+                         (sig>=0 && sig<=MAX_SIGNAL) ? (void*)my_context->signals[sig] : NULL);
+        write(fd, buf, n);
+        close(fd);
+    }
+}
+
 void my_sigactionhandler(int32_t sig, siginfo_t* info, void * ucntx)
 {
     sig = signal_to_x64(sig);
+    rd_gctrace(sig, "ENTER");
     x64emu_t* emu = thread_get_emu_no_create();
-    if (defer_signal(emu, sig, info))
+    if (defer_signal(emu, sig, info)) {
+        rd_gctrace(sig, "DEFERRED(return)");
         return;
+    }
     void* pc = NULL;
     #ifdef DYNAREC
     ucontext_t *p = (ucontext_t *)ucntx;
@@ -1360,7 +1510,9 @@ void my_sigactionhandler(int32_t sig, siginfo_t* info, void * ucntx)
             printf_log_prefix(0, LOG_INFO, "(x64_addr=%p-%p, block:%p-%p)\n", (void*)db->x64_addr, (void*)db->x64_addr+db->x64_size, db->actual_block, db->actual_block+db->size);
         #endif
     }
+    rd_gctrace(sig, "FORWARD->guest");
     my_sigactionhandler_oldcode(emu, sig, 0, info, ucntx, NULL, db, x64pc);
+    rd_gctrace(sig, "RETURNED<-guest");
 }
 #define MY_SIGHANDLER ((signum==X64_SIGSEGV || signum==X64_SIGBUS || signum==X64_SIGILL || signum==X64_SIGABRT)?my_box64signalhandler:my_sigactionhandler)
 EXPORT sighandler_t my_signal(x64emu_t* emu, int signum, sighandler_t handler)
@@ -1396,6 +1548,21 @@ EXPORT sighandler_t my_sysv_signal(x64emu_t* emu, int signum, sighandler_t handl
 int EXPORT my_sigaction(x64emu_t* emu, int signum, const x64_sigaction_t *act, x64_sigaction_t *oldact)
 {
     printf_log(LOG_DEBUG, "Sigaction(signum=%d, act=%p(f=%p, flags=0x%x), old=%p)\n", signum, act, act?act->_u._sa_handler:NULL, act?act->sa_flags:0, oldact);
+    // RimDroid: trace Boehm-GC suspend/restart handler registration (gated).
+    static int rd_reg_en = -1;
+    if (rd_reg_en < 0) { const char* e = getenv("RIMDROID_GCTRACE"); rd_reg_en = (e && e[0]=='1') ? 1 : 0; }
+    if (rd_reg_en && (signum == X64_SIGPWR || signum == X64_SIGXCPU)) {
+        const char* home = getenv("HOME");
+        char path[512];
+        snprintf(path, sizeof(path), "%s/gc_signal.log", home ? home : "/data/local/tmp");
+        int fd = open(path, O_WRONLY|O_CREAT|O_APPEND, 0644);
+        if (fd >= 0) {
+            char b[200];
+            int n = snprintf(b, sizeof(b), "GCSIG REGISTER sigaction signum=%d handler=%p flags=0x%x tid=%d\n",
+                             signum, act?act->_u._sa_handler:NULL, act?(unsigned)act->sa_flags:0, GetTID());
+            write(fd, b, n); close(fd);
+        }
+    }
     if(signum<0 || signum>MAX_SIGNAL) {
         errno = EINVAL;
         return -1;
@@ -1410,7 +1577,10 @@ int EXPORT my_sigaction(x64emu_t* emu, int signum, const x64_sigaction_t *act, x
     struct sigaction old = {0};
     uintptr_t old_handler = my_context->signals[signum];
     if(act) {
-        newact.sa_mask = act->sa_mask;
+        // sa_mask is the x86_64 128-byte mask; copy the low bytes into the host
+        // (bionic) sigset_t, which is smaller.
+        memcpy(&newact.sa_mask, act->sa_mask,
+               sizeof(newact.sa_mask) < sizeof(act->sa_mask) ? sizeof(newact.sa_mask) : sizeof(act->sa_mask));
         newact.sa_flags = act->sa_flags&~0x04000000;  // No sa_restorer...
         if(act->sa_flags&0x04) {
             my_context->signals[signum] = (uintptr_t)act->_u._sa_sigaction;
@@ -1435,8 +1605,17 @@ int EXPORT my_sigaction(x64emu_t* emu, int signum, const x64_sigaction_t *act, x
     if(signum!=X64_SIGSEGV && signum!=X64_SIGBUS && signum!=X64_SIGILL && signum!=X64_SIGABRT)
         ret = sigaction(signal_from_x64(signum), act?&newact:NULL, oldact?&old:NULL);
     if(oldact) {
+        // Zero-initialize the whole struct first.
+        // On Android the x64_sigaction_t puts sa_flags (int, 4 bytes) at offset 0
+        // followed by 4 bytes of implicit C padding before the 8-byte handler pointer
+        // at offset 8.  The x86_64 Linux ABI puts the handler pointer at offset 0
+        // (8 bytes).  If those 4 pad bytes are left uninitialised, Mono reads them
+        // as part of sa_handler and sees a non-zero value → thinks every signal is
+        // already taken → "Could not find an available signal" → abort.
+        memset(oldact, 0, sizeof(*oldact));
         oldact->sa_flags = old.sa_flags;
-        oldact->sa_mask = old.sa_mask;
+        memcpy(oldact->sa_mask, &old.sa_mask,
+               sizeof(old.sa_mask) < sizeof(oldact->sa_mask) ? sizeof(old.sa_mask) : sizeof(oldact->sa_mask));
         if(old.sa_flags & 0x04)
             oldact->_u._sa_sigaction = old.sa_sigaction; //TODO should wrap...
         else
@@ -1497,6 +1676,7 @@ int EXPORT my_syscall_rt_sigaction(x64emu_t* emu, int signum, const x64_sigactio
 
         int ret = syscall(__NR_rt_sigaction, signum, act?&newact:NULL, oldact?&old:NULL, (sigsetsize>16)?16:sigsetsize);
         if(oldact && ret==0) {
+            memset(oldact, 0, sizeof(*oldact));
             oldact->sa_flags = old.sa_flags;
             memcpy(&oldact->sa_mask, &old.sa_mask, (sigsetsize>16)?16:sigsetsize);
             if(old.sa_flags & 0x04)
@@ -1542,6 +1722,7 @@ int EXPORT my_syscall_rt_sigaction(x64emu_t* emu, int signum, const x64_sigactio
         if(signum!=X64_SIGSEGV && signum!=X64_SIGBUS && signum!=X64_SIGILL && signum!=X64_SIGABRT)
             ret = sigaction(signal_from_x64(signum), act?&newact:NULL, oldact?&old:NULL);
         if(oldact && ret==0) {
+            memset(oldact, 0, sizeof(*oldact));
             oldact->sa_flags = old.sa_flags;
             memcpy(&oldact->sa_mask, &old.sa_mask, (sigsetsize>8)?8:sigsetsize);
             if(old.sa_flags & 0x04)

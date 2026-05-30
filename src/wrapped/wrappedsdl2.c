@@ -12,6 +12,7 @@
 #include "bridge.h"
 #include "callback.h"
 #include "librarian.h"
+#include "elfloader.h"
 #include "librarian/library_private.h"
 #include "emu/x64emu_private.h"
 #include "box64context.h"
@@ -25,6 +26,139 @@
 const char* sdl2Name = "libSDL2-2.0.so.0";
 #define LIBNAME sdl2
 static void* my_glhandle = NULL;
+// Real static SDL_CreateWindow (captured in my2_SDL_DYNAPI_entry).  my2_SDL_CreateWindow
+// strips SDL_WINDOW_OPENGL and calls this so the dummy video driver creates a valid
+// window WITHOUT attempting (impossible) GL init; the GL context comes from ZFA/EGL.
+static uintptr_t g_real_sdl_createwindow = 0;
+static uintptr_t g_real_sdl_gl_loadlibrary = 0;  // real static SDL_GL_LoadLibrary (observe-only passthrough)
+// Host dlopen handle to the GL provider (libgl4es.so), used to resolve GL
+// function addresses when there is no real ARM64 libSDL2 to supply
+// SDL_GL_GetProcAddress.  Without this, getGLProcAddress() would call a NULL
+// procaddr (my->SDL_GL_GetProcAddress) and crash (SIGSEGV @0x0) the moment
+// Unity starts loading OpenGL entry points after creating the GL context.
+static void* g_gl4es_host_handle = NULL;
+// For ZINK_ZFA: libzfa.so is loaded by rimdroid.c into the rimdroid namespace
+// (so Zink can reach the Vulkan loader/driver).  A plain dlopen() here would
+// fail to link those, so resolve GL entry points from that inherited handle.
+extern __attribute__((weak)) void* g_zfa_handle;
+static void* rimdroid_gl_proc_resolver(const char* name)
+{
+    if (&g_zfa_handle && g_zfa_handle) {
+        void* p = dlsym(g_zfa_handle, name);
+        if (p) return p;
+        // Mesa/Zink exposes CORE GL entry points (e.g. glGetInternalformativ
+        // @4.2, glGetQueryObjectui64v @3.3) via eglGetProcAddress even when they
+        // are NOT exported as plain dlsym symbols of libzfa.so.  Returning the
+        // REAL function (instead of a zeroing stub) is critical: Unity calls
+        // glGetInternalformativ to test render-target format support; a stub
+        // returning 0 makes Unity believe formats are unsupported → it tears the
+        // GfxDevice down and retries forever (the SDL_GL_DeleteContext(NULL) loop).
+        static void* (*egl_gpa)(const char*) = NULL;
+        static int egl_checked = 0;
+        if (!egl_checked) {
+            egl_checked = 1;
+            egl_gpa = (void*(*)(const char*))dlsym(g_zfa_handle, "eglGetProcAddress");
+        }
+        if (egl_gpa) {
+            void* q = egl_gpa(name);
+            if (q) printf_log(LOG_NONE, "rimdroid_gl_proc_resolver: '%s' via eglGetProcAddress => %p\n", name, q);
+            return q;
+        }
+        return NULL;
+    }
+    if (!g_gl4es_host_handle) {
+        const char* libgl = BOX64ENV(libgl) ? BOX64ENV(libgl) : "libGL.so.1";
+        g_gl4es_host_handle = dlopen(libgl, RTLD_LAZY | RTLD_GLOBAL);
+        if (!g_gl4es_host_handle && strcmp(libgl, "libgl4es.so") != 0)
+            g_gl4es_host_handle = dlopen("libgl4es.so", RTLD_LAZY | RTLD_GLOBAL);
+        if (!g_gl4es_host_handle)
+            printf_log(LOG_NONE, "rimdroid_gl_proc_resolver: cannot dlopen GL lib '%s' (%s)\n", libgl, dlerror());
+    }
+    if (!g_gl4es_host_handle)
+        return NULL;
+    void* p = dlsym(g_gl4es_host_handle, name);
+    if (!p) {
+        // Core GL names not exported directly — try GL4ES's own resolver.
+        static void* (*gl4es_gpa)(const char*) = NULL;
+        static int gpa_checked = 0;
+        if (!gpa_checked) {
+            gpa_checked = 1;
+            gl4es_gpa = (void*(*)(const char*))dlsym(g_gl4es_host_handle, "gl4es_GetProcAddress");
+        }
+        if (gl4es_gpa)
+            p = gl4es_gpa(name);
+    }
+    printf_log(LOG_DEBUG, "GL proc resolver('%s') handle=%p => %p\n", name, g_gl4es_host_handle, p);
+    return p;
+}
+
+// No-op GL entry point returned for names libzfa.so does not export.  Mesa/Zink
+// advertises some functions as core (by GL version) or via extensions, but the
+// static libzfa lacks the actual symbol (e.g. glGetInternalformativ core@4.2,
+// glGetQueryObjectui64v core@3.3).  Unity loads core entry points by version and
+// calls a few unconditionally; returning NULL makes it jump to 0x0 → crash.
+// Returning this stub (RAX=0) turns such calls into harmless no-ops.  Feature
+// *selection* in Unity is gated on the GL version / extension string (which we
+// control via MESA_*_OVERRIDE), NOT on a non-NULL pointer, so handing back a
+// stub does not make Unity wrongly enable an unsupported path.
+static int rimdroid_gl_noop(void) { return 0; }
+
+// Getters libzfa.so does not export need MORE than a no-op: they must ZERO the
+// caller's output buffer, otherwise Unity reads uninitialised garbage (MSAA
+// sample counts, format support, texture params) and miscomputes a texture
+// upload → glTexSubImage2D with a bad src pointer → crash.  Real signatures so
+// box64's bridge marshals args correctly; the *params pointer is a guest address
+// (valid in-process under box64).
+static void rd_glGetInternalformativ(uint32_t target, uint32_t internalformat, uint32_t pname, int32_t count, int32_t* params) {
+    (void)target;
+    // PLAN B: libzfa doesn't export this (core GL4.2) and eglGetProcAddress
+    // fallback didn't resolve it.  Returning 0 made Unity believe render-target
+    // formats are UNSUPPORTED → it tore the GfxDevice down + retried forever
+    // (the SDL_GL_DeleteContext(NULL) loop).  So LIE that formats are fully
+    // supported, instead of zeroing.
+    if (!params || count <= 0) return;
+    int32_t v;
+    switch (pname) {
+        case 0x826F: v = 1;       break; // GL_INTERNALFORMAT_SUPPORTED → GL_TRUE
+        case 0x8270: v = (int32_t)internalformat; break; // GL_INTERNALFORMAT_PREFERRED → echo
+        case 0x9380: v = 1;       break; // GL_NUM_SAMPLE_COUNTS → 1
+        case 0x80A9: v = 1;       break; // GL_SAMPLES → 1
+        case 0x8286: case 0x8287: case 0x8288:          // COLOR/DEPTH/STENCIL_RENDERABLE
+        case 0x8289: case 0x828A:                        // FRAMEBUFFER_RENDERABLE[_LAYERED]
+        case 0x828B: case 0x828C: case 0x828D:          // FRAMEBUFFER_BLEND/READ_PIXELS[_FORMAT]
+        case 0x827F: case 0x8280: case 0x8281: case 0x8282: case 0x8283: // GET/TEX image format/type
+            v = 0x82B7; break;            // GL_FULL_SUPPORT
+        case 0x826E: v = 1;       break; // GL_INTERNALFORMAT_PREFERRED-ish / supported
+        default:     v = 1;       break; // default to "supported/yes" rather than 0
+    }
+    for (int32_t i = 0; i < count; ++i) params[i] = v;
+}
+static void rd_glGetTextureParameteriv(uint32_t texture, uint32_t pname, int32_t* params) {
+    (void)texture; (void)pname; if (params) params[0] = 0;
+}
+static void rd_glGetTextureLevelParameteriv(uint32_t texture, int32_t level, uint32_t pname, int32_t* params) {
+    (void)texture; (void)level; (void)pname; if (params) params[0] = 0;
+}
+static void rd_glGetQueryObjectui64v(uint32_t id, uint32_t pname, uint64_t* params) {
+    (void)id; (void)pname; if (params) params[0] = 0;
+}
+
+// DIAGNOSTIC: instrument glTexSubImage2D (crash site).  Logs args + whether a
+// GL_PIXEL_UNPACK_BUFFER (PBO) is bound (if so, `pixels` is a byte OFFSET, not a
+// client pointer), then tail-calls the real libzfa glTexSubImage2D.
+static void rd_glTexSubImage2D(uint32_t target, int32_t level, int32_t xoff, int32_t yoff,
+                               int32_t w, int32_t h, uint32_t format, uint32_t type, void* pixels) {
+    static void (*real)(uint32_t,int32_t,int32_t,int32_t,int32_t,int32_t,uint32_t,uint32_t,const void*) = NULL;
+    static int resolved = 0;
+    if (!resolved) { resolved = 1;
+        if (&g_zfa_handle && g_zfa_handle)
+            real  = (void(*)(uint32_t,int32_t,int32_t,int32_t,int32_t,int32_t,uint32_t,uint32_t,const void*))dlsym(g_zfa_handle, "glTexSubImage2D");
+    }
+    // (instrumentation removed — texture upload confirmed working; logging
+    //  every call flooded the log and slowed content loading.)
+    if (real) real(target, level, xoff, yoff, w, h, format, type, pixels);
+}
+
 // DL functions from wrappedlibdl.c
 void* my_dlopen(x64emu_t* emu, void *filename, int flag);
 int my_dlclose(x64emu_t* emu, void *handle);
@@ -611,25 +745,172 @@ static int get_sdl_priv(x64emu_t* emu, const char *sym_str, void **w, void **f)
 
 int EXPORT my2_SDL_DYNAPI_entry(x64emu_t* emu, uint32_t version, uintptr_t *table, uint32_t tablesize)
 {
+    // tablesize is sizeof(SDL_DYNAPI_jump_table) in BYTES.
+    // Convert to element count (each entry is one uintptr_t = function pointer).
+    uint32_t n = tablesize / (uint32_t)sizeof(uintptr_t);
     uint32_t i = 0;
-    uintptr_t tab[tablesize];
-    int r = my->SDL_DYNAPI_entry(version, tab, tablesize);
-    (void)r;
+    uintptr_t tab[n];
+
+    if (my->SDL_DYNAPI_entry) {
+        // Real ARM64 libSDL2 available — populate tab with its jump table.
+        // Pass tablesize in bytes, as SDL expects.
+        int r = my->SDL_DYNAPI_entry(version, tab, tablesize);
+        (void)r;
+        printf_log(LOG_INFO, "SDL_DYNAPI_entry: real ARM64 SDL2 table loaded (%u bytes / %u entries)\n", tablesize, n);
+    } else {
+        // No real ARM64 libSDL2 (statically linked game).  The `table` we got is
+        // SDL's jump_table in its INITIAL state: every entry points at a *_DEFAULT
+        // stub that calls SDL_InitDynamicAPI() then tail-jumps to jump_table.fn.
+        // Because SDL_DYNAMIC_API is set, SDL calls ONLY this external entry and
+        // never its own built-in one — so the real static function pointers are
+        // never installed.  If we seeded `tab` from these default stubs, every
+        // non-wrapped SDL_* call would re-enter SDL_InitDynamicAPI and tail-jump
+        // back to the default stub forever (single-threaded 100% CPU hang at
+        // startup, observed as a spin inside SDL_AtomicLock).
+        //
+        // Fix: call the GAME's OWN built-in SDL_DYNAPI_entry to populate `table`
+        // with the real static SDL2 implementations, then read them into `tab`.
+        // We run it directly by address so box64 does not re-intercept it back
+        // into this function.
+        //
+        // IMPORTANT (RimWorld 1.5 / Unity 2022): the built-in is NOT in elfs[0].
+        // 1.5 ships a tiny 6 KB launcher ELF (elfs[0]) + the engine as a separate
+        // UnityPlayer.so DYN library, and SDL2 (hence SDL_DYNAPI_entry) is linked
+        // into UnityPlayer.so.  Searching only elfs[0] (as before, fine for the
+        // monolithic 1.2 EXE) finds nothing → fallback default-stub table → every
+        // non-wrapped SDL_* call hangs forever in SDL_InitDynamicAPI/SDL_AtomicLock.
+        // So scan ALL loaded ELFs for the built-in entry.
+        uintptr_t gstart = 0, gend = 0;
+        int gver = 0, gveropt = 0;
+        const char* gvername = NULL;
+        int found_elf = -1;
+        for (int ei = 0; ei < emu->context->elfsize; ++ei) {
+            elfheader_t* e = emu->context->elfs[ei];
+            if (!e) continue;
+            gstart = gend = 0; gver = 0; gveropt = 0; gvername = NULL;
+            if (ElfGetGlobalSymbolStartEnd(e, &gstart, &gend, "SDL_DYNAPI_entry",
+                                           &gver, &gvername, 1, &gveropt) && gstart) {
+                found_elf = ei;
+                break;
+            }
+        }
+        if (found_elf >= 0 && gstart) {
+            RunFunctionWithEmu(emu, 0, gstart, 3,
+                               (uint64_t)version,
+                               (uint64_t)(uintptr_t)table,
+                               (uint64_t)tablesize);
+            memcpy(tab, table, tablesize);
+            printf_log(LOG_NONE, "RIMDROID SDL_DYNAPI_entry: seeded from built-in @%p (elf #%d, %u entries)\n", (void*)gstart, found_elf, n);
+        } else {
+            // Built-in not found in ANY elf — fall back to the (broken) default-stub table.
+            memcpy(tab, table, tablesize);
+            printf_log(LOG_NONE, "RIMDROID SDL_DYNAPI_entry: built-in NOT found in any of %d elfs — non-wrapped SDL calls WILL hang (%u entries)\n", emu->context->elfsize, n);
+        }
+    }
+
+    printf_log(LOG_NONE, "RIMDROID jump_table base=%p tablesize=%u n=%u\n", (void*)table, tablesize, n);
+
+    // --- RimDroid corrective GL dynapi remap --------------------------------
+    // RimWorldLinux ships Unity's own static SDL2, whose SDL_dynapi jump-table
+    // index order differs from box64's canonical SDL_dynapi_procs.h.  The loop
+    // below installs each wrapped bridge at box64's index; for the GL cluster
+    // those indices are wrong for RimWorld (it lacks GL_GetDrawableSize, so the
+    // cluster is shifted -5 then -6), and Unity's renderer detection lands our
+    // bridges on the wrong slots (e.g. SDL_GL_GetAttribute hits our LoadLibrary
+    // bridge).  RimWorld's real indices were obtained by disassembling its
+    // built-in SDL_DYNAPI_entry and matching each static wrapper to the
+    // SDL_VideoDevice GL vtable offset it calls.  We capture each wrapped GL
+    // bridge + the box64 index it was placed at during the loop, then move it.
+    static const struct { const char* name; uint32_t rw_idx; } rd_remap[] = {
+        {"SDL_GL_LoadLibrary",    509},
+        {"SDL_GL_GetProcAddress", 510},
+        {"SDL_GL_CreateContext",  515},
+        {"SDL_GL_MakeCurrent",    516},
+        {"SDL_GL_SwapWindow",     521},
+        {"SDL_GL_DeleteContext",  522},
+        // 1.5 game indices (box64 has GetDrawableSize the game lacks → shift):
+        {"SDL_GL_GetCurrentWindow",  517},
+        {"SDL_GL_GetCurrentContext", 518},
+        // SDL_CreateWindow: game idx 470 (box64 475, shift -5).  Route to
+        // my2_SDL_CreateWindow so it STRIPS SDL_WINDOW_OPENGL — the dummy video
+        // driver has no GL and fails SDL_CreateWindow when that flag is set,
+        // leaving Unity with a NULL window (win=0x0) and a degenerate GfxDevice
+        // that loops forever destroying contexts.  Stripping it lets the window
+        // be created (we supply GL via ZFA regardless).
+        {"SDL_CreateWindow",         470},
+        // Window invariants (game idx; box64 479/488, shift -5):
+        {"SDL_GetWindowFlags",       474},
+        {"SDL_GetWindowSize",        483},
+        // TEST: force display mode 1024x768 @ 60 Hz (game idx; box64 468/469, shift -5)
+        {"SDL_GetDesktopDisplayMode", 463},
+        {"SDL_GetCurrentDisplayMode", 464},
+    };
+    const int rd_nremap = (int)(sizeof(rd_remap)/sizeof(rd_remap[0]));
+    uint32_t  rd_box64_idx[13];
+    uintptr_t rd_bridge[13];
+    for (int rj = 0; rj < rd_nremap; ++rj) { rd_box64_idx[rj] = (uint32_t)-1; rd_bridge[rj] = 0; }
 
     #define SDL_DYNAPI_PROC(ret, sym, args, parms, ...) \
-        if (i < tablesize) { \
+        if (i < n) { \
             void *w = NULL; \
             void *f = NULL; \
+            /* Capture the real static SDL_CreateWindow so my2_SDL_CreateWindow can \
+               call it (with the SDL_WINDOW_OPENGL flag stripped). */ \
+            if (!strcmp(#sym, "SDL_CreateWindow")) g_real_sdl_createwindow = tab[i]; \
+            if (!strcmp(#sym, "SDL_GL_LoadLibrary")) g_real_sdl_gl_loadlibrary = tab[i]; \
             if (get_sdl_priv(emu, #sym, &w, &f)) { \
                 table[i] = AddCheckBridge(my_lib->w.bridge, w, f, 0, #sym); \
+                printf_log(LOG_DEBUG, "SDL_DYNAPI_entry: wrapped  %s => %p\n", #sym, (void*)table[i]); \
             } \
-            else \
-                table[i] = (uintptr_t)NULL; \
-            printf_log(LOG_DEBUG, "SDL_DYNAPI_entry: %s => %p (%p)\n", #sym, (void*)table[i], f); \
+            else { \
+                table[i] = tab[i]; \
+            } \
+            /* Record wrapped GL bridges so the remap below can relocate them. */ \
+            for (int rj = 0; rj < rd_nremap; ++rj) \
+                if (!strcmp(#sym, rd_remap[rj].name)) { rd_box64_idx[rj] = i; rd_bridge[rj] = table[i]; } \
+            /* GROUND TRUTH: log box64 index + absolute slot addr for GL/window funcs */ \
+            if (!strncmp(#sym, "SDL_GL_", 7) || !strcmp(#sym, "SDL_CreateWindow")) \
+                printf_log(LOG_NONE, "RIMDROID MAP %s box64_idx=%u slot=%p\n", #sym, i, (void*)&table[i]); \
             i++; \
         }
 
     #include "SDL_dynapi_procs.h"
+
+    // Re-capture real static SDL fns at the GAME indices.  The in-loop captures
+    // above used `tab[i]` at box64's running index, but `tab` is seeded in the
+    // GAME's DYNAPI order, which is shifted vs box64 (game lacks GL_GetDrawableSize
+    // etc.).  So tab[box64_idx] is the WRONG function.  my2_SDL_CreateWindow then
+    // called the wrong fn → returned garbage → Unity deref'd a bogus window
+    // (SIGSEGV addr=0xffffffff).  Fix: use the game indices (same as the remap).
+    if (470 < n) g_real_sdl_createwindow   = tab[470]; // game SDL_CreateWindow
+    if (509 < n) g_real_sdl_gl_loadlibrary = tab[509]; // game SDL_GL_LoadLibrary
+
+    // Remap is ONLY needed for old-SDL games (RimWorld 1.2 / Unity 2019) where
+    // the bundled SDL had a different DYNAPI_PROC order than box64's SDL.
+    // For new-SDL games (RimWorld 1.5+ / Unity 2022) the order is the same →
+    // box64_idx == rw_idx → the bridges are already in the right slots →
+    // remap would move them to the wrong (old) positions.
+    // Controlled by RIMDROID_SDL_REMAP env: "0" = skip; default = apply.
+    const char* remap_env = getenv("RIMDROID_SDL_REMAP");
+    int do_remap = (!remap_env || strcmp(remap_env, "0") != 0);
+    if (!do_remap) {
+        printf_log(LOG_NONE, "RIMDROID REMAP: skipped (RIMDROID_SDL_REMAP=0, new-SDL game)\n");
+        return 0;
+    }
+    // pass 1: undo the box64-indexed placement (restore the seeded RimWorld
+    // static that genuinely belongs at that slot).  Done for ALL entries first
+    // so overlaps between a box64 index and another entry's RimWorld index
+    // (e.g. GetProcAddress@box64 515 vs CreateContext@rw 515) resolve correctly.
+    for (int rj = 0; rj < rd_nremap; ++rj)
+        if (rd_box64_idx[rj] != (uint32_t)-1)
+            table[rd_box64_idx[rj]] = tab[rd_box64_idx[rj]];
+    // pass 2: install our bridges at RimWorld's actual indices.
+    for (int rj = 0; rj < rd_nremap; ++rj)
+        if (rd_bridge[rj] && rd_remap[rj].rw_idx < n) {
+            table[rd_remap[rj].rw_idx] = rd_bridge[rj];
+            printf_log(LOG_NONE, "RIMDROID REMAP %s box64_idx=%u -> rw_idx=%u bridge=%p\n",
+                       rd_remap[rj].name, rd_box64_idx[rj], rd_remap[rj].rw_idx, (void*)rd_bridge[rj]);
+        }
     return 0;
 }
 
@@ -695,6 +976,11 @@ EXPORT void* my2_SDL_GL_GetProcAddress(x64emu_t* emu, void* name)
 {
     khint_t k;
     const char* rname = (const char*)name;
+    printf_log(LOG_NONE, "RIMDROID SDL_GL_GetProcAddress('%s')\n", rname?rname:"(null)");
+    // SDL_GL_GetProcAddress(NULL) must return NULL, not crash: getGLProcAddress()
+    // hashes/strcmps the name and would dereference NULL.
+    if (!rname)
+        return NULL;
     static int lib_checked = 0;
     if(!lib_checked) {
         lib_checked = 1;
@@ -703,7 +989,43 @@ EXPORT void* my2_SDL_GL_GetProcAddress(x64emu_t* emu, void* name)
             // use a my_dlopen to actually open that lib, like SDL2 is doing...
             my_glhandle = my_dlopen(emu, BOX64ENV(libgl)?BOX64ENV(libgl):"libGL.so.1", RTLD_LAZY|RTLD_GLOBAL);
     }
-    return getGLProcAddress(emu, NULL, (glprocaddress_t)my->SDL_GL_GetProcAddress, rname);
+    // With no real ARM64 libSDL2, my->SDL_GL_GetProcAddress is NULL.  Passing it
+    // to getGLProcAddress() would call NULL → SIGSEGV.  Fall back to resolving
+    // GL entry points straight from libgl4es.so.
+    // DIAGNOSTIC: hand Unity our instrumented glTexSubImage2D (the crash site)
+    // instead of the real one, to log args + PBO binding before the upload.
+    if (!strcmp(rname, "glTexSubImage2D")) {
+        static uintptr_t b = 0;
+        if (!b) b = AddBridge(my_lib->w.bridge, vFuiiiiiuup, (void*)rd_glTexSubImage2D, 0, "rd_glTexSubImage2D");
+        printf_log(LOG_NONE, "RIMDROID GetProcAddress('glTexSubImage2D') → instrumented %p\n", (void*)b);
+        return (void*)b;
+    }
+    glprocaddress_t pa = (glprocaddress_t)my->SDL_GL_GetProcAddress;
+    if (!pa) pa = rimdroid_gl_proc_resolver;
+    void* res = getGLProcAddress(emu, NULL, pa, rname);
+    if (!res) {
+        // libzfa lacks the symbol (Mesa still advertises it as core/extension).
+        // GETTERS must zero their output buffer (a bare no-op leaves it
+        // uninitialised → Unity reads garbage → bad texture upload → crash).
+        wrapper_t w = NULL; void* fn = NULL;
+        if      (!strcmp(rname, "glGetInternalformativ"))        { w = vFuuuip; fn = (void*)rd_glGetInternalformativ; }
+        else if (!strcmp(rname, "glGetTextureParameteriv"))      { w = vFuup;   fn = (void*)rd_glGetTextureParameteriv; }
+        else if (!strcmp(rname, "glGetTextureLevelParameteriv")) { w = vFuiup;  fn = (void*)rd_glGetTextureLevelParameteriv; }
+        else if (!strcmp(rname, "glGetQueryObjectui64v"))        { w = vFuup;   fn = (void*)rd_glGetQueryObjectui64v; }
+        if (fn) {
+            void* b = (void*)AddBridge(my_lib->w.bridge, w, fn, 0, rname);
+            printf_log(LOG_NONE, "RIMDROID GetProcAddress zeroing-stub for '%s' => %p\n", rname, b);
+            return b;
+        }
+        // Everything else: a no-op (RAX=0, writes nothing) so a stray call does
+        // not jump to 0x0.  Bridge created once and reused for every such name.
+        static uintptr_t noop_bridge = 0;
+        if (!noop_bridge)
+            noop_bridge = AddBridge(my_lib->w.bridge, iFv, (void*)rimdroid_gl_noop, 0, "rimdroid_gl_noop");
+        printf_log(LOG_NONE, "RIMDROID GetProcAddress NULL for '%s' → no-op stub %p\n", rname, (void*)noop_bridge);
+        res = (void*)noop_bridge;
+    }
+    return res;
 }
 
 #define nb_once 16
@@ -900,9 +1222,301 @@ EXPORT void my2_SDL_FilterEvents(x64emu_t* emu, void* filter, void* userdata) {
     my->SDL_FilterEvents(my_FilterEvents_callback, &data);
 }
 
+// ---- GL4ES / EGL intercepts -------------------------------------------------
+// These my2_ overrides replace the SDL2 GL context functions so that, when
+// Unity calls SDL_GL_CreateContext() (via box64's SDL2 wrapper), we return the
+// EGL context that rimdroid.c already created with GL4ES's ANativeWindow.
+// Without this, SDL_VIDEODRIVER=dummy returns NULL from CreateContext and Unity
+// prints "Unable to find a supported OpenGL core profile".
+
+// EGL handles set up by rimdroid_init_gl4es_egl() before launch_rimworld_elf().
+// Declared __weak so the standalone box64 executable links without error
+// (symbols stay NULL there).  In librimdroidlinker.so the strong definitions
+// from librimdroid.so override these at runtime.
+extern __attribute__((weak)) void* g_egl_display;
+extern __attribute__((weak)) void* g_egl_surface;
+extern __attribute__((weak)) void* g_egl_context;
+
+// ZINK_ZFA renderer: ZFA context created by rimdroid.c in the parent (Zink over
+// Vulkan/Turnip).  When g_zfa_context is set we route the GL context calls to
+// ZFA instead of EGL.  GL proc resolution already works via BOX64_LIBGL
+// (=libzfa.so) in rimdroid_gl_proc_resolver, so SDL_GL_GetProcAddress is
+// unchanged.  rimdroid_zfa_make_current/swap live in rimdroid.c (strong defs).
+extern __attribute__((weak)) void* g_zfa_context;
+extern __attribute__((weak)) int  rimdroid_zfa_make_current(void);
+extern __attribute__((weak)) void rimdroid_zfa_swap(void);
+
+// Lazy-open libEGL.so and cache the handle.
+static void* rimdroid_libegl(void) {
+    static void* h = NULL;
+    if (!h) {
+        h = dlopen("libEGL.so", RTLD_LAZY | RTLD_GLOBAL);
+        if (!h) h = dlopen("libEGL.so.1", RTLD_LAZY | RTLD_GLOBAL);
+    }
+    return h;
+}
+
+// eglMakeCurrent(display, draw, read, ctx) — make our context current on this thread.
+static int rimdroid_egl_make_current(void) {
+    void* h = rimdroid_libegl();
+    if (!h || !g_egl_display || !g_egl_surface || !g_egl_context) return 0;
+    typedef unsigned int (*fn_t)(void*, void*, void*, void*);
+    fn_t fn = (fn_t)(uintptr_t)dlsym(h, "eglMakeCurrent");
+    return fn ? (int)fn(g_egl_display, g_egl_surface, g_egl_surface, g_egl_context) : 0;
+}
+
+// SDL_CreateWindow(title,x,y,w,h,flags) → strip SDL_WINDOW_OPENGL and call the
+// real (dummy-driver) SDL_CreateWindow.  The dummy driver cannot do GL, so a window
+// requested WITH SDL_WINDOW_OPENGL makes SDL internally call SDL_GL_LoadLibrary →
+// fails → returns NULL → Unity's renderer detection bails before SDL_GL_CreateContext.
+// We hand Unity a valid (non-GL) window and provide the GL context separately via ZFA.
+#define RD_SDL_WINDOW_OPENGL 0x00000002u
+#define RD_SDL_WINDOW_SHOWN  0x00000004u
+// Window invariants Unity queries (we strip OPENGL at creation so the dummy
+// driver succeeds, but Unity must still SEE a GL window of the right size or it
+// builds a degenerate GfxDevice render-target graph whose cleanup recurses
+// forever — the SDL_GL_DeleteContext(NULL) loop).  Capture the ORIGINAL flags
+// (incl. OPENGL) + requested size at creation and report THOSE back.
+static uint32_t g_window_flags = RD_SDL_WINDOW_OPENGL | RD_SDL_WINDOW_SHOWN;
+static int      g_window_w = 2340, g_window_h = 1080;  // native default (overwritten by CreateWindow)
+
+// SDL_GetWindowFlags(window) → report the GL window flags Unity asked for
+// (the real dummy window lacks SDL_WINDOW_OPENGL because we stripped it).
+EXPORT uint32_t my2_SDL_GetWindowFlags(void* window) {
+    uint32_t f = g_window_flags | RD_SDL_WINDOW_OPENGL | RD_SDL_WINDOW_SHOWN;
+    static int n = 0;
+    if (n < 4) { n++; printf_log(LOG_NONE, "RIMDROID SDL_GetWindowFlags(win=%p) => 0x%x\n", window, f); }
+    return f;
+}
+// SDL_GetWindowSize(window, w, h) → report the requested size (dummy window may
+// report 0x0 → Unity makes a 0x0 framebuffer).
+EXPORT void my2_SDL_GetWindowSize(void* window, int* w, int* h) {
+    if (w) *w = g_window_w;
+    if (h) *h = g_window_h;
+    static int n = 0;
+    if (n < 4) { n++; printf_log(LOG_NONE, "RIMDROID SDL_GetWindowSize(win=%p) => %dx%d\n", window, g_window_w, g_window_h); }
+}
+
+// TEST (2026-05-30): consistent 1024x768 + 60 Hz.  Keep size at 1024x768 (matches
+// window/FBO/dummy) but force refresh_rate=60 instead of dummy's 0 — testing
+// whether "@ 0 Hz" (not the size) is the fullscreen-teardown trigger.
+typedef struct { uint32_t format; int32_t w; int32_t h; int32_t refresh_rate; void* driverdata; } rd_SDL_DisplayMode;
+static void rd_fill_display_mode(void* mode) {
+    if (!mode) return;
+    rd_SDL_DisplayMode* m = (rd_SDL_DisplayMode*)mode;
+    m->format = 0x16161804;   // SDL_PIXELFORMAT_RGB888
+    m->w = 1024; m->h = 768;  // same as the consistent pipeline size
+    m->refresh_rate = 60;     // was 0 (dummy) → suspected co-trigger
+    m->driverdata = NULL;
+}
+EXPORT int my2_SDL_GetDesktopDisplayMode(int displayIndex, void* mode) {
+    rd_fill_display_mode(mode);
+    static int n = 0;
+    if (n < 4) { n++; printf_log(LOG_NONE, "RIMDROID GetDesktopDisplayMode(%d) => 1024x768@60\n", displayIndex); }
+    return 0;
+}
+EXPORT int my2_SDL_GetCurrentDisplayMode(int displayIndex, void* mode) {
+    rd_fill_display_mode(mode);
+    static int n = 0;
+    if (n < 4) { n++; printf_log(LOG_NONE, "RIMDROID GetCurrentDisplayMode(%d) => 1024x768@60\n", displayIndex); }
+    return 0;
+}
+
+EXPORT void* my2_SDL_CreateWindow(x64emu_t* emu, void* title, int x, int y, int w, int h, uint32_t flags) {
+    uint32_t stripped = flags & ~RD_SDL_WINDOW_OPENGL;
+    g_window_flags = flags; g_window_w = w; g_window_h = h;   // report these back to Unity
+    if (!g_real_sdl_createwindow) {
+        printf_log(LOG_NONE, "RIMDROID SDL_CreateWindow: no real fn captured!\n");
+        return NULL;
+    }
+    printf_log(LOG_NONE, "RIMDROID SDL_CreateWindow(flags=0x%x→0x%x) %dx%d\n", flags, stripped, w, h);
+    return (void*)(uintptr_t)RunFunctionWithEmu(emu, 0, g_real_sdl_createwindow, 6,
+        (uint64_t)(uintptr_t)title, (uint64_t)(int64_t)x, (uint64_t)(int64_t)y,
+        (uint64_t)(int64_t)w, (uint64_t)(int64_t)h, (uint64_t)stripped);
+}
+
+// SDL_GL_CreateContext(window) → return our pre-created context, bind to thread.
+// The SDL_Window* Unity created its GL context for (captured in CreateContext);
+// returned by my2_SDL_GL_GetCurrentWindow so Unity's "is a window/context
+// current?" checks see a valid current window even though we bypass SDL's GL.
+static void* g_gl_window = NULL;
+// DEBUG counters to characterise the DeleteContext loop's GL call mix.
+static unsigned long g_cnt_getctx=0, g_cnt_getwin=0, g_cnt_makecur=0,
+                     g_cnt_swap=0, g_cnt_create=0, g_cnt_setattr=0, g_cnt_getattr=0;
+
+// SDL_GL_GetCurrentContext / GetCurrentWindow read SDL's per-thread "current GL"
+// TLS, which is set by SDL_GL_MakeCurrent.  We OWN the context via ZFA and never
+// call the real SDL_GL_MakeCurrent, so that TLS stays NULL → Unity sees "no
+// current context", believes the device was lost, and loops destroying/recreating
+// it forever (observed: endless SDL_GL_DeleteContext(0x0), no frame).  Override
+// both to report our context/window as current.
+EXPORT void* my2_SDL_GL_GetCurrentContext(void) {
+    g_cnt_getctx++;
+    if (&g_zfa_context && g_zfa_context) return g_zfa_context;
+    if (g_egl_context) return g_egl_context;
+    if (my->SDL_GL_GetCurrentContext) return my->SDL_GL_GetCurrentContext();
+    return NULL;
+}
+EXPORT void* my2_SDL_GL_GetCurrentWindow(void) {
+    g_cnt_getwin++;
+    if (g_gl_window) return g_gl_window;
+    if (my->SDL_GL_GetCurrentWindow) return my->SDL_GL_GetCurrentWindow();
+    return NULL;
+}
+
+EXPORT void* my2_SDL_GL_CreateContext(void* win) {
+    g_cnt_create++;
+    g_gl_window = win;
+    if (&g_zfa_context && g_zfa_context) {
+        if (rimdroid_zfa_make_current) rimdroid_zfa_make_current();
+        printf_log(LOG_NONE, "RIMDROID SDL_GL_CreateContext → ZFA ctx %p (Zink core) win=%p — MILESTONE reached\n", g_zfa_context, win);
+        return g_zfa_context;
+    }
+    if (g_egl_context) {
+        rimdroid_egl_make_current();
+        printf_log(LOG_NONE, "RIMDROID SDL_GL_CreateContext → EGL ctx %p (GL4ES) — MILESTONE reached\n", g_egl_context);
+        return g_egl_context;
+    }
+    // No renderer context set up; fall back to SDL.
+    return my->SDL_GL_CreateContext(win);
+}
+
+// SDL_GL_MakeCurrent(window, ctx) → re-bind our context on the calling thread.
+// In ZFA/EGL mode WE own the GL context: the SDL dummy driver has no GL at all,
+// so we must NEVER delegate to my->SDL_GL_MakeCurrent (with SDL_DYNAMIC_API that
+// would route back through the jump_table into us, or dive into the dummy
+// driver's NULL GL hooks → crash).  ctx==NULL is an unbind → succeed as a no-op
+// (our single context just stays alive; the next bind re-routes here).
+EXPORT int my2_SDL_GL_MakeCurrent(void* win, void* ctx) {
+    g_cnt_makecur++;
+    (void)win;
+    printf_log(LOG_NONE, "RIMDROID SDL_GL_MakeCurrent(win=%p ctx=%p) zfa=%p egl=%p\n",
+               win, ctx, (&g_zfa_context)?g_zfa_context:NULL, g_egl_context);
+    if (&g_zfa_context && g_zfa_context) {
+        if (!ctx) {
+            printf_log(LOG_NONE, "RIMDROID SDL_GL_MakeCurrent → ZFA unbind (no-op)\n");
+            return 0;
+        }
+        int ok = (rimdroid_zfa_make_current && rimdroid_zfa_make_current());
+        printf_log(LOG_NONE, "RIMDROID SDL_GL_MakeCurrent → ZFA rebind %s\n", ok ? "OK" : "FAIL");
+        return ok ? 0 : -1;
+    }
+    if (&g_egl_context && g_egl_context) {
+        if (!ctx) return 0;  // unbind no-op
+        return rimdroid_egl_make_current() ? 0 : -1;
+    }
+    return my->SDL_GL_MakeCurrent(win, ctx);
+}
+
+// SDL_GL_SwapWindow(window) → present the frame (ZFA flush or eglSwapBuffers).
+EXPORT void my2_SDL_GL_SwapWindow(void* win) {
+    g_cnt_swap++;
+    (void)win;
+    printf_log(LOG_NONE, "RIMDROID SDL_GL_SwapWindow(win=%p)\n", win);
+    if (&g_zfa_context && g_zfa_context) {
+        if (rimdroid_zfa_swap) rimdroid_zfa_swap();
+        return;
+    }
+    if (g_egl_display && g_egl_surface) {
+        void* h = rimdroid_libegl();
+        if (h) {
+            typedef unsigned int (*fn_t)(void*, void*);
+            fn_t fn = (fn_t)(uintptr_t)dlsym(h, "eglSwapBuffers");
+            if (fn) { fn(g_egl_display, g_egl_surface); return; }
+        }
+    }
+    my->SDL_GL_SwapWindow(win);
+}
+
+// SDL_GL_DeleteContext(ctx) → no-op for our context (it outlives the game loop).
+EXPORT void my2_SDL_GL_DeleteContext(x64emu_t* emu, void* ctx) {
+    (void)emu;
+    // Rate-limited counter only (per-call logging flooded the log + slowed the
+    // run). Lets us see whether DeleteContext calls keep growing (loop) or stop.
+    static unsigned long rd_dc_count = 0;
+    if ((++rd_dc_count % 20000UL) == 1UL)
+        printf_log(LOG_NONE, "RIMDROID DeleteCtx#%lu | create=%lu makecur=%lu swap=%lu getctx=%lu getwin=%lu setattr=%lu getattr=%lu\n",
+                   rd_dc_count, g_cnt_create, g_cnt_makecur, g_cnt_swap, g_cnt_getctx, g_cnt_getwin, g_cnt_setattr, g_cnt_getattr);
+    // In ZFA/EGL mode WE own the GL context (created via zfaCreateContext /
+    // eglCreateContext, NOT via SDL).  There is no real SDL GL context to
+    // delete, and my->SDL_GL_DeleteContext is NULL for the statically-linked
+    // game — so falling through to it (which the old `ctx && ctx==g_zfa_context`
+    // guards did for ctx==NULL, as Unity passes on scene transition / teardown)
+    // jumps to a NULL function pointer and SIGSEGVs at addr=0x0.  Whenever we
+    // have our own context, this is ALWAYS a no-op; the context outlives the
+    // game loop and is torn down by us at process exit.
+    if (g_zfa_context || g_egl_context) {
+        printf_log(LOG_INFO, "SDL_GL_DeleteContext: ZFA/EGL no-op (ctx=%p, keeping our context)\n", ctx);
+        return;
+    }
+    if (my->SDL_GL_DeleteContext)
+        my->SDL_GL_DeleteContext(ctx);
+}
+
+// SDL_VIDEODRIVER=dummy reports no GL capability, so Unity's renderer-detection
+// (LinuxStandalone main.cpp:623) bails BEFORE ever calling SDL_GL_CreateContext —
+// our context (ZFA/EGL) is never reached and Unity prints "No supported renderers".
+// These overrides make the detection believe a real OpenGL CORE 3.2+ context is
+// available, so Unity proceeds to SDL_GL_CreateContext (→ ZFA/EGL).
+// SDL_GLattr enum values:
+#define RD_GL_RED_SIZE              0
+#define RD_GL_GREEN_SIZE            1
+#define RD_GL_BLUE_SIZE             2
+#define RD_GL_ALPHA_SIZE            3
+#define RD_GL_DOUBLEBUFFER          5
+#define RD_GL_DEPTH_SIZE            6
+#define RD_GL_STENCIL_SIZE          7
+#define RD_GL_CONTEXT_MAJOR_VERSION 17
+#define RD_GL_CONTEXT_MINOR_VERSION 18
+#define RD_GL_CONTEXT_FLAGS         20
+#define RD_GL_CONTEXT_PROFILE_MASK  21
+#define RD_GL_CONTEXT_PROFILE_CORE  0x0001
+
+// SDL_GL_LoadLibrary(path) → OBSERVE-ONLY: log + passthrough to the real static
+// function (so behaviour is unchanged — no infinite loop), to map the detection.
+EXPORT int my2_SDL_GL_LoadLibrary(x64emu_t* emu, void* path) {
+    int r = -999;
+    if (g_real_sdl_gl_loadlibrary)
+        r = (int)RunFunctionWithEmu(emu, 0, g_real_sdl_gl_loadlibrary, 1, (uint64_t)(uintptr_t)path);
+    printf_log(LOG_NONE, "RIMDROID SDL_GL_LoadLibrary(path=%p) => %d (real passthrough)\n", path, r);
+    return r;
+}
+
+// SDL_GL_SetAttribute(attr, value) → accept any requested attribute.
+EXPORT int my2_SDL_GL_SetAttribute(uint32_t attr, int value) {
+    (void)attr; (void)value;
+    return 0;
+}
+
+// SDL_GL_GetAttribute(attr, int* value) → report a real GL 4.3 CORE profile.
+EXPORT int my2_SDL_GL_GetAttribute(uint32_t attr, void* value) {
+    if (!value) return -1;
+    int* v = (int*)value;
+    switch (attr) {
+        case RD_GL_CONTEXT_MAJOR_VERSION: *v = 4; break;
+        case RD_GL_CONTEXT_MINOR_VERSION: *v = 3; break;
+        case RD_GL_CONTEXT_PROFILE_MASK:  *v = RD_GL_CONTEXT_PROFILE_CORE; break;
+        case RD_GL_CONTEXT_FLAGS:         *v = 0; break;
+        case RD_GL_DEPTH_SIZE:            *v = 24; break;
+        case RD_GL_STENCIL_SIZE:          *v = 8;  break;
+        case RD_GL_RED_SIZE: case RD_GL_GREEN_SIZE:
+        case RD_GL_BLUE_SIZE: case RD_GL_ALPHA_SIZE: *v = 8; break;
+        case RD_GL_DOUBLEBUFFER:          *v = 1; break;
+        default:                          *v = 0; break;
+    }
+    printf_log(LOG_NONE, "RIMDROID SDL_GL_GetAttribute(%u) => %d\n", attr, *v);
+    return 0;
+}
+
 #undef HAS_MY
 
 #define ALTMY my2_
+
+// No real ARM64 libSDL2 needed — our my2_SDL_GL_* and my2_SDL_DYNAPI_entry
+// intercepts work without an underlying native SDL2.  getMy() will set all
+// my->* to NULL (dlsym(NULL,...) returns NULL for unknown symbols), and
+// my2_SDL_DYNAPI_entry guards against that explicitly.
+#define OPTIONAL_LIB
 
 #define CUSTOM_INIT \
     box64->sdl2lib = lib;                   \

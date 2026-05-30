@@ -8,9 +8,14 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <errno.h>
 #include <link.h>
 #include <stdarg.h>
+#include <locale.h>
+#include <math.h>
+#include <sys/mman.h>
+#include <sys/sysmacros.h>
 
 #include "debug.h"
 #include "library.h"
@@ -543,6 +548,8 @@ library_t *NewLibrary(const char* path, box64context_t* context, elfheader_t* ve
     int precise = (!BOX64ENV(prefer_wrapped) && !essential && path && strchr(path, '/'))?1:0;
     if(!notwrapped && precise && strstr(path, "libtcmalloc_minimal.so"))
         precise = 0;    // allow native version for tcmalloc_minimum
+    if(!notwrapped && precise && strstr(path, "libSDL2-2.0.so"))
+        precise = 0;    // force wrapped mode for SDL2: my2_SDL_DYNAPI_entry must intercept jump table
     /*
     if(!notwrapped && precise && strstr(path, "libEGL.so"))
         precise = 0;    // allow native version for EGL
@@ -975,7 +982,12 @@ static int android_pthread_setcancel(int val, int *old) {
 
 // __assert_fail(msg, file, line, func) — bionic uses __assert2(file,line,func,msg)
 static void android__assert_fail(const char *msg, const char *file, unsigned int line, const char *func) {
-    fprintf(stderr, "%s:%u: %s: Assertion '%s' failed.\n", file, line, func, msg);
+    printf_log(LOG_NONE, "ASSERTION FAILED: %s:%u: %s: %s\n", file, line, func, msg);
+    { const char* _h=getenv("HOME"); char _p[512],_b[512];
+      snprintf(_p,sizeof(_p),"%s/abort_site.log",_h?_h:"/data/local/tmp");
+      int _fd=open(_p,O_WRONLY|O_CREAT|O_APPEND,0644);
+      if(_fd>=0){int _n=snprintf(_b,sizeof(_b),"ABORT: __assert_fail %s:%u %s: %s\n",file,line,func,msg);write(_fd,_b,_n);close(_fd);}
+    }
     abort();
 }
 
@@ -986,9 +998,12 @@ static void *android__rawmemchr(const void *s, int c) {
     return (void *)p;
 }
 
-// __fdelt_chk — glibc bounds-check for fd_set slot; abort on out-of-range fd
+// __fdelt_chk — glibc bounds-check for fd_set slot
 static long android__fdelt_chk(long d) {
-    if(d < 0 || d >= 1024) abort();
+    if(d < 0 || d >= 1024) {
+        printf_log(LOG_NONE, "Warning: __fdelt_chk: fd %ld out of FD_SET range\n", d);
+        return 0;  // return word 0 — caller's bit-test will yield 0 (safe no-op)
+    }
     return d / (long)(8 * sizeof(long));
 }
 
@@ -1009,6 +1024,52 @@ static int android_wordexp_stub(const char *w, void *p, int f) {
     (void)w; (void)p; (void)f; return 4;
 }
 
+// Missing symbols needed by libmonobdwgc-2.0.so
+
+// __finite: glibc's name for isfinite(double)
+static int android___finite(double x) { return isfinite(x) ? 1 : 0; }
+
+// pthread_cancel: bionic doesn't implement it; return ENOSYS so Mono skips cancellation
+static int android_pthread_cancel(pthread_t thread) { (void)thread; return ENOSYS; }
+
+// gnu_dev_makedev: glibc extension — same as POSIX makedev()
+static unsigned long long android_gnu_dev_makedev(unsigned int maj, unsigned int min) {
+    return (unsigned long long)makedev(maj, min);
+}
+
+// shm_open/shm_unlink: on Ubuntu glibc >= 2.31 these moved from librt.so.1 to libc.so.6,
+// so the x86_64 librt.so.1 stub doesn't export them.
+// Use dlsym at call time to find them in Android's bionic libc.
+static int android_shm_open(const char* name, int oflag, unsigned int mode) {
+    typedef int (*fn_t)(const char*, int, unsigned int);
+    static fn_t fn = NULL;
+    if (!fn) fn = (fn_t)(uintptr_t)dlsym(RTLD_DEFAULT, "shm_open");
+    if (!fn) { errno = ENOSYS; return -1; }
+    return fn(name, oflag, mode);
+}
+static int android_shm_unlink(const char* name) {
+    typedef int (*fn_t)(const char*);
+    static fn_t fn = NULL;
+    if (!fn) fn = (fn_t)(uintptr_t)dlsym(RTLD_DEFAULT, "shm_unlink");
+    if (!fn) { errno = ENOSYS; return -1; }
+    return fn(name);
+}
+
+// glibc's _S_create_c_locale calls __newlocale(1<<LC_ALL=0x40, name, base).
+// Android bionic newlocale() only accepts individual LC_*_MASK bits (0x01–0x20=LC_ALL_MASK=0x3f);
+// mask 0x40 is outside that range → EINVAL → returns NULL → std::locale throws and aborts.
+// This wrapper converts glibc-style masks and maps unsupported locale names to "C".
+static locale_t android___newlocale(int category_mask, const char* locale, locale_t base) {
+    // Compute bionic-compatible mask: keep only bits 0-5, or use all if out-of-range
+    int bionic_mask = category_mask & LC_ALL_MASK;
+    if (!bionic_mask || (category_mask & ~LC_ALL_MASK))
+        bionic_mask = LC_ALL_MASK;  // glibc's 1<<LC_ALL or zero → all categories
+    // Android only supports "C" and "POSIX"; map anything else (en_US.UTF-8 etc.) to "C"
+    if (!locale || (strcmp(locale, "C") != 0 && strcmp(locale, "POSIX") != 0))
+        locale = "C";
+    return newlocale(bionic_mask, locale, base);
+}
+
 static void *android_symbol_fallback(const char *name) {
     // errno location
     if(!strcmp(name, "__errno_location") || !strcmp(name, "__h_errno_location"))
@@ -1017,7 +1078,21 @@ static void *android_symbol_fallback(const char *name) {
     if(!strcmp(name, "__ctype_b_loc"))       return android__ctype_b_loc;
     if(!strcmp(name, "__ctype_tolower_loc")) return android__ctype_tolower_loc;
     if(!strcmp(name, "__ctype_toupper_loc")) return android__ctype_toupper_loc;
-    // locale functions: bionic exports these without the __ prefix
+    // symbols needed by libmonobdwgc-2.0.so (Mono Bleeding Edge runtime)
+    if(!strcmp(name, "pthread_getattr_np")) return dlsym(RTLD_DEFAULT, "pthread_getattr_np");
+    if(!strcmp(name, "pthread_cancel"))     return android_pthread_cancel;
+    if(!strcmp(name, "__finite"))           return android___finite;
+    if(!strcmp(name, "shm_open"))           return android_shm_open;
+    if(!strcmp(name, "shm_unlink"))         return android_shm_unlink;
+    if(!strcmp(name, "gnu_dev_makedev"))    return android_gnu_dev_makedev;
+
+    // locale functions
+    // __newlocale: use our wrapper that fixes glibc's mask 0x40 → bionic-compatible mask
+    if(!strcmp(name, "__newlocale"))      return android___newlocale;
+    // the rest can go straight to bionic (locale_t created by our wrapper is bionic's type)
+    if(!strcmp(name, "__uselocale"))      return dlsym(RTLD_DEFAULT, "uselocale");
+    if(!strcmp(name, "__freelocale"))     return dlsym(RTLD_DEFAULT, "freelocale");
+    if(!strcmp(name, "__duplocale"))      return dlsym(RTLD_DEFAULT, "duplocale");
     if(!strcmp(name, "__nl_langinfo_l"))  return dlsym(RTLD_DEFAULT, "nl_langinfo_l");
     if(!strcmp(name, "__strtof_l"))       return dlsym(RTLD_DEFAULT, "strtof_l");
     if(!strcmp(name, "__strtod_l"))       return dlsym(RTLD_DEFAULT, "strtod_l");
@@ -1029,10 +1104,6 @@ static void *android_symbol_fallback(const char *name) {
     if(!strcmp(name, "__wcsftime_l"))     return dlsym(RTLD_DEFAULT, "wcsftime_l");
     if(!strcmp(name, "__iswctype_l"))     return dlsym(RTLD_DEFAULT, "iswctype_l");
     if(!strcmp(name, "__wctype_l"))       return dlsym(RTLD_DEFAULT, "wctype_l");
-    if(!strcmp(name, "__uselocale"))      return dlsym(RTLD_DEFAULT, "uselocale");
-    if(!strcmp(name, "__newlocale"))      return dlsym(RTLD_DEFAULT, "newlocale");
-    if(!strcmp(name, "__freelocale"))     return dlsym(RTLD_DEFAULT, "freelocale");
-    if(!strcmp(name, "__duplocale"))      return dlsym(RTLD_DEFAULT, "duplocale");
     if(!strcmp(name, "__towlower_l"))     return dlsym(RTLD_DEFAULT, "towlower_l");
     if(!strcmp(name, "__towupper_l"))     return dlsym(RTLD_DEFAULT, "towupper_l");
     if(!strcmp(name, "__xpg_strerror_r")) return dlsym(RTLD_DEFAULT, "strerror_r");

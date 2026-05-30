@@ -4399,6 +4399,11 @@ EXPORT void my___cxa_pure_virtual(x64emu_t* emu)
 {
     printf_log(LOG_NONE, "Pure virtual function called\n");
     emu->quit = 1;
+    { const char* _h=getenv("HOME"); char _p[512],_b[128];
+      snprintf(_p,sizeof(_p),"%s/abort_site.log",_h?_h:"/data/local/tmp");
+      int _f=open(_p,O_WRONLY|O_CREAT|O_APPEND,0644);
+      if(_f>=0){int _n=snprintf(_b,sizeof(_b),"ABORT: __cxa_pure_virtual RIP=0x%lx\n",(unsigned long)R_RIP);write(_f,_b,_n);close(_f);}
+    }
     abort();
 }
 
@@ -4710,6 +4715,15 @@ __attribute__((weak)) int dn_skipname(const unsigned char* ptr, const unsigned c
     return -1;
 }
 
+// x86_64 Linux/glibc sysconf constants.  These differ from Android Bionic's
+// numbering, so we must intercept them explicitly rather than forwarding the
+// raw value to the native sysconf() which would interpret it differently.
+// glibc:  _SC_PAGESIZE=30  _SC_NPROCESSORS_CONF=83  _SC_NPROCESSORS_ONLN=84
+// Bionic: _SC_PAGESIZE=39  _SC_NPROCESSORS_CONF=96  _SC_NPROCESSORS_ONLN=97
+#define X86_SC_PAGESIZE          30
+#define X86_SC_NPROCESSORS_CONF  83
+#define X86_SC_NPROCESSORS_ONLN  84
+
 #ifndef _SC_NPROCESSORS_ONLN
 #define _SC_NPROCESSORS_ONLN    84
 #endif
@@ -4717,11 +4731,20 @@ __attribute__((weak)) int dn_skipname(const unsigned char* ptr, const unsigned c
 #define _SC_NPROCESSORS_CONF    83
 #endif
 EXPORT long my_sysconf(x64emu_t* emu, int what) {
-    if(what==_SC_NPROCESSORS_ONLN) {
+    // Processor count: intercept both glibc (83/84) and Bionic (96/97) values
+    // because the emulated binary uses glibc constants.
+    if(what==X86_SC_NPROCESSORS_ONLN || what==_SC_NPROCESSORS_ONLN) {
         return box64_sysinfo.box64_ncpu;
     }
-    if(what==_SC_NPROCESSORS_CONF) {
+    if(what==X86_SC_NPROCESSORS_CONF || what==_SC_NPROCESSORS_CONF) {
         return box64_sysinfo.box64_ncpu;
+    }
+    // Page size: glibc uses 30, Bionic uses 39.  sysconf(30) on Bionic returns
+    // a wrong value (e.g. 1), causing the Boehm GC to believe pages are 1 byte
+    // and subsequently assert-fail in hazard-pointer.c.
+    if(what==X86_SC_PAGESIZE) {
+        long pgsz = getpagesize();
+        return (pgsz > 0) ? pgsz : 4096;
     }
     return sysconf(what);
 }

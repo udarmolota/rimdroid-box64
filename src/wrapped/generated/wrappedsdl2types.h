@@ -49,8 +49,11 @@ typedef uintptr_t (*LFppLL_t)(void*, void*, uintptr_t, uintptr_t);
 typedef void (*vFGpppp_t)(SDL_JoystickGUID, void*, void*, void*, void*);
 typedef uint32_t (*uFpippi_t)(void*, int32_t, void*, void*, int32_t);
 typedef void* (*pFpippp_t)(void*, int32_t, void*, void*, void*);
+typedef void* (*pFpiiiiu_t)(void*, int32_t, int32_t, int32_t, int32_t, uint32_t);
 
 #define SUPER() ADDED_FUNCTIONS() \
+	GO(SDL_GL_DeleteContext, vFp_t) \
+	GO(SDL_GL_SwapWindow, vFp_t) \
 	GO(SDL_UnloadObject, vFp_t) \
 	GO(SDL_GetCPUCount, iFv_t) \
 	GO(SDL_Has3DNow, iFv_t) \
@@ -66,10 +69,12 @@ typedef void* (*pFpippp_t)(void*, int32_t, void*, void*, void*);
 	GO(SDL_HasSSE3, iFv_t) \
 	GO(SDL_HasSSE41, iFv_t) \
 	GO(SDL_HasSSE42, iFv_t) \
+	GO(SDL_GL_LoadLibrary, iFp_t) \
 	GO(SDL_RWclose, iFp_t) \
 	GO(SDL_RemoveTimer, iFp_t) \
 	GO(SDL_SaveAllDollarTemplates, iFp_t) \
 	GO(SDL_RWtell, IFp_t) \
+	GO(SDL_GetWindowFlags, uFp_t) \
 	GO(SDL_ReadBE16, uFp_t) \
 	GO(SDL_ReadBE32, uFp_t) \
 	GO(SDL_ReadLE16, uFp_t) \
@@ -78,8 +83,11 @@ typedef void* (*pFpippp_t)(void*, int32_t, void*, void*, void*);
 	GO(SDL_ReadBE64, UFp_t) \
 	GO(SDL_ReadLE64, UFp_t) \
 	GO(SDL_GetThreadID, LFp_t) \
+	GO(SDL_GL_GetCurrentContext, pFv_t) \
+	GO(SDL_GL_GetCurrentWindow, pFv_t) \
 	GO(SDL_GetBasePath, pFv_t) \
 	GO(SDL_Vulkan_GetVkGetInstanceProcAddr, pFv_t) \
+	GO(SDL_GL_CreateContext, pFp_t) \
 	GO(SDL_GL_GetProcAddress, pFp_t) \
 	GO(SDL_LoadObject, pFp_t) \
 	GO(SDL_AddEventWatch, vFpp_t) \
@@ -89,6 +97,8 @@ typedef void* (*pFpippp_t)(void*, int32_t, void*, void*, void*);
 	GO(SDL_LogSetOutputFunction, vFpp_t) \
 	GO(SDL_SetEventFilter, vFpp_t) \
 	GO(SDL_Log, vFpV_t) \
+	GO(SDL_GetCurrentDisplayMode, iFip_t) \
+	GO(SDL_GetDesktopDisplayMode, iFip_t) \
 	GO(SDL_SaveDollarTemplate, iFip_t) \
 	GO(SDL_IsJoystickNintendoSwitchPro, iFWW_t) \
 	GO(SDL_IsJoystickPS4, iFWW_t) \
@@ -98,6 +108,7 @@ typedef void* (*pFpippp_t)(void*, int32_t, void*, void*, void*);
 	GO(SDL_IsJoystickHIDAPI, iFUU_t) \
 	GO(SDL_IsJoystickXInput, iFUU_t) \
 	GO(SDL_GameControllerAddMappingsFromRW, iFpi_t) \
+	GO(SDL_GL_MakeCurrent, iFpp_t) \
 	GO(SDL_GetEventFilter, iFpp_t) \
 	GO(SDL_OpenAudio, iFpp_t) \
 	GO(SDL_WriteBE16, LFpW_t) \
@@ -121,6 +132,7 @@ typedef void* (*pFpippp_t)(void*, int32_t, void*, void*, void*);
 	GO(SDL_LogWarn, vFipV_t) \
 	GO(SDL_AddHintCallback, vFppp_t) \
 	GO(SDL_DelHintCallback, vFppp_t) \
+	GO(SDL_GetWindowSize, vFppp_t) \
 	GO(SDL_DYNAPI_entry, iFupu_t) \
 	GO(SDL_TLSSet, iFupp_t) \
 	GO(SDL_SaveBMP_RW, iFppi_t) \
@@ -136,6 +148,7 @@ typedef void* (*pFpippp_t)(void*, int32_t, void*, void*, void*);
 	GO(SDL_RWwrite, LFppLL_t) \
 	GO(SDL_GetJoystickGUIDInfo, vFGpppp_t) \
 	GO(SDL_OpenAudioDevice, uFpippi_t) \
-	GO(SDL_LoadWAV_RW, pFpippp_t)
+	GO(SDL_LoadWAV_RW, pFpippp_t) \
+	GO(SDL_CreateWindow, pFpiiiiu_t)
 
 #endif // __wrappedsdl2TYPES_H_

@@ -1529,18 +1529,37 @@ int initialize(int argc, const char **argv, char** env, x64emu_t** emulator, elf
     return 0;
 }
 
+// ---- RimDroid emulate() trace (file writes survive SIGKILL/_exit) -----------
+#ifndef DYNAREC
+#include <fcntl.h>
+#endif
+#define _EMTRACE(msg) do { \
+    const char* _h = getenv("HOME"); \
+    char _p[512]; \
+    snprintf(_p, sizeof(_p), "%s/emulate_trace.log", _h ? _h : "/data/local/tmp"); \
+    int _fd = open(_p, O_WRONLY|O_CREAT|O_APPEND, 0644); \
+    if(_fd >= 0) { write(_fd, msg "\n", sizeof(msg "\n")-1); close(_fd); } \
+} while(0)
+
 int emulate(x64emu_t* emu, elfheader_t* elf_header)
 {
+    _EMTRACE("emulate: entered");
     // get entrypoint
     my_context->ep = GetEntryPoint(my_context->maplib, elf_header);
+    _EMTRACE("emulate: GetEntryPoint done");
 
     atexit(endBox64);
+    _EMTRACE("emulate: atexit registered");
+
     loadProtectionFromMap();
+    _EMTRACE("emulate: loadProtectionFromMap done");
 
     // emulate!
     printf_log(LOG_DEBUG, "Start x64emu on Main\n");
+    _EMTRACE("emulate: about to ResetFlags");
     // Stack is ready, with stacked: NULL env NULL argv argc
     ResetFlags(emu);
+    _EMTRACE("emulate: about to SetRIP/DynaRun");
     #ifdef BOX32
     if(box64_is32bits) {
         SetEIP(emu, my_context->ep);
@@ -1553,7 +1572,9 @@ int emulate(x64emu_t* emu, elfheader_t* elf_header)
         Push64(emu, my_context->exit_bridge);  // push to pop it just after
         SetRDX(emu, Pop64(emu));    // RDX is exit function
     }
+    _EMTRACE("emulate: calling DynaRun");
     DynaRun(emu);
+    _EMTRACE("emulate: DynaRun returned");
     // Get EAX
     int ret = GetEAX(emu);
     printf_log(LOG_DEBUG, "Emulation finished, EAX=%d\n", ret);

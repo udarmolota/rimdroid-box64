@@ -3263,6 +3263,7 @@
 #() LFpLppuuu
 #() LFppLpLpL
 #() LFppLppLp
+#() pFEpiiiiu
 #() pFEpupppp
 #() pFEpLiiiI
 #() pFEpLiiil
@@ -7013,6 +7014,8 @@ wrappedsdl1ttf:
 wrappedsdl2:
 % G SDL_JoystickGUID UU
 - vFp:
+  - SDL_GL_DeleteContext
+  - SDL_GL_SwapWindow
   - SDL_UnloadObject
 - iFv:
   - SDL_GetCPUCount
@@ -7030,12 +7033,14 @@ wrappedsdl2:
   - SDL_HasSSE41
   - SDL_HasSSE42
 - iFp:
+  - SDL_GL_LoadLibrary
   - SDL_RWclose
   - SDL_RemoveTimer
   - SDL_SaveAllDollarTemplates
 - IFp:
   - SDL_RWtell
 - uFp:
+  - SDL_GetWindowFlags
   - SDL_ReadBE16
   - SDL_ReadBE32
   - SDL_ReadLE16
@@ -7047,9 +7052,12 @@ wrappedsdl2:
 - LFp:
   - SDL_GetThreadID
 - pFv:
+  - SDL_GL_GetCurrentContext
+  - SDL_GL_GetCurrentWindow
   - SDL_GetBasePath
   - SDL_Vulkan_GetVkGetInstanceProcAddr
 - pFp:
+  - SDL_GL_CreateContext
   - SDL_GL_GetProcAddress
   - SDL_LoadObject
 - vFpp:
@@ -7062,6 +7070,8 @@ wrappedsdl2:
 - vFpV:
   - SDL_Log
 - iFip:
+  - SDL_GetCurrentDisplayMode
+  - SDL_GetDesktopDisplayMode
   - SDL_SaveDollarTemplate
 - iFWW:
   - SDL_IsJoystickNintendoSwitchPro
@@ -7075,6 +7085,7 @@ wrappedsdl2:
 - iFpi:
   - SDL_GameControllerAddMappingsFromRW
 - iFpp:
+  - SDL_GL_MakeCurrent
   - SDL_GetEventFilter
   - SDL_OpenAudio
 - LFpW:
@@ -7105,6 +7116,7 @@ wrappedsdl2:
 - vFppp:
   - SDL_AddHintCallback
   - SDL_DelHintCallback
+  - SDL_GetWindowSize
 - iFupu:
   - SDL_DYNAPI_entry
 - iFupp:
@@ -7136,6 +7148,8 @@ wrappedsdl2:
   - SDL_OpenAudioDevice
 - pFpippp:
   - SDL_LoadWAV_RW
+- pFpiiiiu:
+  - SDL_CreateWindow
 % vFGpppp
 wrappedsdl2image:
 - pFp:

@@ -184,7 +184,16 @@ int FUNC(_init)(library_t* lib, box64context_t* box64)
                 if(!lib->w.lib)
 #endif
 #endif
+#ifdef OPTIONAL_LIB
+                {
+                    // OPTIONAL_LIB: proceed with lib->w.lib = NULL.
+                    // getMy() will use dlsym(NULL,...) → returns NULL for
+                    // symbols not in the global namespace (all my->* = NULL).
+                    lib->path = box_strdup(MAPNAME(Name));
+                }
+#else
                 return -1;
+#endif
 #ifdef ALTNAME
 #ifdef ALTNAME2
                 else lib->path = box_strdup(ALTNAME2);

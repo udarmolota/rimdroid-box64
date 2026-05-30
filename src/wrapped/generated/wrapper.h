@@ -3300,6 +3300,7 @@ void LFpLLppuu(x64emu_t *emu, uintptr_t fnc);
 void LFpLppuuu(x64emu_t *emu, uintptr_t fnc);
 void LFppLpLpL(x64emu_t *emu, uintptr_t fnc);
 void LFppLppLp(x64emu_t *emu, uintptr_t fnc);
+void pFEpiiiiu(x64emu_t *emu, uintptr_t fnc);
 void pFEpupppp(x64emu_t *emu, uintptr_t fnc);
 void pFEpLiiiI(x64emu_t *emu, uintptr_t fnc);
 void pFEpLiiil(x64emu_t *emu, uintptr_t fnc);

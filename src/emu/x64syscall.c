@@ -22,6 +22,7 @@
 #include <sys/prctl.h>
 #include <poll.h>
 #include <sys/epoll.h>
+#include <fcntl.h>
 
 #include "x64_signals.h"
 #include "os.h"
@@ -537,9 +538,28 @@ void EXPORT x64Syscall_linux(x64emu_t *emu)
         int sc = syscallwrap[s].nats;
         switch(syscallwrap[s].nbpars) {
             case 0: S_RAX = syscall(sc); break;
-            case 1: 
-                if(s==80) {if(log) snprintf(buff2, 127, " [sys_chdir(\"%s\")]", (char*)R_RDI);}; 
-                S_RAX = syscall(sc, R_RDI); 
+            case 1:
+                if(s==80) {if(log) snprintf(buff2, 127, " [sys_chdir(\"%s\")]", (char*)R_RDI);};
+                if(s == 60 || s == 231) {
+                    const char* home_dir = getenv("HOME");
+                    char exit_path[512];
+                    snprintf(exit_path, sizeof(exit_path), "%s/exit_debug.log",
+                             home_dir ? home_dir : "/data/local/tmp");
+                    int efd = open(exit_path, O_WRONLY|O_CREAT|O_APPEND, 0644);
+                    if(efd >= 0) {
+                        char ebuf[256];
+                        int elen = snprintf(ebuf, sizeof(ebuf),
+                            "=== %s(code=%ld) x86_64 RIP=0x%lx ===\n",
+                            s==231 ? "exit_group" : "exit",
+                            (long)R_RDI, (unsigned long)R_RIP);
+                        write(efd, ebuf, elen);
+                        close(efd);
+                    }
+                    printf_log(LOG_NONE, "=== %s(code=%ld) x86_64 RIP=0x%lx ===\n",
+                               s==231 ? "exit_group" : "exit",
+                               (long)R_RDI, (unsigned long)R_RIP);
+                }
+                S_RAX = syscall(sc, R_RDI);
                 break;
             case 2: 
                 if(s==33) {if(log) snprintf(buff2, 127, " [sys_access(\"%s\", %ld)]", (char*)R_RDI, R_RSI);}; 
