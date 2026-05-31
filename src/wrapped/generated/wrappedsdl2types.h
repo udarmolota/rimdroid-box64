@@ -27,6 +27,7 @@ typedef int32_t (*iFWW_t)(uint16_t, uint16_t);
 typedef int32_t (*iFUU_t)(uint64_t, uint64_t);
 typedef int32_t (*iFpi_t)(void*, int32_t);
 typedef int32_t (*iFpp_t)(void*, void*);
+typedef uint32_t (*uFpp_t)(void*, void*);
 typedef uintptr_t (*LFpW_t)(void*, uint16_t);
 typedef uintptr_t (*LFpu_t)(void*, uint32_t);
 typedef uintptr_t (*LFpU_t)(void*, uint64_t);
@@ -70,6 +71,7 @@ typedef void* (*pFpiiiiu_t)(void*, int32_t, int32_t, int32_t, int32_t, uint32_t)
 	GO(SDL_HasSSE41, iFv_t) \
 	GO(SDL_HasSSE42, iFv_t) \
 	GO(SDL_GL_LoadLibrary, iFp_t) \
+	GO(SDL_PollEvent, iFp_t) \
 	GO(SDL_RWclose, iFp_t) \
 	GO(SDL_RemoveTimer, iFp_t) \
 	GO(SDL_SaveAllDollarTemplates, iFp_t) \
@@ -111,6 +113,7 @@ typedef void* (*pFpiiiiu_t)(void*, int32_t, int32_t, int32_t, int32_t, uint32_t)
 	GO(SDL_GL_MakeCurrent, iFpp_t) \
 	GO(SDL_GetEventFilter, iFpp_t) \
 	GO(SDL_OpenAudio, iFpp_t) \
+	GO(SDL_GetMouseState, uFpp_t) \
 	GO(SDL_WriteBE16, LFpW_t) \
 	GO(SDL_WriteLE16, LFpW_t) \
 	GO(SDL_WriteBE32, LFpu_t) \

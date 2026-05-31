@@ -5634,6 +5634,8 @@ wrappedlibc:
 - iFppi:
   - ftw
   - ftw64
+- iFppL:
+  - bcmp
 - iFppp:
   - __cxa_atexit
   - __cxa_thread_atexit_impl
@@ -5789,6 +5791,8 @@ wrappedlibc:
   - __sprintf_chk
 - iFpuppp:
   - __vswprintf_chk
+- iFpppLp:
+  - getprotobyname_r
 - lFippLL:
   - __readlinkat_chk
 - pFpLLiN:
@@ -7034,6 +7038,7 @@ wrappedsdl2:
   - SDL_HasSSE42
 - iFp:
   - SDL_GL_LoadLibrary
+  - SDL_PollEvent
   - SDL_RWclose
   - SDL_RemoveTimer
   - SDL_SaveAllDollarTemplates
@@ -7088,6 +7093,8 @@ wrappedsdl2:
   - SDL_GL_MakeCurrent
   - SDL_GetEventFilter
   - SDL_OpenAudio
+- uFpp:
+  - SDL_GetMouseState
 - LFpW:
   - SDL_WriteBE16
   - SDL_WriteLE16

@@ -4,6 +4,8 @@
 #define _GNU_SOURCE         /* See feature_test_macros(7) */
 #include <dlfcn.h>
 #include <stdarg.h>
+#include <unistd.h>
+#include <sys/syscall.h>
 
 #include "wrappedlibs.h"
 
@@ -132,15 +134,55 @@ static void rd_glGetInternalformativ(uint32_t target, uint32_t internalformat, u
         default:     v = 1;       break; // default to "supported/yes" rather than 0
     }
     for (int32_t i = 0; i < count; ++i) params[i] = v;
+    static int n=0; if(n<24){n++; printf_log(LOG_NONE, "RIMDROID glGetInternalformativ ifmt=0x%x pname=0x%x => %d\n", internalformat, pname, v);}
 }
+// Resolve a REAL Zink GL entry point (dlsym + eglGetProcAddress fallback).
+static void* rd_zfa_gl(const char* n) { return rimdroid_gl_proc_resolver(n); }
+
+// libzfa lacks the DSA getters (glGetTextureParameteriv/LevelParameteriv, GL4.5)
+// but DOES export the classic GL-1.0 glGetTexParameteriv/glGetTexLevelParameteriv.
+// Returning 0 (the old stub) made Unity read TEXTURE_WIDTH=0 on a freshly-created
+// texture → "0x0 texture" → GfxDevice "device lost" → the infinite
+// SDL_GL_DeleteContext(NULL) teardown loop.  Proxy DSA→classic: bind the texture
+// to GL_TEXTURE_2D, query via the classic getter, restore the previous binding.
 static void rd_glGetTextureParameteriv(uint32_t texture, uint32_t pname, int32_t* params) {
-    (void)texture; (void)pname; if (params) params[0] = 0;
+    static void (*bind)(uint32_t,uint32_t) = 0;
+    static void (*get)(uint32_t,uint32_t,int32_t*) = 0;
+    static void (*getiv)(uint32_t,int32_t*) = 0;
+    static int init = 0;
+    if (!init) { init=1; bind=rd_zfa_gl("glBindTexture"); get=rd_zfa_gl("glGetTexParameteriv"); getiv=rd_zfa_gl("glGetIntegerv"); }
+    if (!params) return;
+    params[0] = 0;
+    if (bind && get && getiv) {
+        int32_t prev = 0; getiv(0x8069 /*GL_TEXTURE_BINDING_2D*/, &prev);
+        bind(0x0DE1 /*GL_TEXTURE_2D*/, texture);
+        get(0x0DE1, pname, params);
+        bind(0x0DE1, (uint32_t)prev);
+    }
+    static int n=0; if(n<16){n++; printf_log(LOG_NONE, "RIMDROID glGetTextureParameteriv tex=%u pname=0x%x => %d%s\n", texture, pname, params[0], (bind&&get)?"":" [no-proxy]");}
 }
 static void rd_glGetTextureLevelParameteriv(uint32_t texture, int32_t level, uint32_t pname, int32_t* params) {
-    (void)texture; (void)level; (void)pname; if (params) params[0] = 0;
+    static void (*bind)(uint32_t,uint32_t) = 0;
+    static void (*get)(uint32_t,int32_t,uint32_t,int32_t*) = 0;
+    static void (*getiv)(uint32_t,int32_t*) = 0;
+    static int init = 0;
+    if (!init) { init=1; bind=rd_zfa_gl("glBindTexture"); get=rd_zfa_gl("glGetTexLevelParameteriv"); getiv=rd_zfa_gl("glGetIntegerv"); }
+    if (!params) return;
+    params[0] = 0;
+    if (bind && get && getiv) {
+        int32_t prev = 0; getiv(0x8069 /*GL_TEXTURE_BINDING_2D*/, &prev);
+        bind(0x0DE1 /*GL_TEXTURE_2D*/, texture);
+        get(0x0DE1, level, pname, params);
+        bind(0x0DE1, (uint32_t)prev);
+    }
+    static int n=0; if(n<16){n++; printf_log(LOG_NONE, "RIMDROID glGetTextureLevelParameteriv tex=%u lvl=%d pname=0x%x => %d%s\n", texture, level, pname, params[0], (bind&&get)?"":" [no-proxy]");}
 }
 static void rd_glGetQueryObjectui64v(uint32_t id, uint32_t pname, uint64_t* params) {
-    (void)id; (void)pname; if (params) params[0] = 0;
+    if (!params) return;
+    // GL_QUERY_RESULT_AVAILABLE(0x8867) → TRUE (else Unity may wait forever / treat
+    // GPU timers as broken = device failure); GL_QUERY_RESULT(0x8866) → 0.
+    params[0] = (pname == 0x8867) ? 1u : 0u;
+    static int n=0; if(n<16){n++; printf_log(LOG_NONE, "RIMDROID glGetQueryObjectui64v id=%u pname=0x%x => %llu\n", id, pname, (unsigned long long)params[0]);}
 }
 
 // DIAGNOSTIC: instrument glTexSubImage2D (crash site).  Logs args + whether a
@@ -814,8 +856,8 @@ int EXPORT my2_SDL_DYNAPI_entry(x64emu_t* emu, uint32_t version, uintptr_t *tabl
     // RimWorldLinux ships Unity's own static SDL2, whose SDL_dynapi jump-table
     // index order differs from box64's canonical SDL_dynapi_procs.h.  The loop
     // below installs each wrapped bridge at box64's index; for the GL cluster
-    // those indices are wrong for RimWorld (it lacks GL_GetDrawableSize, so the
-    // cluster is shifted -5 then -6), and Unity's renderer detection lands our
+    // those indices are wrong for RimWorld (its GL cluster is uniformly shifted
+    // -5 vs box64's SDL_dynapi order), and Unity's renderer detection lands our
     // bridges on the wrong slots (e.g. SDL_GL_GetAttribute hits our LoadLibrary
     // bridge).  RimWorld's real indices were obtained by disassembling its
     // built-in SDL_DYNAPI_entry and matching each static wrapper to the
@@ -826,8 +868,14 @@ int EXPORT my2_SDL_DYNAPI_entry(x64emu_t* emu, uint32_t version, uintptr_t *tabl
         {"SDL_GL_GetProcAddress", 510},
         {"SDL_GL_CreateContext",  515},
         {"SDL_GL_MakeCurrent",    516},
-        {"SDL_GL_SwapWindow",     521},
-        {"SDL_GL_DeleteContext",  522},
+        // FIX (2026-05-31): the game DOES have SDL_GL_GetDrawableSize (game idx 519,
+        // verified by disassembling its SDL_GL_* stubs reading jump_table[base+idx*8]).
+        // So the GL cluster shift is a UNIFORM -5, NOT -5-then-6. The old 521/522 put
+        // the SwapWindow bridge where the game calls GetSwapInterval, and routed the
+        // game's SwapWindow (idx 522) into our DeleteContext no-op → render thread span
+        // SwapWindow forever, swap=0, black screen ("the loop"). Correct: 522/523.
+        {"SDL_GL_SwapWindow",     522},
+        {"SDL_GL_DeleteContext",  523},
         // 1.5 game indices (box64 has GetDrawableSize the game lacks → shift):
         {"SDL_GL_GetCurrentWindow",  517},
         {"SDL_GL_GetCurrentContext", 518},
@@ -844,10 +892,16 @@ int EXPORT my2_SDL_DYNAPI_entry(x64emu_t* emu, uint32_t version, uintptr_t *tabl
         // TEST: force display mode 1024x768 @ 60 Hz (game idx; box64 468/469, shift -5)
         {"SDL_GetDesktopDisplayMode", 463},
         {"SDL_GetCurrentDisplayMode", 464},
+        // Phase A input: route the game's SDL_PollEvent (game idx 81, from
+        // disassembling its stub) to our my2_SDL_PollEvent injector.
+        {"SDL_PollEvent",            81},
+        // SDL_GetMouseState (game idx 205) → return our injected cursor/buttons so
+        // selection-drag and right-click targeting use the right position.
+        {"SDL_GetMouseState",       205},
     };
     const int rd_nremap = (int)(sizeof(rd_remap)/sizeof(rd_remap[0]));
-    uint32_t  rd_box64_idx[13];
-    uintptr_t rd_bridge[13];
+    uint32_t  rd_box64_idx[20];
+    uintptr_t rd_bridge[20];
     for (int rj = 0; rj < rd_nremap; ++rj) { rd_box64_idx[rj] = (uint32_t)-1; rd_bridge[rj] = 0; }
 
     #define SDL_DYNAPI_PROC(ret, sym, args, parms, ...) \
@@ -1245,6 +1299,7 @@ extern __attribute__((weak)) void* g_egl_context;
 extern __attribute__((weak)) void* g_zfa_context;
 extern __attribute__((weak)) int  rimdroid_zfa_make_current(void);
 extern __attribute__((weak)) void rimdroid_zfa_swap(void);
+extern __attribute__((weak)) int  rimdroid_zfa_release_current(void);
 
 // Lazy-open libEGL.so and cache the handle.
 static void* rimdroid_libegl(void) {
@@ -1305,8 +1360,11 @@ static void rd_fill_display_mode(void* mode) {
     if (!mode) return;
     rd_SDL_DisplayMode* m = (rd_SDL_DisplayMode*)mode;
     m->format = 0x16161804;   // SDL_PIXELFORMAT_RGB888
-    m->w = 1024; m->h = 768;  // same as the consistent pipeline size
-    m->refresh_rate = 60;     // was 0 (dummy) → suspected co-trigger
+    m->w = g_window_w; m->h = g_window_h;  // NATIVE (default 2340x1080). Reporting a
+                                           // fake 1024x768 desktop made Unity render
+                                           // 1024x768 into the native buffer → tiny
+                                           // image in a corner. Match the real size.
+    m->refresh_rate = 60;     // 60 Hz (dummy reports 0)
     m->driverdata = NULL;
 }
 EXPORT int my2_SDL_GetDesktopDisplayMode(int displayIndex, void* mode) {
@@ -1340,6 +1398,9 @@ EXPORT void* my2_SDL_CreateWindow(x64emu_t* emu, void* title, int x, int y, int 
 // returned by my2_SDL_GL_GetCurrentWindow so Unity's "is a window/context
 // current?" checks see a valid current window even though we bypass SDL's GL.
 static void* g_gl_window = NULL;
+// The context handle Unity currently considers "current" (a distinct opaque alias
+// per CreateContext — see my2_SDL_GL_CreateContext).  Returned by GetCurrentContext.
+static void* g_rd_ctx_current = NULL;
 // DEBUG counters to characterise the DeleteContext loop's GL call mix.
 static unsigned long g_cnt_getctx=0, g_cnt_getwin=0, g_cnt_makecur=0,
                      g_cnt_swap=0, g_cnt_create=0, g_cnt_setattr=0, g_cnt_getattr=0;
@@ -1352,7 +1413,7 @@ static unsigned long g_cnt_getctx=0, g_cnt_getwin=0, g_cnt_makecur=0,
 // both to report our context/window as current.
 EXPORT void* my2_SDL_GL_GetCurrentContext(void) {
     g_cnt_getctx++;
-    if (&g_zfa_context && g_zfa_context) return g_zfa_context;
+    if (&g_zfa_context && g_zfa_context) return g_rd_ctx_current ? g_rd_ctx_current : g_zfa_context;
     if (g_egl_context) return g_egl_context;
     if (my->SDL_GL_GetCurrentContext) return my->SDL_GL_GetCurrentContext();
     return NULL;
@@ -1369,8 +1430,15 @@ EXPORT void* my2_SDL_GL_CreateContext(void* win) {
     g_gl_window = win;
     if (&g_zfa_context && g_zfa_context) {
         if (rimdroid_zfa_make_current) rimdroid_zfa_make_current();
-        printf_log(LOG_NONE, "RIMDROID SDL_GL_CreateContext → ZFA ctx %p (Zink core) win=%p — MILESTONE reached\n", g_zfa_context, win);
-        return g_zfa_context;
+        // Hand back a DISTINCT opaque handle per call (all alias the one ZFA ctx).
+        // Unity 2019 GLCore creates a 2nd (shared) context; returning the SAME
+        // pointer twice (create=2) confused its context bookkeeping → endless
+        // DeleteContext teardown of NULL-ctx nodes. Distinct handles keep its
+        // bookkeeping consistent. They are opaque to Unity (compared/passed only).
+        void* fake = (void*)((uintptr_t)g_zfa_context + (uintptr_t)(g_cnt_create * 0x10000UL));
+        g_rd_ctx_current = fake;
+        printf_log(LOG_NONE, "RIMDROID SDL_GL_CreateContext #%lu → handle %p (ZFA %p) win=%p tid=%ld — MILESTONE reached\n", g_cnt_create, fake, g_zfa_context, win, (long)syscall(SYS_gettid));
+        return fake;
     }
     if (g_egl_context) {
         rimdroid_egl_make_current();
@@ -1390,13 +1458,27 @@ EXPORT void* my2_SDL_GL_CreateContext(void* win) {
 EXPORT int my2_SDL_GL_MakeCurrent(void* win, void* ctx) {
     g_cnt_makecur++;
     (void)win;
-    printf_log(LOG_NONE, "RIMDROID SDL_GL_MakeCurrent(win=%p ctx=%p) zfa=%p egl=%p\n",
-               win, ctx, (&g_zfa_context)?g_zfa_context:NULL, g_egl_context);
+    printf_log(LOG_NONE, "RIMDROID SDL_GL_MakeCurrent(win=%p ctx=%p) tid=%ld zfa=%p egl=%p\n",
+               win, ctx, (long)syscall(SYS_gettid), (&g_zfa_context)?g_zfa_context:NULL, g_egl_context);
     if (&g_zfa_context && g_zfa_context) {
         if (!ctx) {
-            printf_log(LOG_NONE, "RIMDROID SDL_GL_MakeCurrent → ZFA unbind (no-op)\n");
+            // CONFIRMED ROOT CAUSE (tid log): Unity's threaded renderer hands the
+            // GL context between the main thread and a render worker via
+            // MakeCurrent(NULL)[release-here] then MakeCurrent(ctx)[acquire-there].
+            // A no-op here left the ZFA/Zink st_context "current" on the donor
+            // thread too → one context current on TWO threads → concurrent pipe_context
+            // use → device-lost → infinite teardown.  Honour the unbind: release the
+            // st_context from THIS thread via libzfa's zfaReleaseCurrent
+            // (= st_api_make_current(NULL,NULL,NULL)).  The handoff is serialized, so
+            // a single context legally migrates between threads.
+            // NOTE: no-op (rel=-1) until a rebuilt libzfa exporting zfaReleaseCurrent
+            // is installed — then this serializes ownership and should kill the loop.
+            int rel = (rimdroid_zfa_release_current) ? rimdroid_zfa_release_current() : -1;
+            g_rd_ctx_current = NULL;
+            printf_log(LOG_NONE, "RIMDROID SDL_GL_MakeCurrent → ZFA unbind (release=%d)\n", rel);
             return 0;
         }
+        g_rd_ctx_current = ctx;   // track what Unity now considers the current context
         int ok = (rimdroid_zfa_make_current && rimdroid_zfa_make_current());
         printf_log(LOG_NONE, "RIMDROID SDL_GL_MakeCurrent → ZFA rebind %s\n", ok ? "OK" : "FAIL");
         return ok ? 0 : -1;
@@ -1429,6 +1511,31 @@ EXPORT void my2_SDL_GL_SwapWindow(void* win) {
 }
 
 // SDL_GL_DeleteContext(ctx) → no-op for our context (it outlives the game loop).
+// ===================== RimDroid injected input (Phase A) =====================
+// The injected-event ring lives in librimdroid.so (rimdroid.c) because box64 is a
+// SEPARATE .so and only the reverse (box64 weakly referencing rimdroid symbols)
+// links. rd_input_poll() fills the caller's x86_64 SDL_Event (56 bytes) from the
+// ring and returns 1, else 0. We drain it before the real (dummy, empty) PollEvent.
+extern __attribute__((weak)) int rd_input_poll(unsigned char* out56);
+
+EXPORT int my2_SDL_PollEvent(void* event) {
+    if (event && rd_input_poll && rd_input_poll((unsigned char*)event))
+        return 1;
+    if (my->SDL_PollEvent) return my->SDL_PollEvent(event);
+    return 0;
+}
+
+// RimWorld polls the mouse position/buttons via SDL_GetMouseState for things like
+// selection-drag and right-click targeting. The real (dummy) SDL doesn't know our
+// injected cursor, so return it from rimdroid.c (weak rd_input_get_mouse).
+extern __attribute__((weak)) unsigned int rd_input_get_mouse(int* x, int* y);
+EXPORT uint32_t my2_SDL_GetMouseState(void* x, void* y) {
+    if (rd_input_get_mouse) return rd_input_get_mouse((int*)x, (int*)y);
+    if (my->SDL_GetMouseState) return my->SDL_GetMouseState(x, y);
+    return 0;
+}
+// ============================================================================
+
 EXPORT void my2_SDL_GL_DeleteContext(x64emu_t* emu, void* ctx) {
     (void)emu;
     // Rate-limited counter only (per-call logging flooded the log + slowed the
@@ -1437,6 +1544,29 @@ EXPORT void my2_SDL_GL_DeleteContext(x64emu_t* emu, void* ctx) {
     if ((++rd_dc_count % 20000UL) == 1UL)
         printf_log(LOG_NONE, "RIMDROID DeleteCtx#%lu | create=%lu makecur=%lu swap=%lu getctx=%lu getwin=%lu setattr=%lu getattr=%lu\n",
                    rd_dc_count, g_cnt_create, g_cnt_makecur, g_cnt_swap, g_cnt_getctx, g_cnt_getwin, g_cnt_setattr, g_cnt_getattr);
+    // On the VERY FIRST DeleteContext (= start of the teardown loop), dump the
+    // guest stack so we can see which UnityPlayer.so function initiated it. We
+    // scan upward from the guest RSP (committed stack, safe to read) and print
+    // any slot that resolves to a code address inside a loaded ELF (filtered via
+    // FindElfAddress), naming it with getAddrFunctionName(). Runs exactly once.
+    if (rd_dc_count == 1UL) {
+        long rd_tid = (long)syscall(SYS_gettid);
+        printf_log(LOG_NONE, "RIMDROID ===== DeleteCtx#1 GUEST STACK SCAN tid=%ld RIP=%p RSP=%p RBP=%p ctx=%p =====\n",
+                   rd_tid, (void*)R_RIP, (void*)R_RSP, (void*)R_RBP, ctx);
+        uintptr_t rd_sp = R_RSP;
+        uintptr_t rd_lastval = 0;
+        int rd_printed = 0;
+        for (int i = 0; i < 1024 && rd_printed < 48; i++) {
+            uintptr_t val = *(uintptr_t*)(rd_sp + (uintptr_t)i * 8u);
+            if (!val || val == rd_lastval) continue;
+            if (!FindElfAddress(my_context, val)) continue;
+            rd_lastval = val;
+            printf_log(LOG_NONE, "  [sp+0x%04x] %p  %s\n",
+                       (unsigned)(i * 8), (void*)val, getAddrFunctionName(val));
+            rd_printed++;
+        }
+        printf_log(LOG_NONE, "RIMDROID ===== DeleteCtx#1 STACK SCAN END (%d entries) =====\n", rd_printed);
+    }
     // In ZFA/EGL mode WE own the GL context (created via zfaCreateContext /
     // eglCreateContext, NOT via SDL).  There is no real SDL GL context to
     // delete, and my->SDL_GL_DeleteContext is NULL for the statically-linked

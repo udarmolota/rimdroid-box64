@@ -904,21 +904,28 @@ void my_box64signalhandler(int32_t sig, siginfo_t* info, void * ucntx)
     int db_searched = 0;
     uintptr_t x64pc = (uintptr_t)-1;
     x64pc = R_RIP;
-    // --- RimDroid: log x86_64 RIP into signal_debug.log ---
+    // --- RimDroid: log x86_64 RIP into signal_debug.log — GATED (RIMDROID_SIGLOG=1)
+    // This fires on EVERY signal; box64's lazy-bridge mechanism throws thousands of
+    // SIGSEGVs during init, so writing each one (open/write/close) wrote ~16 MB/run
+    // and slowed every launch to a crawl ("hangs").  Default OFF.
     {
-        const char* home2 = getenv("HOME");
-        char path2[512];
-        snprintf(path2, sizeof(path2), "%s/signal_debug.log", home2 ? home2 : "/data/local/tmp");
-        int fd2 = open(path2, O_WRONLY|O_CREAT|O_APPEND, 0644);
-        if(fd2 >= 0) {
-            char buf2[256];
-            int n2 = snprintf(buf2, sizeof(buf2),
-                "    x86_64 RIP=0x%lx RSP=0x%lx tid=%d\n",
-                (unsigned long)x64pc,
-                (unsigned long)R_RSP,
-                GetTID());
-            write(fd2, buf2, n2);
-            close(fd2);
+        static int rd_riplog = -1;
+        if (rd_riplog < 0) { const char* _e = getenv("RIMDROID_SIGLOG"); rd_riplog = (_e && _e[0]=='1') ? 1 : 0; }
+        if (rd_riplog) {
+            const char* home2 = getenv("HOME");
+            char path2[512];
+            snprintf(path2, sizeof(path2), "%s/signal_debug.log", home2 ? home2 : "/data/local/tmp");
+            int fd2 = open(path2, O_WRONLY|O_CREAT|O_APPEND, 0644);
+            if(fd2 >= 0) {
+                char buf2[256];
+                int n2 = snprintf(buf2, sizeof(buf2),
+                    "    x86_64 RIP=0x%lx RSP=0x%lx tid=%d\n",
+                    (unsigned long)x64pc,
+                    (unsigned long)R_RSP,
+                    GetTID());
+                write(fd2, buf2, n2);
+                close(fd2);
+            }
         }
     }
     // --------------------------------------------------------
