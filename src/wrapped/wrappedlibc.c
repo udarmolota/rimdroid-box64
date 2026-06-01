@@ -2269,6 +2269,52 @@ static int shm_unlink(const char *name) {
 #define TMP_CPUCACHE_ASSOC "box64_cpucacheassoc"
 #define TMP_CPUCACHE_COHER "box64_cpucachecoher"
 #define TMP_CPUCACHE_SIZE "box64_cpucachesize"
+
+// Anonymous in-memory fd for synthesized /proc files. shm_open is a -1 stub on Android,
+// so prefer memfd_create there (and on any kernel that has it).
+static int box64_anon_fd(const char* name)
+{
+#ifdef __NR_memfd_create
+    int fd = syscall(__NR_memfd_create, name, 0);
+    if(fd>=0) return fd;
+#endif
+    int fd2 = shm_open(name, O_RDWR | O_CREAT, S_IRWXU);
+    if(fd2>=0) shm_unlink(name);
+    return fd2;
+}
+
+// Spoof /proc/self/auxv so AT_PLATFORM (and AT_BASE_PLATFORM) report "x86_64".
+// Some libraries (e.g. MonoMod, used by Harmony) read this file to detect the CPU arch;
+// the real Android/ARM kernel reports "aarch64", which makes MonoMod select an
+// unimplemented ARM64 detour backend and fail every patch. The string is a process-global
+// constant, so the guest can dereference the AT_PLATFORM pointer we hand it.
+static const char box64_x86_platform_str[] = "x86_64";
+static void CreateAuxvFile(int fd, uintptr_t* auxv)
+{
+    size_t dummy;
+    int has_platform = 0;
+    if(auxv) {
+        while(auxv[0]) {
+            uint64_t pair[2] = { (uint64_t)auxv[0], (uint64_t)auxv[1] };
+            if(auxv[0]==15 /*AT_PLATFORM*/) {
+                pair[1] = (uint64_t)(uintptr_t)box64_x86_platform_str;
+                has_platform = 1;
+            } else if(auxv[0]==24 /*AT_BASE_PLATFORM*/) {
+                pair[1] = (uint64_t)(uintptr_t)box64_x86_platform_str;
+            }
+            dummy = write(fd, pair, sizeof(pair));
+            auxv += 2;
+        }
+    }
+    if(!has_platform) {
+        uint64_t pl[2] = { 15 /*AT_PLATFORM*/, (uint64_t)(uintptr_t)box64_x86_platform_str };
+        dummy = write(fd, pl, sizeof(pl));
+    }
+    uint64_t term[2] = { 0 /*AT_NULL*/, 0 };
+    dummy = write(fd, term, sizeof(term));
+    (void)dummy;
+}
+
 EXPORT int32_t my_open(x64emu_t* emu, void* pathname, int32_t flags, uint32_t mode)
 {
     if(isProcSelf((const char*) pathname, "cmdline")) {
@@ -2299,6 +2345,14 @@ EXPORT int32_t my_open(x64emu_t* emu, void* pathname, int32_t flags, uint32_t mo
     }
     if(isProcSelf((const char*)pathname, "exe")) {
         return open(emu->context->fullpath, flags, mode);
+    }
+    if(isProcSelf((const char*)pathname, "auxv")) {
+        // report x86_64 in AT_PLATFORM (see CreateAuxvFile)
+        int tmp = box64_anon_fd("box64_auxv");
+        if(tmp<0) return open(pathname, flags, mode); // error fallback
+        CreateAuxvFile(tmp, emu->context->auxval_start);
+        lseek(tmp, 0, SEEK_SET);
+        return tmp;
     }
     #ifndef NOALIGN
     if(strcmp((const char*)pathname, "/proc/cpuinfo")==0) {
@@ -2443,6 +2497,14 @@ EXPORT int32_t my_open64(x64emu_t* emu, void* pathname, int32_t flags, uint32_t 
     if(isProcSelf((const char*)pathname, "exe")) {
         return open64(emu->context->fullpath, flags, mode);
     }
+    if(isProcSelf((const char*)pathname, "auxv")) {
+        // report x86_64 in AT_PLATFORM (see CreateAuxvFile)
+        int tmp = box64_anon_fd("box64_auxv");
+        if(tmp<0) return open64(pathname, flags, mode); // error fallback
+        CreateAuxvFile(tmp, emu->context->auxval_start);
+        lseek(tmp, 0, SEEK_SET);
+        return tmp;
+    }
     #ifndef NOALIGN
     if(strcmp((const char*)pathname, "/proc/cpuinfo")==0) {
         // special case for cpuinfo
@@ -2519,6 +2581,14 @@ EXPORT FILE* my_fopen64(x64emu_t* emu, const char* path, const char* mode)
     }
     if(isProcSelf((const char*)path, "exe")) {
         return fopen64(emu->context->fullpath, mode);
+    }
+    if(isProcSelf(path, "auxv")) {
+        // report x86_64 in AT_PLATFORM (see CreateAuxvFile)
+        int tmp = box64_anon_fd("box64_auxv");
+        if(tmp<0) return fopen64(path, mode); // error fallback
+        CreateAuxvFile(tmp, emu->context->auxval_start);
+        lseek(tmp, 0, SEEK_SET);
+        return fdopen(tmp, mode);
     }
     if(isProcSelf(path, "maps")) {
         // special case for self memory map
