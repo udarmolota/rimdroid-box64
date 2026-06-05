@@ -34,6 +34,20 @@
 #include "library_inner.h"
 
 #include "wrappedlibs.h"
+
+// RimDroid: strongmem level applied once Mono (libmonobdwgc-2.0.so) loads — i.e. the level the
+// game runs at for the DOMINANT phase (GC + all C#-JIT compiled after Mono init). Upstream hard-set
+// this to 1 (fast, but the weak memory model is the suspected MediaTek/Cortex GC SIGSEGV + save-
+// corruption cause); =4 (QEMU model) fixed correctness hopes but noticeably slowed Adreno (world-gen
+// + FPS). 3 = SEQ_WRITE (a barrier every 3rd store) is the tunable middle ground. Sweep 1..4 here to
+// find the knee that fixes MediaTek without taxing Adreno.
+// Set back to 1 (= upstream box64 behaviour) for the release: the strongmem sweep is a DEAD END for
+// the MediaTek save-corruption bug — even =4 (strongest) didn't fix it (tester, 2026-06-05), so it's
+// not a memory-model issue; and >1 costs Adreno FPS. Kept tunable for any future re-investigation.
+#ifndef RD_MONO_STRONGMEM
+#define RD_MONO_STRONGMEM 1
+#endif
+
 // create the native lib list
 #define GO(P, N) int wrapped##N##_init(library_t* lib, box64context_t *box64); \
                  void wrapped##N##_fini(library_t* lib);
@@ -370,9 +384,13 @@ static int loadEmulatedLib(const char* libname, library_t *lib, box64context_t* 
         int env_changed = 0;
         #ifdef DYNAREC
         if(libname && BOX64ENV(dynarec_bleeding_edge) && strstr(libname, "libmonobdwgc-2.0.so")) {
-            printf_dump(LOG_INFO, "MonoBleedingEdge detected, disable Dynarec BigBlock and enable Dynarec StrongMem\n");
+            printf_dump(LOG_INFO, "MonoBleedingEdge detected, disable Dynarec BigBlock and set Dynarec StrongMem=%d (RimDroid)\n", RD_MONO_STRONGMEM);
             SET_BOX64ENV(dynarec_bigblock, 0);
-            SET_BOX64ENV(dynarec_strongmem, 1);
+            // RimDroid: set the post-Mono-load strongmem to our tunable RD_MONO_STRONGMEM instead of
+            // upstream's hardcoded 1. This is the level the game runs at for its dominant phase (GC +
+            // C#-JIT). 1 = fast but the MediaTek/Cortex GC SIGSEGV + save corruption; 4 = strict but
+            // slowed Adreno; 3 = middle ground under test.
+            SET_BOX64ENV(dynarec_strongmem, RD_MONO_STRONGMEM);
             env_changed = 1;
         }
         if(libname && BOX64ENV(unityplayer) && strstr(libname, "UnityPlayer.so")) {

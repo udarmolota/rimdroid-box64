@@ -43,8 +43,17 @@ static void* g_gl4es_host_handle = NULL;
 // (so Zink can reach the Vulkan loader/driver).  A plain dlopen() here would
 // fail to link those, so resolve GL entry points from that inherited handle.
 extern __attribute__((weak)) void* g_zfa_handle;
+// RD_SOFTPIPE: libOSMesa.so handle (set by rimdroid.c's rimdroid_init_osmesa).
+// libOSMesa exports the full GL API as plain symbols, so a straight dlsym
+// resolves every entry point softpipe provides (proven by the Milestone 1 smoke
+// test). A miss means the symbol genuinely is absent → the GetProcAddress wrapper
+// falls back to its zeroing/no-op stubs, same as for ZFA.
+extern __attribute__((weak)) void* g_osmesa_handle;
 static void* rimdroid_gl_proc_resolver(const char* name)
 {
+    if (&g_osmesa_handle && g_osmesa_handle) {
+        return dlsym(g_osmesa_handle, name);
+    }
     if (&g_zfa_handle && g_zfa_handle) {
         void* p = dlsym(g_zfa_handle, name);
         if (p) return p;
@@ -1301,6 +1310,17 @@ extern __attribute__((weak)) int  rimdroid_zfa_make_current(void);
 extern __attribute__((weak)) void rimdroid_zfa_swap(void);
 extern __attribute__((weak)) int  rimdroid_zfa_release_current(void);
 
+// RD_SOFTPIPE renderer: OSMesa (CPU softpipe) OFFSCREEN context created by
+// rimdroid.c (rimdroid_init_osmesa). g_osmesa_context!=NULL selects the software
+// path in the my2_SDL_GL_* handlers below. Unlike ZFA (which auto-presents via
+// its kopper/Vulkan swapchain), OSMesa has no winsys, so my2_SDL_GL_SwapWindow
+// MUST call rimdroid_osmesa_swap() to blit the CPU buffer to the ANativeWindow —
+// it is the one and only present path for softpipe. make_current binds the
+// context + buffer to the calling thread. Both live in rimdroid.c (strong defs).
+extern __attribute__((weak)) void* g_osmesa_context;
+extern __attribute__((weak)) int  rimdroid_osmesa_make_current(void);
+extern __attribute__((weak)) void rimdroid_osmesa_swap(void);
+
 // Lazy-open libEGL.so and cache the handle.
 static void* rimdroid_libegl(void) {
     static void* h = NULL;
@@ -1413,6 +1433,7 @@ static unsigned long g_cnt_getctx=0, g_cnt_getwin=0, g_cnt_makecur=0,
 // both to report our context/window as current.
 EXPORT void* my2_SDL_GL_GetCurrentContext(void) {
     g_cnt_getctx++;
+    if (&g_osmesa_context && g_osmesa_context) return g_rd_ctx_current ? g_rd_ctx_current : g_osmesa_context;
     if (&g_zfa_context && g_zfa_context) return g_rd_ctx_current ? g_rd_ctx_current : g_zfa_context;
     if (g_egl_context) return g_egl_context;
     if (my->SDL_GL_GetCurrentContext) return my->SDL_GL_GetCurrentContext();
@@ -1428,6 +1449,15 @@ EXPORT void* my2_SDL_GL_GetCurrentWindow(void) {
 EXPORT void* my2_SDL_GL_CreateContext(void* win) {
     g_cnt_create++;
     g_gl_window = win;
+    if (&g_osmesa_context && g_osmesa_context) {
+        // Bind the OSMesa context + CPU buffer to this thread, then hand Unity a
+        // DISTINCT opaque handle per call (same bookkeeping trick as ZFA below).
+        if (rimdroid_osmesa_make_current) rimdroid_osmesa_make_current();
+        void* fake = (void*)((uintptr_t)g_osmesa_context + (uintptr_t)(g_cnt_create * 0x10000UL));
+        g_rd_ctx_current = fake;
+        printf_log(LOG_NONE, "RIMDROID SDL_GL_CreateContext #%lu → handle %p (OSMesa %p) win=%p tid=%ld — softpipe\n", g_cnt_create, fake, g_osmesa_context, win, (long)syscall(SYS_gettid));
+        return fake;
+    }
     if (&g_zfa_context && g_zfa_context) {
         if (rimdroid_zfa_make_current) rimdroid_zfa_make_current();
         // Hand back a DISTINCT opaque handle per call (all alias the one ZFA ctx).
@@ -1460,6 +1490,18 @@ EXPORT int my2_SDL_GL_MakeCurrent(void* win, void* ctx) {
     (void)win;
     printf_log(LOG_NONE, "RIMDROID SDL_GL_MakeCurrent(win=%p ctx=%p) tid=%ld zfa=%p egl=%p\n",
                win, ctx, (long)syscall(SYS_gettid), (&g_zfa_context)?g_zfa_context:NULL, g_egl_context);
+    if (&g_osmesa_context && g_osmesa_context) {
+        // OSMesaMakeCurrent rebinds the context (+ CPU buffer) to whatever thread
+        // calls it, so Unity's main↔render-worker handoff just works: ctx==NULL is
+        // an unbind (no-op — the context migrates on the next bind), ctx!=NULL
+        // rebinds here. No cross-thread st_context hazard like Zink (each
+        // OSMesaMakeCurrent fully (re)binds), so no release dance is needed.
+        if (!ctx) { g_rd_ctx_current = NULL; return 0; }
+        g_rd_ctx_current = ctx;
+        int ok = (rimdroid_osmesa_make_current && rimdroid_osmesa_make_current());
+        printf_log(LOG_NONE, "RIMDROID SDL_GL_MakeCurrent → OSMesa rebind %s\n", ok ? "OK" : "FAIL");
+        return ok ? 0 : -1;
+    }
     if (&g_zfa_context && g_zfa_context) {
         if (!ctx) {
             // CONFIRMED ROOT CAUSE (tid log): Unity's threaded renderer hands the
@@ -1495,6 +1537,11 @@ EXPORT void my2_SDL_GL_SwapWindow(void* win) {
     g_cnt_swap++;
     (void)win;
     printf_log(LOG_NONE, "RIMDROID SDL_GL_SwapWindow(win=%p)\n", win);
+    if (&g_osmesa_context && g_osmesa_context) {
+        // The ONLY present path for softpipe: glFinish + blit CPU buffer → surface.
+        if (rimdroid_osmesa_swap) rimdroid_osmesa_swap();
+        return;
+    }
     if (&g_zfa_context && g_zfa_context) {
         if (rimdroid_zfa_swap) rimdroid_zfa_swap();
         return;
@@ -1575,8 +1622,8 @@ EXPORT void my2_SDL_GL_DeleteContext(x64emu_t* emu, void* ctx) {
     // jumps to a NULL function pointer and SIGSEGVs at addr=0x0.  Whenever we
     // have our own context, this is ALWAYS a no-op; the context outlives the
     // game loop and is torn down by us at process exit.
-    if (g_zfa_context || g_egl_context) {
-        printf_log(LOG_INFO, "SDL_GL_DeleteContext: ZFA/EGL no-op (ctx=%p, keeping our context)\n", ctx);
+    if (g_zfa_context || g_egl_context || g_osmesa_context) {
+        printf_log(LOG_INFO, "SDL_GL_DeleteContext: ZFA/EGL/OSMesa no-op (ctx=%p, keeping our context)\n", ctx);
         return;
     }
     if (my->SDL_GL_DeleteContext)
