@@ -3666,6 +3666,26 @@ int last_mmap_idx = 0;
 void* last_mmap_0_addr = NULL;
 size_t last_mmap_0_len = 0;
 #endif
+EXPORT void* my_getenv(x64emu_t* emu, void* name)
+{
+    (void)emu;
+    // RimDroid: magic guest-side hook. A Harmony mod calls getenv("RIMDROID_FLUSH_JIT") right before
+    // the game serializes a save; we lazily invalidate EVERY translated block (MarkCRC → to_delete →
+    // rebuilt from the now-stable source on next entry). Any torn translation born during the Mono JIT
+    // storm dies before it can corrupt the save (the pawn-save corruption workaround). Lazy mode (2)
+    // is thread-safe: running blocks finish normally and are replaced at their next entry.
+    if(name && !strcmp((const char*)name, "RIMDROID_FLUSH_JIT")) {
+        // Bounded to the sub-4GB zone: Mono's JIT code lives in MAP_32BIT RWX chunks there (all traces
+        // agree), and that's where torn translations are born. A whole-48-bit walk hangs (the range
+        // scan advances in small steps over empty terabytes) — learned the hard way.
+        printf_log(LOG_DEBUG, "[RD] FLUSH_JIT requested by guest: invalidating sub-4GB dynablocks\n");
+        cleanDBFromAddressRange(0x10000, 0x100000000ULL - 0x10000, 2);
+        printf_log(LOG_DEBUG, "[RD] FLUSH_JIT done\n");
+        return NULL;
+    }
+    return getenv((const char*)name);
+}
+
 EXPORT void* my_mmap64(x64emu_t* emu, void *addr, size_t length, int prot, int flags, int fd, ssize_t offset)
 {
     (void)emu;
@@ -3677,6 +3697,13 @@ EXPORT void* my_mmap64(x64emu_t* emu, void *addr, size_t length, int prot, int f
         box_munmap(ret, length);
         ret = MAP_FAILED;
         e = EEXIST;
+    }
+    // RimDroid: ALWAYS log guest mmap failures (a handful of lines at most). Diagnosing the
+    // device-specific OOM-at-Mono-init (39-bit-VA phones) needs the failing size/flags/errno, and
+    // full BOX64_LOG=2 is unusable there: the log flood kills the in-process app before logs flush.
+    if(ret==MAP_FAILED && emu) {
+        printf_log(LOG_DEBUG, "[RD] GUEST mmap FAILED: hint=%p size=0x%zx prot=0x%x flags=0x%x fd=%d -> %s (%d)\n",
+            addr, length, prot, flags, fd, strerror(e), e);
     }
     if((ret==MAP_FAILED && (emu || box64_is32bits)) && (BOX64ENV(log)>=LOG_DEBUG || BOX64ENV(dynarec_log)>=LOG_DEBUG)) {printf_log_prefix(0, LOG_NONE, "%s (%d)\n", strerror(errno), errno);}
     if(((ret!=MAP_FAILED) && (emu || box64_is32bits)) && (BOX64ENV(log)>=LOG_DEBUG || BOX64ENV(dynarec_log)>=LOG_DEBUG)) {printf_log_prefix(0, LOG_NONE, "%p\n", ret);}
@@ -3710,6 +3737,18 @@ EXPORT void* my_mmap64(x64emu_t* emu, void *addr, size_t length, int prot, int f
                 if((BOX64ENV(log)>=LOG_DEBUG || BOX64ENV(dynarec_log)>=LOG_DEBUG)) {printf_log(LOG_NONE, "Note: Marking the region (%p-%p prot=%x) as NEVERCLEAN because fd have O_RDWR attribute\n", ret, ret+length, prot);}
                 prot |= PROT_NEVERCLEAN;
             }
+        }
+        // RimDroid: guest RWX MAP_32BIT regions are Mono's JIT-trampoline chunks — code is written,
+        // executed, and REwritten in the same pages constantly (heavy SMC). The write-protect/fault/
+        // unprotect dance for them breaks on some devices (Snapdragon 7+ Gen2: the SMC write-fault ends
+        // up forwarded to Mono's handler as fatal, with box64's tracking out of sync with the kernel →
+        // instant "OOM" black screen at Mono init). Mark them NEVERCLEAN instead: no write-traps at all;
+        // dynablocks from these pages run in always_test mode (hash-checked each entry), which both
+        // sidesteps the broken fault path and keeps stale-code detection correct.
+        // (env BOX64_RD_TRAMP_NEVERCLEAN=0 disables this for A/B bisection)
+        if(BOX64ENV(rd_tramp_neverclean) && (flags&MAP_32BIT) && (prot&PROT_WRITE) && (prot&PROT_EXEC)) {
+            printf_log(LOG_DEBUG, "[RD] Marking RWX MAP_32BIT region %p-%p as NEVERCLEAN (Mono JIT trampolines)\n", ret, ret+length);
+            prot |= PROT_NEVERCLEAN;
         }
         // hack to capture full size of the mmap done by wine
 #if defined(ANDROID) || defined(WINLATOR_GLIBC)

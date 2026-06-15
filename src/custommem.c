@@ -2541,19 +2541,49 @@ typedef union hotpage_s {
     uint64_t    x;
 } hotpage_t;
 #define HOTPAGE_MAX ((1<<28)-1)
-#define N_HOTPAGE   32
-#define HOTPAGE_MARK 64
-#define HOTPAGE_DIRTY 128
+// RimDroid: 32 slots / 64 ticks drown under Mono's JIT+GC SMC storm (logs show constant
+// "No more live Hotpage slot ... recycling" on Dimensity/Mali devices). A page that loses its
+// interpreter grace while Mono is STILL writing it (JIT back-patching call sites = bursts of
+// non-atomic multi-byte writes) gets a dynablock compiled from torn bytes → garbage code that
+// passes every hash check (hashes are taken from the final bytes) → e.g. every Pawn.ExposeData
+// call NREs → pawns saved as empty XML tags (the X7/Mali pawn-save corruption).
+// v1 fix (more slots + more ticks) was NOT enough: tester logs show ZERO evictions yet the
+// corruption persisted — tick-based grace burns in milliseconds during a JIT storm because the
+// counter decrements on EVERY isInHotPage query, expiring BETWEEN two writes of one patch burst.
+// v2: TIME-BASED grace — a page stays hot until HOTPAGE_GRACE_MS of real quiet time has passed
+// since its last write (each trap re-arms the deadline). A page written more often than that
+// SHOULD stay on the interpreter anyway. Gated by BOX64_RD_HOTPAGE_HARDEN (=0 → legacy ticks).
+#define N_HOTPAGE   128
+#define HOTPAGE_MARK 256
+#define HOTPAGE_DIRTY 512
 #define HOTPAGE_DIRTY2 16
+#define HOTPAGE_GRACE_MS 4
+#define HOTPAGE_GRACE_DIRTY_MS 8
+static inline uint32_t hotpage_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint32_t)(((uint64_t)ts.tv_sec*1000ULL + (uint64_t)ts.tv_nsec/1000000ULL) & HOTPAGE_MAX);
+}
+// 28-bit wrap-aware "deadline not yet reached" (valid for spans < 2^27 ms ≈ 37 hours)
+static inline int hotpage_deadline_live(uint32_t deadline, uint32_t now)
+{
+    return deadline && (((deadline - now) & HOTPAGE_MAX) & (1u<<27)) == 0;
+}
 static hotpage_t hotpage[N_HOTPAGE] = {0};
 void SetHotPage(int idx, uintptr_t page)
 {
     hotpage_t tmp = hotpage[idx];
     tmp.addr = page;
     tmp.cnt = 0;
-    switch(BOX64ENV(dynarec_dirty)) {
-        case 0: tmp.cnt = HOTPAGE_MARK; break;
-        case 1: tmp.cnt = HOTPAGE_DIRTY; break;
+    // (env BOX64_RD_HOTPAGE_HARDEN=1: cnt holds a TIME DEADLINE (ms); =0: legacy upstream tick counts)
+    if(BOX64ENV(rd_hotpage_harden) && BOX64ENV(dynarec_dirty)!=2) {
+        uint32_t grace = BOX64ENV(dynarec_dirty) ? HOTPAGE_GRACE_DIRTY_MS : HOTPAGE_GRACE_MS;
+        tmp.cnt = (hotpage_now_ms() + grace) & HOTPAGE_MAX;
+        if(!tmp.cnt) tmp.cnt = 1;   // keep 0 as the empty-slot sentinel
+    } else switch(BOX64ENV(dynarec_dirty)) {
+        case 0: tmp.cnt = 64; break;
+        case 1: tmp.cnt = 128; break;
         case 2: tmp.cnt = HOTPAGE_DIRTY2; break;
     }
     //TODO: use Atomics to update hotpage?
@@ -2582,6 +2612,9 @@ int IdxOldestHotPage(uintptr_t page)
         }
     }
     dynarec_log(LOG_INFO, "%04d|No more live Hotpage slot for %p, recycling idx=%d (%p)\n", GetTID(), (void*)(page<<12), best_idx, (void*)(uintptr_t)(hotpage[best_idx].addr<<12));
+    // RimDroid note: an earlier revision NEVERCLEAN-marked the evicted page here. REMOVED — always_test
+    // pages execute mid-write code without any trap (that exact mechanism broke mod scanning when
+    // applied to Mono trampolines). With 128 slots eviction is rare anyway (tester logs: zero).
     return best_idx;
 }
 // this function will create a new HotPage, or re-arm it if it's already registered
@@ -2616,6 +2649,10 @@ int isInHotPage(uintptr_t addr)
         return 0;
     uintptr_t page = addr>>12;
     int idx = IdxHotPage(page);
+    if(BOX64ENV(rd_hotpage_harden) && BOX64ENV(dynarec_dirty)!=2) {
+        // time-based grace: hot while the deadline hasn't passed; aging is wall-clock, no ticking
+        return (idx==-1) ? 0 : hotpage_deadline_live(hotpage[idx].cnt, hotpage_now_ms());
+    }
     int ret = ((idx==-1) || !hotpage[idx].cnt)?0:1;
     // decrement all hotpage, it's a hotpage "tick"
     for(int i=0; i<N_HOTPAGE; ++i) {
@@ -2638,6 +2675,8 @@ int checkInHotPage(uintptr_t addr)
     if(addr>0x1000000000000LL) return 0;
     uintptr_t page = addr>>12;
     int idx = IdxHotPage(page);
+    if(BOX64ENV(rd_hotpage_harden) && BOX64ENV(dynarec_dirty)!=2)
+        return (idx==-1) ? 0 : hotpage_deadline_live(hotpage[idx].cnt, hotpage_now_ms());
     return ((idx==-1) || !hotpage[idx].cnt)?0:1;
 }
 
@@ -2940,7 +2979,12 @@ void* find47bitBlockNearHint(void* hint, size_t size, uintptr_t mask)
     uintptr_t bend = 0;
     uintptr_t cur = (uintptr_t)hint;
     if(!mask) mask = 0xffff;
-    while(bend<0x800000000000LL) {
+    // RimDroid: cap the scan at the device's real addressable VA. Devices without 48-bit VA have only
+    // ~39 bits (2^39 = 0x8000000000); the stock 48-bit upper bound (0x800000000000) lets this hand back
+    // a hint ABOVE what the kernel can map → guest mmap fails → Mono OOM (black screen on e.g. SD7+Gen2).
+    // 48-bit devices keep the original bound, so their behaviour is unchanged.
+    const uintptr_t scan_limit = have48bits ? 0x800000000000LL : 0x8000000000LL;
+    while(bend<scan_limit) {
         if(!rb_get_end(mapallmem, cur, &prot, &bend)) {
             if(bend-cur>=size)
                 return (void*)cur;

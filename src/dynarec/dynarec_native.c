@@ -571,6 +571,20 @@ dynablock_t* FillBlock64(uintptr_t addr, int is32bits, int inst_max, int is_new,
                 state = BUILD_ABORT_EMPTY;
                 continue;
             }
+            // RimDroid (gated by BOX64_RD_HOTPAGE_HARDEN): the stock check below covers only the FIRST
+            // page — pass0 reads instruction bytes from TAIL pages that are not write-protected yet, so
+            // a concurrent Mono JIT patch there is invisible, and the torn instruction BOUNDARIES are
+            // never re-verified (passes 1-3 re-read final bytes at torn offsets → internally-consistent
+            // garbage that passes every hash check → the X7 pawn-save corruption). Check the WHOLE
+            // range: if any part is unprotected (never-protected tail OR a write-trap fired during
+            // pass0), protect the full range and PUNT (no block) — the interpreter runs this code for
+            // now and the next compile attempt decodes fully-guarded, stable bytes.
+            if(!is_inhotpage && BOX64ENV(rd_hotpage_harden) && !isprotectedDB(addr, end-addr)) {
+                dynarec_log(LOG_INFO, "Block %p-%p not fully protected after pass0 (tail page or concurrent write), protect & punt\n", (void*)addr, (void*)end);
+                protectDB(addr, end-addr);
+                state = BUILD_ABORT_NULL;
+                continue;
+            }
             if(!is_inhotpage && !isprotectedDB(addr, 1)) {
                 dynarec_log(LOG_INFO, "Warning, write on current page on pass0, aborting dynablock creation (%p)\n", (void*)addr);
                 state = BUILD_ABORT_NULL;

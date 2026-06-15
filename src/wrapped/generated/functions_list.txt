@@ -5406,6 +5406,8 @@ wrappedlibasound:
   - snd_mixer_class_set_event
   - snd_mixer_class_set_private_free
   - snd_mixer_set_compare
+- lFppL:
+  - snd_pcm_writei
 - pFppp:
   - snd_dlsym
 - iFpipp:
@@ -5496,6 +5498,7 @@ wrappedlibc:
   - _ZGTtnam
 - pFp:
   - __deregister_frame_info
+  - getenv
   - mallinfo
   - mallinfo2
 - vFpi:

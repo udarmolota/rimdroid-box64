@@ -1319,6 +1319,8 @@ extern __attribute__((weak)) int  rimdroid_zfa_release_current(void);
 // context + buffer to the calling thread. Both live in rimdroid.c (strong defs).
 extern __attribute__((weak)) void* g_osmesa_context;
 extern __attribute__((weak)) int  rimdroid_osmesa_make_current(void);
+extern __attribute__((weak)) int  rimdroid_osmesa_make_current_ctx(void* ctx);
+extern __attribute__((weak)) void* rimdroid_osmesa_create_shared(void);
 extern __attribute__((weak)) void rimdroid_osmesa_swap(void);
 
 // Lazy-open libEGL.so and cache the handle.
@@ -1421,6 +1423,9 @@ static void* g_gl_window = NULL;
 // The context handle Unity currently considers "current" (a distinct opaque alias
 // per CreateContext — see my2_SDL_GL_CreateContext).  Returned by GetCurrentContext.
 static void* g_rd_ctx_current = NULL;
+// SOFTPIPE: the first SDL_GL_CreateContext reuses the primary OSMesa context (made at init);
+// later ones get their own SHARED context, so Unity's 2nd (shared) GL context has separate state.
+static int g_sp_primary_used = 0;
 // DEBUG counters to characterise the DeleteContext loop's GL call mix.
 static unsigned long g_cnt_getctx=0, g_cnt_getwin=0, g_cnt_makecur=0,
                      g_cnt_swap=0, g_cnt_create=0, g_cnt_setattr=0, g_cnt_getattr=0;
@@ -1450,13 +1455,26 @@ EXPORT void* my2_SDL_GL_CreateContext(void* win) {
     g_cnt_create++;
     g_gl_window = win;
     if (&g_osmesa_context && g_osmesa_context) {
-        // Bind the OSMesa context + CPU buffer to this thread, then hand Unity a
-        // DISTINCT opaque handle per call (same bookkeeping trick as ZFA below).
-        if (rimdroid_osmesa_make_current) rimdroid_osmesa_make_current();
-        void* fake = (void*)((uintptr_t)g_osmesa_context + (uintptr_t)(g_cnt_create * 0x10000UL));
-        g_rd_ctx_current = fake;
-        printf_log(LOG_NONE, "RIMDROID SDL_GL_CreateContext #%lu → handle %p (OSMesa %p) win=%p tid=%ld — softpipe\n", g_cnt_create, fake, g_osmesa_context, win, (long)syscall(SYS_gettid));
-        return fake;
+        // Give each Unity GL context its OWN OSMesa context (separate GL state) that SHARES
+        // resources with the primary — Unity's GLCore path makes a 2nd "shared" context, and
+        // collapsing both onto one OSMesa context crossed their states → the menu rendered into
+        // nothing (black). First call reuses the primary (made at init); later calls create a
+        // shared one. The real, distinct OSMesa context IS the handle Unity holds.
+        void* ctx;
+        if (!g_sp_primary_used) {
+            ctx = g_osmesa_context;
+            g_sp_primary_used = 1;
+        } else if (&rimdroid_osmesa_create_shared && rimdroid_osmesa_create_shared) {
+            ctx = rimdroid_osmesa_create_shared();
+        } else {
+            ctx = g_osmesa_context;
+        }
+        if (!ctx) ctx = g_osmesa_context;
+        if (&rimdroid_osmesa_make_current_ctx && rimdroid_osmesa_make_current_ctx)
+            rimdroid_osmesa_make_current_ctx(ctx);
+        g_rd_ctx_current = ctx;
+        printf_log(LOG_NONE, "RIMDROID SDL_GL_CreateContext #%lu → OSMesa ctx %p win=%p tid=%ld — softpipe\n", g_cnt_create, ctx, win, (long)syscall(SYS_gettid));
+        return ctx;
     }
     if (&g_zfa_context && g_zfa_context) {
         if (rimdroid_zfa_make_current) rimdroid_zfa_make_current();
@@ -1498,8 +1516,13 @@ EXPORT int my2_SDL_GL_MakeCurrent(void* win, void* ctx) {
         // OSMesaMakeCurrent fully (re)binds), so no release dance is needed.
         if (!ctx) { g_rd_ctx_current = NULL; return 0; }
         g_rd_ctx_current = ctx;
-        int ok = (rimdroid_osmesa_make_current && rimdroid_osmesa_make_current());
-        printf_log(LOG_NONE, "RIMDROID SDL_GL_MakeCurrent → OSMesa rebind %s\n", ok ? "OK" : "FAIL");
+        // Bind the SPECIFIC context Unity asked for (ctx == a real OSMesa context handle we returned
+        // from CreateContext) so its separate GL state is the one active. Fall back to the primary
+        // binder if the per-ctx entry point isn't linked.
+        int ok = (&rimdroid_osmesa_make_current_ctx && rimdroid_osmesa_make_current_ctx)
+                 ? rimdroid_osmesa_make_current_ctx(ctx)
+                 : (rimdroid_osmesa_make_current && rimdroid_osmesa_make_current());
+        printf_log(LOG_NONE, "RIMDROID SDL_GL_MakeCurrent → OSMesa rebind ctx=%p %s\n", ctx, ok ? "OK" : "FAIL");
         return ok ? 0 : -1;
     }
     if (&g_zfa_context && g_zfa_context) {

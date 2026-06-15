@@ -179,6 +179,22 @@ static void* findMixerEventFct(void* fct)
 }
 
 
+EXPORT long my_snd_pcm_writei(x64emu_t *emu, void *pcm, void *buffer, unsigned long size)
+{
+    /* RimDroid audio diagnostic: log the GUEST return address = the FMOD function that calls
+     * snd_pcm_writei (its float->int16 convert/feed loop). Use it to set BOX64_NODYNAREC over that range,
+     * forcing the (mis-compiled) convert to the interpreter for clean audio. Logged once, to stderr
+     * (folds into Player.log). Then forward to the native shim so audio keeps working. */
+    static int logged = 0;
+    if (!logged) {
+        logged = 1;
+        uintptr_t caller = *(uintptr_t*)(R_RSP);
+        fprintf(stderr, "[RD-alsa] snd_pcm_writei GUEST CALLER (FMOD convert fn) = 0x%lx\n", (unsigned long)caller);
+        fflush(stderr);
+    }
+    return my->snd_pcm_writei(pcm, buffer, size);
+}
+
 EXPORT int my_snd_async_add_handler(x64emu_t *emu, void *handler, int fd, void* callback, void *private_data)
 {
     return my->snd_async_add_handler(handler, fd, findAsyncFct(callback), private_data);

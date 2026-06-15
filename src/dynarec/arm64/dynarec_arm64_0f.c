@@ -58,6 +58,19 @@ uintptr_t dynarec64_0F(dynarec_arm_t* dyn, uintptr_t addr, uintptr_t ip, int nin
     MAYUSE(j64);
     MAYUSE(cacheupd);
 
+    /* RimDroid audio diagnostic (see dynarec_arm64_660f.c). Force suspect FLOAT-domain interleave/shuffle
+     * and MMX data-movement opcodes to the interpreter, to find which is miscompiled (FMOD float-to-int16
+     * stereo interleave -> white noise with correct magnitudes). Toggle via env, no rebuild.
+     * RD_NODYN_FLOATSHUF = movlps/movhlps/unpcklps/unpckhps/movhps/movlhps/shufps (0x12-0x17, 0xC6).
+     * RD_NODYN_MMX = MMX punpck and pack and pshufw (0x60-0x6D, 0x70). */
+    if (getenv("RD_NODYN_FLOATSHUF") && (opcode==0x12||opcode==0x13||opcode==0x14||opcode==0x15
+            ||opcode==0x16||opcode==0x17||opcode==0xC6)) {
+        DEFAULT;
+    } else if (getenv("RD_NODYN_MMX") && (opcode==0x60||opcode==0x61||opcode==0x62||opcode==0x63
+            ||opcode==0x67||opcode==0x68||opcode==0x69||opcode==0x6A||opcode==0x6B||opcode==0x6C
+            ||opcode==0x6D||opcode==0x70)) {
+        DEFAULT;
+    } else
     switch(opcode) {
         case 0x00:
             nextop = F8;

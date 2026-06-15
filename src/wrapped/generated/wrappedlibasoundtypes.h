@@ -15,6 +15,7 @@ typedef int32_t (*iFp_t)(void*);
 typedef void* (*pFp_t)(void*);
 typedef void (*vFpp_t)(void*, void*);
 typedef int32_t (*iFpp_t)(void*, void*);
+typedef intptr_t (*lFppL_t)(void*, void*, uintptr_t);
 typedef void* (*pFppp_t)(void*, void*, void*);
 typedef int32_t (*iFpipp_t)(void*, int32_t, void*, void*);
 typedef int32_t (*iFpppp_t)(void*, void*, void*, void*);
@@ -32,6 +33,7 @@ typedef int32_t (*iFppupp_t)(void*, void*, uint32_t, void*, void*);
 	GO(snd_mixer_class_set_event, iFpp_t) \
 	GO(snd_mixer_class_set_private_free, iFpp_t) \
 	GO(snd_mixer_set_compare, iFpp_t) \
+	GO(snd_pcm_writei, lFppL_t) \
 	GO(snd_dlsym, pFppp_t) \
 	GO(snd_async_add_handler, iFpipp_t) \
 	GO(snd_async_add_pcm_handler, iFpppp_t) \

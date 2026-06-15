@@ -115,11 +115,16 @@ void my_cpuid(x64emu_t* emu)
                     | (BOX64ENV(cputype)?0:1)<<2      // DS 64bits
                     | 1<<3      // Monitor/MWait (priviledge instructions)
                     | (BOX64ENV(cputype)?0:1)<<5      // VMX  //is that usefull
-                    | 1<<9      // SSSE3
+                    // RimDroid: SSSE3/SSE4.1 used to be hardcoded 1 — impossible to hide, so guests
+                    // (e.g. FMOD's CPU dispatch) always picked SSSE3/SSE4.1 code paths. BOX64_SSSE3=0
+                    // now hides both (SSE4.1 implies SSSE3), forcing the guest onto SSE2/SSE3 paths —
+                    // a different instruction mix, useful to bypass suspected emulation bugs in
+                    // fixed-point SIMD ops (pmulhrsw & friends, audio DSP).
+                    | BOX64ENV(ssse3)<<9      // SSSE3 (can be hidden)
                     | BOX64ENV(avx2)<<12     // fma
                     | 1<<13     // cx16 (cmpxchg16)
-                    | 1<<19     // SSE4_1
-                    | BOX64ENV(sse42)<<20     // SSE4_2 can be hiden
+                    | BOX64ENV(ssse3)<<19     // SSE4_1 (hidden together with SSSE3)
+                    | (BOX64ENV(ssse3)&&BOX64ENV(sse42))<<20     // SSE4_2 can be hiden
                     | 1<<22     // MOVBE
                     | 1<<23     // POPCOUNT
                     | BOX64ENV(aes)<<25     // aesni

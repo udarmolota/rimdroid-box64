@@ -322,6 +322,12 @@ dynablock_t* internalDBGetBlock(x64emu_t* emu, uintptr_t addr, int create, int n
     if(!block) {
         dynarec_log(LOG_DEBUG, "Fillblock of block %p for %p returned an error\n", block, (void*)addr);
     }
+    // RimDroid (BOX64_RD_ALLTEST=1): mark every new block always_test so its jump-table entry points at
+    // jmpnext (the dispatcher) instead of the native body. That routes EVERY entry — including repeated
+    // method calls reached via the table, which otherwise bypass DBGetBlock — through the hash re-check,
+    // so a stale translation (Mono back-patched the source after compile) is caught and rebuilt.
+    if(block && BOX64ENV(rd_alltest) && addr < 0x100000000ULL)
+        block->always_test = 1;
     // check size
     if(block) {
         // fill-in jumptable
@@ -377,7 +383,12 @@ dynablock_t* DBGetBlock(x64emu_t* emu, uintptr_t addr, int create, int is32bits)
     if(is_inhotpage && !BOX64ENV(dynarec_dirty))
         return NULL;
     dynablock_t *db = internalDBGetBlock(emu, addr, create, 1, is32bits, 1);
-    if(db && db->done && db->block && getNeedTest(addr)) {
+    // RimDroid (BOX64_RD_ALLTEST=1): force a hash re-check on EVERY block entry, not just when the
+    // block is already flagged dirty. Catches STALE translations born from an SMC write box64 missed
+    // (Mono back-patching a virtual call-site in JIT'd C# → box64 keeps running the old translation →
+    // Pawn.ExposeData dispatches to the wrong method → save corruption). Mismatch → invalidate+rebuild
+    // from current bytes. Cost: one hash per block entry. Decisive test + likely fix for the pawn bug.
+    if(db && db->done && db->block && (getNeedTest(addr) || BOX64ENV(rd_alltest))) {
         //if (db->always_test) SchedYield(); // just calm down...
         uint32_t hash = X31_hash_code((void*)db->x64_readaddr, db->x64_size);
         mutex_lock(&my_context->mutex_dyndump)?1:0;

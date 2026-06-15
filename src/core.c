@@ -1551,6 +1551,13 @@ int emulate(x64emu_t* emu, elfheader_t* elf_header)
     atexit(endBox64);
     _EMTRACE("emulate: atexit registered");
 
+    // RimDroid: force a FRESH map reload right before the guest starts. loadProtectionFromMap() latches
+    // via box64_mapclean and is otherwise a no-op here, but in the IN-PROCESS/relocatable path the native
+    // half (ART boot image, scudo reserves, Turnip/zink GL libs loaded before box64) has mmap'd memory
+    // box64 never tracked → its free-VA view (mapallmem) is stale → on a tight 39-bit address space
+    // find47bitBlock can hand out an occupied/unmappable hint → guest mmap fails → Mono OOM (black
+    // screen). Reset the latch so the map is re-read from /proc/self/maps with everything accounted for.
+    box64_mapclean = 0;
     loadProtectionFromMap();
     _EMTRACE("emulate: loadProtectionFromMap done");
 

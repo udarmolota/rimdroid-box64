@@ -648,8 +648,27 @@ EXPORT int my_pthread_create(x64emu_t *emu, void* t, void* attr, void* start_rou
 	#endif
 	// create thread
 	PTHREAD_ATTR_ALIGN(attr);
-	return pthread_create((pthread_t*)t, PTHREAD_ATTR(attr),
-		pthread_routine, et);
+	int pcret = pthread_create((pthread_t*)t, PTHREAD_ATTR(attr), pthread_routine, et);
+	if((pcret==EPERM || pcret==EINVAL) && attr) {
+		// RimDroid/Android: unprivileged apps cannot set SCHED_FIFO/SCHED_RR (real-time) priority, so
+		// pthread_create with an explicit real-time sched policy fails with EPERM and the thread is NOT
+		// created. Some Linux apps treat that as fatal — notably FMOD's audio mixer thread
+		// (FMOD_OS_Thread_Create sets SCHED_FIFO), which makes RimWorld's audio init return
+		// FMOD_ERR_INTERNAL and the game ends up with no sound. Retry with INHERITED scheduling (normal
+		// priority) so the thread is created and runs instead of failing.
+		pthread_attr_t* src = PTHREAD_ATTR(attr);
+		pthread_attr_t a2;
+		if(pthread_attr_init(&a2)==0) {
+			size_t ss=0; int ds=0;
+			if(src && pthread_attr_getstacksize(src, &ss)==0 && ss) pthread_attr_setstacksize(&a2, ss);
+			if(src && pthread_attr_getdetachstate(src, &ds)==0) pthread_attr_setdetachstate(&a2, ds);
+			pthread_attr_setinheritsched(&a2, PTHREAD_INHERIT_SCHED);
+			int r2 = pthread_create((pthread_t*)t, &a2, pthread_routine, et);
+			pthread_attr_destroy(&a2);
+			if(r2==0) pcret = 0;   // success at normal priority
+		}
+	}
+	return pcret;
 	// no need too unalign for attr, it's const
 }
 
