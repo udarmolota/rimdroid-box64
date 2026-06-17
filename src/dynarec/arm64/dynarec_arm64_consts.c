@@ -1,5 +1,6 @@
 #include <stdint.h>
 #include <string.h>
+#include <stdlib.h>
 
 #include "dynarec_arm64_consts.h"
 #include "debug.h"
@@ -33,7 +34,45 @@ static const float subaddps[4] = {1.f, -1.f, 1.f, -1.f};
 static const double subaddpd[2] = {1., -1.};
 
 #ifndef HAVE_TRACE
-void PrintTrace() {}
+// [RD] op-hunt: zydis-free trace sink. Emitted (per-instruction) only for the env-selected range by
+// dynarec_native_pass.c, so it logs guest registers as the Mono IMT resolver executes — at full
+// dynarec speed, no interpreter, no stall. Called with emu in x0 (RIP already pinned to the insn addr).
+void PrintTrace(x64emu_t* emu, uintptr_t ip, int b)
+{
+    (void)ip; (void)b;
+    // [RD] save-bug writer hunt. Two modes:
+    //  - range mode (RIMDROID_TRACE_LO/HI set, RIMDROID_WATCH_ADDR unset): log every traced insn (default).
+    //  - watch mode (RIMDROID_WATCH_ADDR set): log ONLY when some guest reg holds (watch_addr - watch_disp),
+    //    i.e. this insn addresses the watched slot via [reg+disp]. Catches both the reader (RIP 0x...56c9d)
+    //    and the WRITER (other RIP) of MonoClass+0x278 live, with no ring buffer / NRE hook. Distinguish by RIP.
+    static int    rd_w_init = 0;
+    static uintptr_t rd_w_addr = 0, rd_w_disp = 0x278;
+    if(!rd_w_init){ rd_w_init = 1;
+        char* a = getenv("RIMDROID_WATCH_ADDR"); char* d = getenv("RIMDROID_WATCH_DISP");
+        if(a) rd_w_addr = (uintptr_t)strtoull(a, NULL, 0);
+        if(d) rd_w_disp = (uintptr_t)strtoull(d, NULL, 0);
+    }
+    if(rd_w_addr){
+        uintptr_t base = rd_w_addr - rd_w_disp;
+        uintptr_t regs[16] = { R_RAX,R_RCX,R_RDX,R_RBX,R_RSP,R_RBP,R_RSI,R_RDI,
+                               R_R8,R_R9,R_R10,R_R11,R_R12,R_R13,R_R14,R_R15 };
+        int hit = 0;
+        for(int i=0;i<16;i++) if(regs[i]==base){ hit=1; break; }
+        if(!hit) return;
+        // guest memory is mapped 1:1, so the slot's current value is directly readable.
+        void* slotval = *(void**)rd_w_addr;
+        printf_log(LOG_NONE, "[RD-W] rip=%p [%p]=%p rax=%p rcx=%p rdx=%p rbx=%p rsi=%p rdi=%p r8=%p r9=%p r10=%p r11=%p r12=%p r13=%p r14=%p r15=%p\n",
+            (void*)R_RIP, (void*)rd_w_addr, slotval,
+            (void*)R_RAX, (void*)R_RCX, (void*)R_RDX, (void*)R_RBX, (void*)R_RSI, (void*)R_RDI,
+            (void*)R_R8, (void*)R_R9, (void*)R_R10, (void*)R_R11,
+            (void*)R_R12, (void*)R_R13, (void*)R_R14, (void*)R_R15);
+        return;
+    }
+    printf_log(LOG_NONE, "[RD-T] %p rax=%p rbx=%p rcx=%p rdx=%p rsi=%p rdi=%p r8=%p r9=%p r10=%p r11=%p r12=%p r13=%p r14=%p r15=%p\n",
+        (void*)R_RIP, (void*)R_RAX, (void*)R_RBX, (void*)R_RCX, (void*)R_RDX,
+        (void*)R_RSI, (void*)R_RDI, (void*)R_R8, (void*)R_R9, (void*)R_R10, (void*)R_R11,
+        (void*)R_R12, (void*)R_R13, (void*)R_R14, (void*)R_R15);
+}
 #endif
 
 uintptr_t getConst(arm64_consts_t which)

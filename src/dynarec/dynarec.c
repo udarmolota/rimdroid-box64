@@ -185,6 +185,15 @@ void DynaCall(x64emu_t* emu, uintptr_t addr, int no_alt)
 #ifdef DYNAREC
 static dynablock_t* fastDBGetBlock(x64emu_t* emu, uintptr_t addr, int create, int is32bits)
 {
+    // [RD] force the interpreter for a chosen address range (Mono IMT-resolver op-hunt). Returning
+    // NULL routes these instructions through Run() (interpreter), where the [RD-T] tracer logs them,
+    // while everything else keeps running via dynarec (fast startup). Env parsed once; off by default.
+    {
+        static int rd_i_init = 0; static uintptr_t rd_i_lo = 0, rd_i_hi = 0;
+        if(!rd_i_init){ rd_i_init=1; char* a=getenv("RIMDROID_INTERP_LO"); char* b=getenv("RIMDROID_INTERP_HI");
+            if(a&&b){ rd_i_lo=(uintptr_t)strtoull(a,NULL,0); rd_i_hi=(uintptr_t)strtoull(b,NULL,0);} }
+        if(rd_i_hi && R_RIP>=rd_i_lo && R_RIP<rd_i_hi) return NULL;
+    }
     dynablock_t* ret = getDBnoTest(R_RIP);
     if(!ret)
         ret = DBGetBlock(emu, R_RIP, 1, is32bits);

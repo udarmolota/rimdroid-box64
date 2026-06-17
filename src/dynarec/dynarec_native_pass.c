@@ -270,6 +270,44 @@ uintptr_t native_pass(dynarec_native_t* dyn, uintptr_t addr, int alternate, int 
             }
         }
         #endif
+        // [RD] op-hunt: emit a PrintTrace call for instructions in [RIMDROID_TRACE_LO, RIMDROID_TRACE_HI),
+        // independent of HAVE_TRACE. Build-time gated → zero overhead outside the range, full dynarec
+        // speed (no interpreter, no stall). PrintTrace (consts) logs the guest regs as the resolver runs.
+        {
+            static int rd_tr_init = 0; static uintptr_t rd_tr_lo = 0, rd_tr_hi = 0;
+            if(!rd_tr_init){ rd_tr_init=1; char* a=getenv("RIMDROID_TRACE_LO"); char* b=getenv("RIMDROID_TRACE_HI");
+                if(a&&b){ rd_tr_lo=(uintptr_t)strtoull(a,NULL,0); rd_tr_hi=(uintptr_t)strtoull(b,NULL,0);} }
+            if(rd_tr_hi && ip>=rd_tr_lo && ip<rd_tr_hi) {
+                fpu_reflectcache(dyn, ninst, x1, x2, x3);
+                GO_TRACE(PrintTrace, 1, x5);
+                fpu_unreflectcache(dyn, ninst, x1, x2, x3);
+            }
+        }
+        // [RD] save-bug writer hunt (watch mode). If RIMDROID_WATCH_ADDR is set, find the insn that writes
+        // MonoClass+0x278. We can't know the writer's RIP ahead of time, so we narrow by displacement: any
+        // insn whose bytes contain the disp32 (0x278 = 78 02 00 00) addresses [reg+disp] and is a candidate.
+        // Emit a (PrintTrace) dump for those; PrintTrace's watch filter then logs only the ones where a reg
+        // actually points at watch_addr-disp. Over-inclusive byte scan is harmless (runtime-filtered). The
+        // writer appears live in the log at its own RIP, alongside the reader (RIP 0x...56c9d).
+        {
+            static int rd_w_init = 0; static uintptr_t rd_w_addr = 0; static uint32_t rd_w_disp = 0x278;
+            if(!rd_w_init){ rd_w_init = 1;
+                char* a = getenv("RIMDROID_WATCH_ADDR"); char* d = getenv("RIMDROID_WATCH_DISP");
+                if(a) rd_w_addr = (uintptr_t)strtoull(a, NULL, 0);
+                if(d) rd_w_disp = (uint32_t)strtoull(d, NULL, 0);
+            }
+            if(rd_w_addr) {
+                uint8_t b0 = rd_w_disp & 0xff, b1 = (rd_w_disp>>8) & 0xff, b2 = (rd_w_disp>>16) & 0xff, b3 = (rd_w_disp>>24) & 0xff;
+                int found = 0;
+                for(int k=1; k<=11 && !found; k++)
+                    if(PK(k)==b0 && PK(k+1)==b1 && PK(k+2)==b2 && PK(k+3)==b3) found = 1;
+                if(found) {
+                    fpu_reflectcache(dyn, ninst, x1, x2, x3);
+                    GO_TRACE(PrintTrace, 1, x5);
+                    fpu_unreflectcache(dyn, ninst, x1, x2, x3);
+                }
+            }
+        }
 
         uint8_t pk = PK(0);
         

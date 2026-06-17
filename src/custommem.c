@@ -2960,6 +2960,18 @@ void* find32bitBlock(size_t size)
 }
 void* find47bitBlock(size_t size)
 {
+    // [RD] reproduce the bad layout on demand: RIMDROID_GUEST_HIGH=1 forces this no-hint guest allocator
+    // (where Mono's heap/metadata land) to search from near the 39-bit top → blocks land ~0x79xx, the
+    // high zone that triggers the IMT dispatch corruption (ExposeData->AnythingToStrip). Off by default.
+    // (The fix side, RIMDROID_GUEST_LOW, is handled inside find47bitBlockNearHint.)
+    {
+        static int rd_ghigh = -1;
+        if(rd_ghigh==-1) rd_ghigh = getenv("RIMDROID_GUEST_HIGH")?1:0;
+        if(rd_ghigh) {
+            void* r = find47bitBlockNearHint((void*)0x7800000000LL, size, 0);
+            if(r) return r;
+        }
+    }
     void* ret = find47bitBlockNearHint(HIGH, size, 0);
     if(!ret)
         ret = find31bitBlockNearHint(MEDIUM, size, 0);
@@ -2983,7 +2995,17 @@ void* find47bitBlockNearHint(void* hint, size_t size, uintptr_t mask)
     // ~39 bits (2^39 = 0x8000000000); the stock 48-bit upper bound (0x800000000000) lets this hand back
     // a hint ABOVE what the kernel can map → guest mmap fails → Mono OOM (black screen on e.g. SD7+Gen2).
     // 48-bit devices keep the original bound, so their behaviour is unchanged.
-    const uintptr_t scan_limit = have48bits ? 0x800000000000LL : 0x8000000000LL;
+    uintptr_t scan_limit = have48bits ? 0x800000000000LL : 0x8000000000LL;
+    // [RD] guest-heap layout fix for the IMT dispatch corruption. When Mono's guest heap lands HIGH
+    // (~0x79xx, near the 39-bit top) box64 mis-resolves the interface call (ExposeData->AnythingToStrip);
+    // LOW (~0x1xx) is safe. RIMDROID_GUEST_LOW=1 caps LOW-hint searches (the Mono-heap path via
+    // find47bitBlock, hint=0x60000000) below the bad zone, so big allocations stay in the good range.
+    // High-hint searches (the ELF path, hint=0x3f..) are left alone so libmono still loads where expected.
+    {
+        static int rd_glow = -1;
+        if(rd_glow==-1) rd_glow = getenv("RIMDROID_GUEST_LOW")?1:0;
+        if(rd_glow && cur < 0x2000000000LL) scan_limit = 0x2000000000LL;
+    }
     while(bend<scan_limit) {
         if(!rb_get_end(mapallmem, cur, &prot, &bend)) {
             if(bend-cur>=size)

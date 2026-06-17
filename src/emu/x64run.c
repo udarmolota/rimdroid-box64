@@ -84,6 +84,20 @@ x64emurun:
                 PrintTrace(emu, addr, 0);
 #endif
         emu->old_ip = addr;
+        // [RD] scoped interpreter trace for the Mono IMT-resolver op-hunt. Logs every interpreted
+        // instruction whose addr is in [RIMDROID_TRACE_LO, RIMDROID_TRACE_HI) with key regs, so a
+        // failing resolution can be diffed against a working one. Run with BOX64_DYNAREC=0. Off by
+        // default (no env => no-op). Env parsed once.
+        {
+            static int rd_t_init = 0;
+            static uintptr_t rd_t_lo = 0, rd_t_hi = 0;
+            if(!rd_t_init){ rd_t_init=1; char* a=getenv("RIMDROID_TRACE_LO"); char* b=getenv("RIMDROID_TRACE_HI");
+                if(a&&b){ rd_t_lo=(uintptr_t)strtoull(a,NULL,0); rd_t_hi=(uintptr_t)strtoull(b,NULL,0);} }
+            if(rd_t_hi && addr>=rd_t_lo && addr<rd_t_hi)
+                printf_log(LOG_NONE, "[RD-T] %p rax=%p rbx=%p rcx=%p rdx=%p rsi=%p rdi=%p r10=%p r11=%p\n",
+                    (void*)addr, (void*)R_RAX, (void*)R_RBX, (void*)R_RCX, (void*)R_RDX,
+                    (void*)R_RSI, (void*)R_RDI, (void*)R_R10, (void*)R_R11);
+        }
 
         #ifndef TEST_INTERPRETER
         // check the TRACE flag before going to next

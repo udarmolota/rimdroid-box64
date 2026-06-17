@@ -379,6 +379,16 @@ void FlushZombieDynablocks(void)
 
 dynablock_t* DBGetBlock(x64emu_t* emu, uintptr_t addr, int create, int is32bits)
 {
+    // [RD] op-hunt: never build/return a dynablock for the chosen range (RIMDROID_INTERP_LO/HI). With
+    // no block, the jump table keeps routing jumps into the range to the dispatcher, which falls back to
+    // the interpreter (Run) where the [RD-T] tracer logs each instruction — while everything else stays
+    // dynarec (fast startup). Covers the block-linking path that bypassed the fastDBGetBlock guard.
+    {
+        static int rd_i_init = 0; static uintptr_t rd_i_lo = 0, rd_i_hi = 0;
+        if(!rd_i_init){ rd_i_init=1; char* a=getenv("RIMDROID_INTERP_LO"); char* b=getenv("RIMDROID_INTERP_HI");
+            if(a&&b){ rd_i_lo=(uintptr_t)strtoull(a,NULL,0); rd_i_hi=(uintptr_t)strtoull(b,NULL,0);} }
+        if(rd_i_hi && addr>=rd_i_lo && addr<rd_i_hi) return NULL;
+    }
     int is_inhotpage = isInHotPage(addr);
     if(is_inhotpage && !BOX64ENV(dynarec_dirty))
         return NULL;

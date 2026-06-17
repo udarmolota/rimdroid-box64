@@ -377,6 +377,21 @@ int my_sigactionhandler_oldcode_64(x64emu_t* emu, int32_t sig, int simple, sigin
     // get that actual ESP first!
     if(!emu)
         emu = thread_get_emu();
+    // [RD] IMT-dispatch diagnostic (ExposeData->AnythingToStrip save/load bug). When a Mono-JIT'd
+    // method (sub-4GB region) takes a low-address null-deref (= the NRE we chase), dump the guest
+    // registers at the fault: rip = where dispatch LANDED, r10 = the IMT method-cookie that was
+    // requested, rdi = this. Lets us tell r10-clobber (garbage r10) from thunk-misresolve (correct
+    // r10, wrong landing). Gated by env RIMDROID_DISPATCH_LOG, prints at LOG_NONE. Non-destructive.
+    if(sig==X64_SIGSEGV && info) {
+        static int rd_disp = -1;
+        if(rd_disp==-1) rd_disp = getenv("RIMDROID_DISPATCH_LOG")?1:0;
+        if(rd_disp && (uintptr_t)info->si_addr < 0x10000
+           && R_RIP>=0x30000000ULL && R_RIP<0x40000000ULL) {
+            printf_log(LOG_NONE, "[RD-DISP] rip=%p fault=%p rax=%p r10=%p r11=%p rdi=%p rsi=%p\n",
+                (void*)R_RIP, info->si_addr, (void*)R_RAX, (void*)R_R10, (void*)R_R11,
+                (void*)R_RDI, (void*)R_RSI);
+        }
+    }
     uintptr_t frame = R_RSP;
 #if defined(DYNAREC)
     dynablock_t* db = (dynablock_t*)cur_db;//FindDynablockFromNativeAddress(pc);
@@ -1048,6 +1063,25 @@ void my_box64signalhandler(int32_t sig, siginfo_t* info, void * ucntx)
     }
     #endif
 #ifdef DYNAREC
+    // [RD] Adreno-725 / Snapdragon 7+ Gen2 black-screen root fix. Some Android kernels report
+    // SEGV_MAPERR (si_code=1) instead of SEGV_ACCERR for a write to one of OUR write-protected
+    // dynarec pages — e.g. Mono rewriting a JIT trampoline in a page box64 already built+protected
+    // (heavy SMC). The SMC handler below requires SEGV_ACCERR, so the fault used to be mis-forwarded
+    // to the guest as fatal → instant fake "OOM" black screen at Mono init. If the faulting page is
+    // box64's own protected code (PROT_DYNAREC/_R), a write there IS self-modifying code no matter
+    // what si_code the kernel reports, so reclassify MAPERR→ACCERR and let the normal unprotect/dirty
+    // path run. This makes the trampoline-NEVERCLEAN workaround (slow, breaks mods via torn-code race)
+    // unnecessary. Safe everywhere: a correct kernel already sends ACCERR, so this branch never fires;
+    // gated on PROT_DYNAREC so a genuinely-unmapped address is left as a real fault. (Generalises the
+    // older #ifdef BAD_SIGNAL/getMmapped RK3588 hack.)
+    if((sig==X64_SIGSEGV) && addr && (info->si_code == SEGV_MAPERR) && (prot & (PROT_DYNAREC|PROT_DYNAREC_R))) {
+        // Confirm the fix path is active without flooding the log: print once (LOG_NONE always shows).
+        static int rd_reclass_logged = 0;
+        if(!rd_reclass_logged) { rd_reclass_logged = 1;
+            printf_log(LOG_NONE, "[RD] MAPERR->ACCERR reclassification ACTIVE (first hit %p prot=0x%x) — Adreno-725 SMC fix\n", (void*)addr, prot);
+        }
+        info->si_code = SEGV_ACCERR;
+    }
     if((Locks & is_dyndump_locked) && ((sig==X64_SIGSEGV) || (sig==X64_SIGBUS)) && current_helper && fillblock_active) {
         printf_log(LOG_INFO, "FillBlock triggered a %s at %p from %p\n", (sig==X64_SIGSEGV)?"segfault":"bus error", addr, pc);
         relockMutex(Locks);
