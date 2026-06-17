@@ -55,12 +55,18 @@ if(TERMUX)
     set(ANDROID ON CACHE BOOL "")
 endif()
 
-# Hack: limit the optimization level to -O1 for some platforms
+# Hack: limit the optimization level for some platforms.
+# RimDroid: build box64 at -O0 on Android. At -O1 the dynarec miscompiles a Mono
+# managed->native dispatch: the very first Assembly.GetTypes returns garbage ->
+# NullReferenceException in Verse.XmlInheritance at startup (SIGSEGV in libmonobdwgc),
+# same family as the disappearing-colonists / save corruption. The -O0 debug build is
+# clean (mods + save + reboot all work). -O0 until the specific -O1 miscompile is
+# root-caused, then optimization can be restored. (NDEBUG is intentionally not set here.)
 if(TERMUX OR ANDROID)
-    set(CMAKE_C_FLAGS_RELEASE "-O1")
-    set(CMAKE_CXX_FLAGS_RELEASE "-O1")
-    set(CMAKE_C_FLAGS_RELWITHDEBINFO "-O1 -g")
-    set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O1 -g")
+    set(CMAKE_C_FLAGS_RELEASE "-O0")
+    set(CMAKE_CXX_FLAGS_RELEASE "-O0")
+    set(CMAKE_C_FLAGS_RELWITHDEBINFO "-O0 -g")
+    set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O0 -g")
 endif()
 
 if(LARCH64)
