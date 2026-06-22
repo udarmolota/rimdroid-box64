@@ -1074,13 +1074,30 @@ void my_box64signalhandler(int32_t sig, siginfo_t* info, void * ucntx)
     // unnecessary. Safe everywhere: a correct kernel already sends ACCERR, so this branch never fires;
     // gated on PROT_DYNAREC so a genuinely-unmapped address is left as a real fault. (Generalises the
     // older #ifdef BAD_SIGNAL/getMmapped RK3588 hack.)
-    if((sig==X64_SIGSEGV) && addr && (info->si_code == SEGV_MAPERR) && (prot & (PROT_DYNAREC|PROT_DYNAREC_R))) {
-        // Confirm the fix path is active without flooding the log: print once (LOG_NONE always shows).
-        static int rd_reclass_logged = 0;
-        if(!rd_reclass_logged) { rd_reclass_logged = 1;
-            printf_log(LOG_NONE, "[RD] MAPERR->ACCERR reclassification ACTIVE (first hit %p prot=0x%x) — Adreno-725 SMC fix\n", (void*)addr, prot);
+    // [RD-fixB5] CLEAN false-MAPERR fix (all diagnostic instrumentation removed; only the fix remains).
+    // Some Android kernels report SEGV_MAPERR instead of SEGV_ACCERR for a write to a page box64 OWNS — Mono
+    // backpatching its own JIT code (proven: libmono+0x14df92 lock cmpxchg, page getMmapped + PROT_EXEC,
+    // prot 0x7/0x87). Original only covered PROT_DYNAREC; broaden to any box64-owned EXECUTABLE page
+    // (getMmapped && PROT_EXEC) — the real backpatch case — but NOT data pages (those carry Mono's legit
+    // null-check faults that must reach Mono's handler). SELF-LIMITING: a true false-MAPERR resolves on the
+    // immediate retry and won't fault again; if an addr recurs >=2 times we bail (leave MAPERR → forward to
+    // guest), so a wrongly-grabbed fault is never swallowed. NOTE: the deep "phasic" save/crash bug is
+    // SEPARATE (present even in baseline; reset by reboot) — this fix only addresses the false-MAPERR class.
+    if((sig==X64_SIGSEGV) && addr && (info->si_code == SEGV_MAPERR)
+        && ((prot & (PROT_DYNAREC|PROT_DYNAREC_R)) || (getMmapped((uintptr_t)addr) && (prot & PROT_EXEC)))) {
+        static __thread uintptr_t rd_rc_addr[8]; static __thread uint8_t rd_rc_cnt[8]; static __thread int rd_rc_n;
+        uintptr_t a = (uintptr_t)addr;
+        int slot = -1;
+        for(int i=0;i<8;i++) if(rd_rc_addr[i]==a){ slot=i; break; }
+        if(slot<0){ slot = (rd_rc_n++)&7; rd_rc_addr[slot]=a; rd_rc_cnt[slot]=0; }
+        if(rd_rc_cnt[slot] < 2) {
+            rd_rc_cnt[slot]++;
+            static int rd_reclass_logged = 0;
+            if(!rd_reclass_logged) { rd_reclass_logged = 1;
+                printf_log(LOG_NONE, "[RD] false-MAPERR fix ACTIVE (first hit %p prot=0x%x)\n", (void*)addr, prot);
+            }
+            info->si_code = SEGV_ACCERR;
         }
-        info->si_code = SEGV_ACCERR;
     }
     if((Locks & is_dyndump_locked) && ((sig==X64_SIGSEGV) || (sig==X64_SIGBUS)) && current_helper && fillblock_active) {
         printf_log(LOG_INFO, "FillBlock triggered a %s at %p from %p\n", (sig==X64_SIGSEGV)?"segfault":"bus error", addr, pc);

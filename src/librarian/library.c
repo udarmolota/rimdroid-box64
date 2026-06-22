@@ -384,13 +384,18 @@ static int loadEmulatedLib(const char* libname, library_t *lib, box64context_t* 
         int env_changed = 0;
         #ifdef DYNAREC
         if(libname && BOX64ENV(dynarec_bleeding_edge) && strstr(libname, "libmonobdwgc-2.0.so")) {
-            printf_dump(LOG_INFO, "MonoBleedingEdge detected, disable Dynarec BigBlock and set Dynarec StrongMem=%d (RimDroid)\n", RD_MONO_STRONGMEM);
+            // RimDroid: post-Mono-load strongmem = the level the game's DOMINANT phase (GC + C#-JIT)
+            // runs at. Default RD_MONO_STRONGMEM, but overridable AT RUNTIME via env
+            // RIMDROID_MONO_STRONGMEM=0..4 so FPS A/B needs NO rebuild (just the Settings env field).
+            // 1 = upstream/fast; higher = stricter — for Mono GC stricter often means fewer
+            // memory-ordering fault-storms (SIGSEGV→recompile→hotpage thrash) = faster. Sweep per device.
+            int mono_sm = RD_MONO_STRONGMEM;
+            const char* sm_env = getenv("RIMDROID_MONO_STRONGMEM");
+            if(sm_env && sm_env[0] >= '0' && sm_env[0] <= '4' && sm_env[1] == '\0')
+                mono_sm = sm_env[0] - '0';
+            printf_dump(LOG_INFO, "MonoBleedingEdge detected, disable Dynarec BigBlock and set Dynarec StrongMem=%d (RimDroid)\n", mono_sm);
             SET_BOX64ENV(dynarec_bigblock, 0);
-            // RimDroid: set the post-Mono-load strongmem to our tunable RD_MONO_STRONGMEM instead of
-            // upstream's hardcoded 1. This is the level the game runs at for its dominant phase (GC +
-            // C#-JIT). 1 = fast but the MediaTek/Cortex GC SIGSEGV + save corruption; 4 = strict but
-            // slowed Adreno; 3 = middle ground under test.
-            SET_BOX64ENV(dynarec_strongmem, RD_MONO_STRONGMEM);
+            SET_BOX64ENV(dynarec_strongmem, mono_sm);
             env_changed = 1;
         }
         if(libname && BOX64ENV(unityplayer) && strstr(libname, "UnityPlayer.so")) {

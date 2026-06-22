@@ -63,10 +63,12 @@ endif()
 # clean (mods + save + reboot all work). -O0 until the specific -O1 miscompile is
 # root-caused, then optimization can be restored. (NDEBUG is intentionally not set here.)
 if(TERMUX OR ANDROID)
-    set(CMAKE_C_FLAGS_RELEASE "-O0")
-    set(CMAKE_CXX_FLAGS_RELEASE "-O0")
-    set(CMAKE_C_FLAGS_RELWITHDEBINFO "-O0 -g")
-    set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O0 -g")
+    # [RD-O1-BISECT 2026-06-21] global -O1; dynarec targets forced back to -O0 below (~line 1272)
+    # to test if the -O1 Mono miscompile lives in the dynarec. REVERT all to -O0 after the bisect.
+    set(CMAKE_C_FLAGS_RELEASE "-O1")
+    set(CMAKE_CXX_FLAGS_RELEASE "-O1")
+    set(CMAKE_C_FLAGS_RELWITHDEBINFO "-O1 -g")
+    set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O1 -g")
 endif()
 
 if(LARCH64)
@@ -1255,6 +1257,8 @@ if(DYNAREC)
     endif()
 
     set_source_files_properties(${DYNAREC_PASS} PROPERTIES COMPILE_OPTIONS "${CFLAGS}")
+    # [RD 2026-06-21] (whole dynarec is forced -O0 below via target_compile_options, so no per-file override
+    # is needed here. The -O1 miscompile root was pinned to dynarec_arm64_00.c by bisection.)
     set_source_files_properties(${DYNAREC_ASM} PROPERTIES COMPILE_OPTIONS "${ASMFLAGS}")
     set_source_files_properties(${INTERPRETER} PROPERTIES COMPILE_OPTIONS "${CFLAGS}")
 
@@ -1270,6 +1274,18 @@ if(DYNAREC)
     set_target_properties(native_pass3 PROPERTIES COMPILE_DEFINITIONS "STEP=3")
     add_library(test_interpreter OBJECT ${INTERPRETER})
     set_target_properties(test_interpreter PROPERTIES COMPILE_DEFINITIONS "TEST_INTERPRETER")
+    # [RD-O1-BISECT] force the dynarec back to -O0 while the rest of box64 is -O1 (CFLAGS has no -O,
+    # so this target-level -O0 wins). If startup works with this → the -O1 miscompile is in the dynarec.
+    # [RD 2026-06-21] SHIP -O1 FPS config: global box64 -O1, but the whole DYNAREC at -O0. The dynarec is the
+    # block-COMPILER (not the hot runtime path), so -O0 there costs ~nothing for steady-state FPS, while the
+    # box64 runtime (helpers/mem/flags) at -O1 carries the win: 65-70 FPS (vs 42-50 all-O0), beats GameHub.
+    # Verified stable on S25U. (Root of the -O1 breakage = dynarec_arm64_00.c; keeping all dynarec -O0 is the
+    # safe superset. A future precise fix = only that one file -O0.)
+    target_compile_options(dynarec_native PRIVATE -O0)
+    target_compile_options(native_pass0 PRIVATE -O0)
+    target_compile_options(native_pass1 PRIVATE -O0)
+    target_compile_options(native_pass2 PRIVATE -O0)
+    target_compile_options(native_pass3 PRIVATE -O0)
     add_dependencies(native_pass0 WRAPPERS)
     add_dependencies(native_pass1 WRAPPERS)
     add_dependencies(native_pass2 WRAPPERS)
