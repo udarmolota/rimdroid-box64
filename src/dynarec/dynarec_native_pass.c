@@ -283,6 +283,30 @@ uintptr_t native_pass(dynarec_native_t* dyn, uintptr_t addr, int alternate, int 
                 fpu_unreflectcache(dyn, ninst, x1, x2, x3);
             }
         }
+        // [RD] save-bug level-1/2 probe: emit a one-shot PrintTrace at the Pawn ExposeData thunk's `cmp`
+        // (rd_probe_cmp_ip is set by FillBlock64 when it detects the thunk). At execution RDI = this Pawn.
+        {
+            extern uintptr_t rd_probe_list[]; extern int rd_probe_n;
+            int rd_hit=0; for(int i=0;i<rd_probe_n;i++) if(ip==rd_probe_list[i]){ rd_hit=1; break; }
+            if(rd_hit) {
+                static int rd_emit_n=0; if(rd_emit_n<30){ rd_emit_n++;
+                    printf_log(LOG_NONE, "[RD-EMIT] trace baked @ip=%p (n=%d)\n", (void*)ip, rd_probe_n); }
+                fpu_reflectcache(dyn, ninst, x1, x2, x3);
+                GO_TRACE(PrintTrace, 1, x5);
+                fpu_unreflectcache(dyn, ninst, x1, x2, x3);
+            }
+        }
+        // [RD] dispatch entry-guard: emit a PrintTrace at AnythingToStrip's ENTRY (rd_guard_addr is set +
+        // the block invalidated by rd_pawn_scan_strip). PrintTrace then dumps the caller = the dispatch
+        // call-site → ground truth for where offset 112/0x3C0 comes from.
+        {
+            extern uintptr_t rd_guard_addr;
+            if(rd_guard_addr && ip==rd_guard_addr) {
+                fpu_reflectcache(dyn, ninst, x1, x2, x3);
+                GO_TRACE(PrintTrace, 1, x5);
+                fpu_unreflectcache(dyn, ninst, x1, x2, x3);
+            }
+        }
         // [RD] save-bug writer hunt (watch mode). If RIMDROID_WATCH_ADDR is set, find the insn that writes
         // MonoClass+0x278. We can't know the writer's RIP ahead of time, so we narrow by displacement: any
         // insn whose bytes contain the disp32 (0x278 = 78 02 00 00) addresses [reg+disp] and is a candidate.

@@ -1556,8 +1556,12 @@ EXPORT int my2_SDL_GL_MakeCurrent(void* win, void* ctx) {
 }
 
 // SDL_GL_SwapWindow(window) → present the frame (ZFA flush or eglSwapBuffers).
+// FPS overlay: librimdroid counts presented frames; the Java overlay polls it.
+// Weak so a box64 build without librimdroid still links (call is then skipped).
+extern __attribute__((weak)) void rimdroid_frame_tick(void);
 EXPORT void my2_SDL_GL_SwapWindow(void* win) {
     g_cnt_swap++;
+    if (rimdroid_frame_tick) rimdroid_frame_tick();   // count this present (any renderer)
     (void)win;
     printf_log(LOG_NONE, "RIMDROID SDL_GL_SwapWindow(win=%p)\n", win);
     if (&g_osmesa_context && g_osmesa_context) {

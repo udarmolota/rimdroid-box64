@@ -33,6 +33,7 @@ extern int _nl_msg_cat_cntr __attribute__((weak));
 #include <sys/stat.h>
 #include <sys/select.h>
 #include <unistd.h>
+#include <sched.h>      // RimDroid: sched_getaffinity + cpu_set_t for my_sched_getaffinity CPU cap
 #include <fcntl.h>
 #include <glob.h>
 #include <ctype.h>
@@ -4857,6 +4858,45 @@ __attribute__((weak)) int dn_skipname(const unsigned char* ptr, const unsigned c
 #ifndef _SC_NPROCESSORS_CONF
 #define _SC_NPROCESSORS_CONF    83
 #endif
+// RimDroid: cap the affinity mask the guest sees to BOX64_MAXCPU.
+// Mono's mono_cpu_count() (-> Environment.ProcessorCount) prefers CPU_COUNT(sched_getaffinity)
+// over sysconf(_SC_NPROCESSORS_ONLN); without capping HERE too, BOX64_MAXCPU does NOT reduce the
+// degree-of-parallelism of System.Threading.Tasks.Parallel. RimWorld 1.5 loads Defs with
+// Parallel.ForEach (ShortHashGiver.GiveAllShortHashes); on some devices/phases box64 miscompiles
+// .NET self-replicating tasks (Task.ExecuteSelfReplicating) so the worker delegate gets a null
+// state -> NullReferenceException at worker [0x00000] -> "Caught exception while loading play data,
+// resetting mods config" -> mods fail to load / black screen. With BOX64_MAXCPU=1 the guest sees a
+// single CPU, so Parallel.ForEach runs the body inline/serially and the self-replicating code path
+// is never taken. GATED on maxcpu so default behaviour is identical to upstream (passthrough); we
+// only ever CLEAR high CPU bits, never add. Layout-agnostic raw-bit edit (no native cpu_set_t size
+// assumption). NOTE: only covers the libc symbol path; the raw syscall path (x64syscall #204) is
+// separate — Mono's glibc build uses the libc function, so this suffices in practice.
+EXPORT int my_sched_getaffinity(x64emu_t* emu, int pid, size_t cpusetsize, void* mask)
+{
+    int ret = sched_getaffinity(pid, cpusetsize, (cpu_set_t*)mask);
+    if(ret==0 && BOX64ENV(maxcpu) && mask && cpusetsize) {
+        int want = (int)box64_sysinfo.box64_ncpu;
+        if(want < 1) want = 1;
+        unsigned char* bytes = (unsigned char*)mask;
+        size_t nbits = cpusetsize * 8;
+        int before = 0, kept = 0;
+        for(size_t i = 0; i < nbits; ++i) {
+            if(bytes[i>>3] & (1u << (i & 7))) {
+                ++before;
+                if(kept < want) ++kept;
+                else bytes[i>>3] &= (unsigned char)~(1u << (i & 7));
+            }
+        }
+        // RimDroid one-shot diagnostic: confirm the guest (Mono) actually uses this libc path
+        // (vs the raw syscall #204 which would bypass us). [RD-MAXCPU] in the log => cap reaches Mono.
+        static int rd_logged = 0;
+        if(!rd_logged) { rd_logged = 1;
+            printf_log(LOG_NONE, "[RD-MAXCPU] sched_getaffinity capped: maxcpu=%d cpus %d->%d (pid=%d)\n",
+                       (int)BOX64ENV(maxcpu), before, kept, pid);
+        }
+    }
+    return ret;
+}
 EXPORT long my_sysconf(x64emu_t* emu, int what) {
     // Processor count: intercept both glibc (83/84) and Bionic (96/97) values
     // because the emulated binary uses glibc constants.

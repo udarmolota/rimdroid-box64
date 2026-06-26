@@ -1171,6 +1171,7 @@
 #() iFEiiu
 #() iFEiip
 #() iFEiiN
+#() iFEiLp
 #() iFEipp
 #() iFEipV
 #() iFEipA
@@ -4193,7 +4194,6 @@
 #!defined(STATICBUILD) iFEpipppL
 #!defined(STATICBUILD) iFiiULippp
 #!defined(STATICBUILD) lFpLpdddddd
-#defined(PPC64LE) iFEiLp
 #!defined(PPC64LE) iFiLN
 #() vFEv -> vFE
 #() iFEv -> iFE
@@ -5614,6 +5614,7 @@ wrappedlibc:
   - fsmount
 - iFiLp:
   - ioctl
+  - sched_getaffinity
 - iFipu:
   - fspick
 - iFipp:

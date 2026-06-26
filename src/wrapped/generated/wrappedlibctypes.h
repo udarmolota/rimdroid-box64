@@ -247,6 +247,7 @@ typedef int32_t (*iFppipppp_t)(void*, void*, int32_t, void*, void*, void*, void*
 	GO(fcntl64, iFiiN_t) \
 	GO(fsmount, iFiuu_t) \
 	GO(ioctl, iFiLp_t) \
+	GO(sched_getaffinity, iFiLp_t) \
 	GO(fspick, iFipu_t) \
 	GO(__lxstat, iFipp_t) \
 	GO(__lxstat64, iFipp_t) \

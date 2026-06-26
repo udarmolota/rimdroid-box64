@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <string.h>
 #include <assert.h>
+#include <unistd.h>   // RimDroid [RD-DELTA] capture: access() for the file trigger
 
 #include "os.h"
 #include "debug.h"
@@ -420,6 +421,361 @@ dynablock_t* CreateEmptyBlock(uintptr_t addr, int is32bits, int is_new) {
     return block;
 }
 
+// RimDroid [RD-DELTA] capture helpers (save-bug box64 fix). Bounds-checked guest-memory dumps (every read
+// guarded by getProtection_fast) used ONE-SHOT to recover the Pawn ExposeData IMT conflict-thunk + its
+// vtable neighbourhood, so the correct-slot DELTA can be computed offline. Inert unless armed by the
+// /sdcard/Download/rd_capture trigger (see FillBlock64). printf_log(LOG_NONE) => always written to the log.
+// readable? getProtection_fast under-reports Mono's GC/metadata heap (not box64-tracked), so accept plausible
+// Mono ranges too: guest heap 0x70xx..0x74xx, libmono image 0x3f04xx..0x3f06xx.
+static int rd_rd(uintptr_t p) {
+    if(!p) return 0;
+    if(getProtection_fast(p)&PROT_READ) return 1;
+    // box64 doesn't track Mono/Unity's own data allocations (vtables, heap), so getProtection_fast
+    // returns 0 for them — fall back to plausible-Mono-pointer ranges. The managed-heap/vtable
+    // region's exact base is ASLR-dependent (Y700 ~0x72xx, Samsung ~0x74xx), so use a WIDE window
+    // (0x60–0x80) rather than a tight one; every deref is structure-validated downstream.
+    if((p>=0x6000000000ULL && p<0x8000000000ULL) || (p>=0x3f04000000ULL && p<0x3f06000000ULL)) return 1;
+    return 0;
+}
+
+// The save-bug FIX (locate Pawn, rd_imt_fix) runs by DEFAULT. The heavy/noisy DIAGNOSTICS (good-phase probe,
+// AnythingToStrip slot scan + entry-guard, thunk dumps, verbose logs) stay behind env RIMDROID_SAVEDIAG — they do
+// expensive jit_code_hash passes that made good-phase save-LOADS crawl. rd_diag_on() gates only the diagnostics.
+static int rd_diag_on(void) { static int v=-1; if(v<0) v = getenv("RIMDROID_SAVEDIAG")?1:0; return v; }
+
+// RimDroid save-bug level-1/2 PROBE state. Set when the Pawn ExposeData conflict-thunk is detected at compile
+// (FillBlock64); consumed by the trace-emit in dynarec_native_pass.c and by PrintTrace in
+// dynarec_arm64_consts.c. PrintTrace fires once at the thunk's `cmp` (R_RIP==rd_probe_cmp_ip), where RDI = the
+// `this` Pawn, computes the TRUE ExposeData vtable cell via Mono offsets (read-only) and logs level-1 vs level-2.
+// The ExposeData IMT cookie is the INTERFACE method, shared by ALL classes implementing IExposable — so the
+// first conflict-thunk with an "ExposeData" key is usually NOT Pawn's (seen: DefMap`2). So we arm a LIST of all
+// ExposeData thunks; PrintTrace filters at execution by the dispatched object's klass name == "Pawn".
+uintptr_t rd_probe_list[64]; int rd_probe_n = 0;
+uintptr_t rd_probe_method = 0;
+int rd_probe_done = 0;
+// RimDroid PAWN SAVE FIX (2026-06-25, AI-consensus): Pawn's ExposeData has NO detectable IMT conflict-thunk — its
+// mis-dispatch is a corrupted PLAIN vtable cell (pawn_vt+0x40+8*interface_offset(Pawn,IExposable) holds
+// AnythingToStrip's code). Find Pawn read-only WITHOUT a dispatch: scan jit_code_hash for any method whose
+// klass->name=="Pawn" -> pawn_klass; get its live MonoVTable via runtime_info (verified offsets: MonoClass+0xC8 =
+// MonoClassRuntimeInfo; ri+0x00 = u16 max_domain; pawn_vt = *(ri + 0x8 + domain_id*8); MonoDomain+0xBC = domain_id),
+// validate *(vt+0)==pawn_klass; compute the IExposable cell; write Pawn's real ExposeData JIT code (parent chain).
+// One-shot per process. No Mono calls. Triggered from rd_savefix_repair once a domain is known.
+static int rd_pawn_done = 0;
+// Pawn fix state: located once (cell/klass/domain/initial-trampoline-value), then a cheap per-FillBlock tick
+// applies the fix the moment the cell actually changes (gets dispatched/corrupted) AND ExposeData is compiled.
+static uintptr_t rd_pawn_cell = 0, rd_pawn_tramp = 0, rd_pawn_domain = 0;
+uintptr_t rd_pawn_klass = 0;       // non-static: PrintTrace (arm64_consts.c) externs it to filter the arg-trace to Pawn
+uintptr_t rd_guard_addr = 0;       // non-static: AnythingToStrip entry — pass.c emits PrintTrace there, which dumps the dispatch call-site
+uintptr_t rd_expose_code = 0;      // non-static: Pawn.ExposeData compiled code — the guard writes it into the mis-built IMT slot
+static uintptr_t rd_pawn_vt = 0;   // Pawn's MonoVTable (for the AnythingToStrip slot scan)
+
+// Find a method's compiled code in domain->jit_code_hash by name, walking the Pawn parent chain.
+// Read-only; returns 0 if not (yet) compiled. (name match uses strncmp of `len`.)
+static uintptr_t rd_find_code_by_name(const char* name, int len) {
+    if(!rd_pawn_domain || !rd_pawn_klass) return 0;
+    uintptr_t hh = rd_pawn_domain + 0xF0;
+    if(!rd_rd(hh+0x20)) return 0;
+    uint32_t  hsize   = *(uint32_t*)(hh+0x18);
+    uintptr_t buckets = *(uintptr_t*)(hh+0x20);
+    if(!rd_rd(buckets) || hsize==0 || hsize>0x100000) return 0;
+    for(uintptr_t c=rd_pawn_klass, d=0; rd_rd(c) && d<24; c=*(uintptr_t*)(c+0x28), d++)
+        for(uint32_t bk=0; bk<hsize; bk++){
+            uintptr_t ji=*(uintptr_t*)(buckets+(uintptr_t)bk*8);
+            for(int g=0; rd_rd(ji) && g<20000; ji=*(uintptr_t*)(ji+0x08), g++){
+                uintptr_t m=*(uintptr_t*)(ji+0x00); if(!rd_rd(m)) continue;
+                if(*(uintptr_t*)(m+0x08)!=c) continue;
+                uintptr_t nmp=*(uintptr_t*)(m+0x18); if(!rd_rd(nmp)) continue;
+                if(!strncmp((const char*)nmp,name,(size_t)len)) return *(uintptr_t*)(ji+0x10);
+            }
+        }
+    return 0;
+}
+
+// Reverse-lookup: given a compiled code pointer, name the method ("Klass.Method") by scanning the WHOLE
+// domain jit_code_hash for code_start==code. Read-only, one-shot use. Writes "?.?" if not found.
+static void rd_name_of_code(uintptr_t code, char* out, int outlen) {
+    if(outlen>0){ out[0]='?'; out[1]=0; }
+    if(!rd_pawn_domain || !code) return;
+    uintptr_t hh = rd_pawn_domain + 0xF0;
+    if(!rd_rd(hh+0x20)) return;
+    uint32_t  hsize   = *(uint32_t*)(hh+0x18);
+    uintptr_t buckets = *(uintptr_t*)(hh+0x20);
+    if(!rd_rd(buckets) || hsize==0 || hsize>0x100000) return;
+    for(uint32_t bk=0; bk<hsize; bk++){
+        uintptr_t ji=*(uintptr_t*)(buckets+(uintptr_t)bk*8);
+        for(int g=0; rd_rd(ji) && g<20000; ji=*(uintptr_t*)(ji+0x08), g++){
+            if(*(uintptr_t*)(ji+0x10)!=code) continue;
+            uintptr_t m=*(uintptr_t*)(ji+0x00); if(!rd_rd(m)) return;
+            uintptr_t nmp=*(uintptr_t*)(m+0x18);
+            uintptr_t kl=*(uintptr_t*)(m+0x08);
+            uintptr_t kn= rd_rd(kl+0x40)? *(uintptr_t*)(kl+0x40):0;
+            snprintf(out,(size_t)outlen,"%.24s.%.24s", rd_rd(kn)?(const char*)kn:"?", rd_rd(nmp)?(const char*)nmp:"?");
+            return;
+        }
+    }
+}
+
+// Sonnet's cheapest decisive probe: scan Pawn's MonoVTable for the slot that holds AnythingToStrip's
+// compiled code — THAT is Pawn's real IMT ExposeData dispatch slot (the mis-dispatch target), wherever
+// it lives (negative IMT region vt[-N] or positive vtable). Logs the offset (compare to the plain cell
+// vt+0x40+8*14 = vt+0xB0: same => that IS the dispatch slot; different => plain slot is vestigial and
+// the real one is elsewhere). Capped expensive jit-search; cheap window scan thereafter.
+static int rd_strip_done = 0; static uintptr_t rd_strip_code = 0;
+static void rd_pawn_scan_strip(void) {
+    if(rd_strip_done || !rd_pawn_vt) return;
+    if(!rd_strip_code) {
+        // Only run the (expensive) jit_code_hash search once the Pawn cell has actually been dispatched
+        // (cur != trampoline/NULL) — AnythingToStrip is compiled by then, so we don't burn early passes.
+        if(!rd_rd(rd_pawn_cell)) return;
+        uintptr_t cur = *(uintptr_t*)rd_pawn_cell;
+        if(cur == rd_pawn_tramp || cur == 0) return;        // not dispatched yet
+        rd_strip_code = rd_find_code_by_name("AnythingToStrip", 15);
+        if(!rd_strip_code) return;                          // not compiled yet
+        uintptr_t expose = rd_find_code_by_name("ExposeData", 11);   // 0 if it never compiled
+        rd_expose_code = expose;     // hand it to the guard so it can repair the IMT slot to real ExposeData
+        char nm[80]; rd_name_of_code(cur, nm, sizeof(nm));
+        printf_log(LOG_NONE,"[RD-PAWNSCAN] strip=%p expose=%p plain_cell=%p ('%s'), pawn_vt=%p\n",
+                   (void*)rd_strip_code,(void*)expose,(void*)cur,nm,(void*)rd_pawn_vt);
+        // ARM the dispatch entry-guard: invalidate AnythingToStrip's block so it RECOMPILES with a PrintTrace
+        // at its entry (pass.c keys on rd_guard_addr). On the NEXT mis-dispatch, PrintTrace dumps the caller
+        // (return addr + call-site bytes) → ground truth: is offset 0x3C0 baked into the JIT call, or an IMT path?
+        rd_guard_addr = rd_strip_code;
+        cleanDBFromAddressRange(rd_strip_code, 0x40, 1);
+        printf_log(LOG_NONE,"[RD-GUARD] armed AnythingToStrip @%p (block invalidated, will trace caller)\n",(void*)rd_strip_code);
+    }
+    int found=0;
+    // (a) DIRECT: a slot in a WIDE vtable window holds AnythingToStrip's code.
+    for(intptr_t off=-0x400; off<=0x800; off+=8){
+        uintptr_t slot = rd_pawn_vt + (uintptr_t)off;
+        if(!rd_rd(slot)) continue;
+        if(*(uintptr_t*)slot == rd_strip_code){
+            printf_log(LOG_NONE,"[RD-PAWNSCAN] DIRECT hit: vt%+ld (= %p) holds AnythingToStrip\n",(long)off,(void*)slot);
+            found++;
+        }
+    }
+    // (b) INDIRECT: a vtable field points to an array (a separate IMT table?) that holds AnythingToStrip's
+    // code — Unity Mono may keep the IMT as a separate allocation rather than inline in the vtable.
+    for(intptr_t off=-0x200; off<=0x200; off+=8){
+        uintptr_t fld = rd_pawn_vt + (uintptr_t)off; if(!rd_rd(fld)) continue;
+        uintptr_t arr = *(uintptr_t*)fld;            if(!rd_rd(arr)) continue;
+        for(int i=-24;i<=32;i++){
+            uintptr_t e = arr + (intptr_t)i*8; if(!rd_rd(e)) continue;
+            if(*(uintptr_t*)e == rd_strip_code){
+                printf_log(LOG_NONE,"[RD-PAWNSCAN] INDIRECT hit: vt%+ld -> arr[%d] holds AnythingToStrip\n",(long)off,i);
+                found++;
+            }
+        }
+    }
+    rd_strip_done=1;   // one comprehensive pass once strip code is known
+}
+
+// Re-scan domain->jit_code_hash for Pawn's real ExposeData code (most-derived in parent chain) and write it into
+// the cell. Called when the cell has changed from its initial trampoline (= dispatched/corrupted). One-shot.
+static void rd_pawn_apply_fix(void) {
+    if(rd_pawn_done || !rd_pawn_cell || !rd_rd(rd_pawn_cell)) return;
+    uintptr_t cur = *(uintptr_t*)rd_pawn_cell;
+    if(cur == rd_pawn_tramp) return;                 // not yet dispatched/corrupted — wait
+    uintptr_t hh = rd_pawn_domain + 0xF0;
+    if(!rd_rd(hh+0x20)) return;
+    uint32_t  hsize   = *(uint32_t*)(hh+0x18);
+    uintptr_t buckets = *(uintptr_t*)(hh+0x20);
+    if(!rd_rd(buckets) || hsize==0 || hsize>0x100000) return;
+    uintptr_t code=0, pk=0;
+    for(uintptr_t c=rd_pawn_klass, d=0; rd_rd(c) && d<24 && !code; c=*(uintptr_t*)(c+0x28), d++)
+        for(uint32_t bk=0; bk<hsize && !code; bk++){
+            uintptr_t ji=*(uintptr_t*)(buckets+(uintptr_t)bk*8);
+            for(int g=0; rd_rd(ji) && g<20000 && !code; ji=*(uintptr_t*)(ji+0x08), g++){
+                uintptr_t m=*(uintptr_t*)(ji+0x00); if(!rd_rd(m)) continue;
+                if(*(uintptr_t*)(m+0x08)!=c) continue;
+                uintptr_t nmp=*(uintptr_t*)(m+0x18); if(!rd_rd(nmp)) continue;
+                if(!strncmp((const char*)nmp,"ExposeData",11)){ code=*(uintptr_t*)(ji+0x10); pk=c; }
+            }
+        }
+    if(code && code!=cur){
+        *(uintptr_t*)rd_pawn_cell = code;
+        rd_pawn_done = 1;
+        printf_log(LOG_NONE, "[RD-PAWNFIX] APPLIED: cell %p %p -> %p (changed from tramp %p)\n",
+                   (void*)rd_pawn_cell,(void*)cur,(void*)code,(void*)rd_pawn_tramp);
+    } else if(code==cur) {
+        rd_pawn_done = 1;  // already correct
+    }
+}
+// PROACTIVE IMT-slot fix (the real fix — runs BEFORE any pawn dispatches, so NO pawn is lost). The dispatch
+// `call [pawn_vt - 0x58]` goes through a box64-mis-built IMT slot whose thunk targets AnythingToStrip's vtable
+// cell (pawn_vt+0x3C0) instead of ExposeData's (pawn_vt+0xB0). Scan the 19 IMT slots (pawn_vt[-19..-1]); the one
+// whose thunk embeds the literal `pawn_vt+0x3C0` is the broken ExposeData slot — overwrite it to point straight
+// at Pawn.ExposeData's compiled code. One-shot. (Confirmed fix point: the guard-write already took the save from
+// 1 to 14 colonists; doing it here, before the first dispatch, saves the last one too.)
+static int rd_imt_done = 0;
+static void rd_imt_fix(void) {
+    if(rd_imt_done || !rd_pawn_vt) return;
+    // THROTTLE: the rd_find_code_by_name() below is a full jit_code_hash scan. Pawn is located during gameplay
+    // but ExposeData only compiles around save time, so without this we'd run that scan on EVERY FillBlock for
+    // the whole session → the game crawled. Only attempt every 256th tick while waiting; once fixed, done.
+    static unsigned rd_imt_tick = 0;
+    if((rd_imt_tick++ & 0xFF) != 0) return;
+    uintptr_t expose = rd_find_code_by_name("ExposeData", 11);
+    if(!expose) return;                                   // ExposeData not compiled yet — wait
+    uintptr_t bad_cell = rd_pawn_vt + 0x3C0;              // AnythingToStrip's vtable cell (DIRECT-hit confirmed)
+    for(int s=1; s<=19; s++){
+        uintptr_t slotaddr = rd_pawn_vt - (uintptr_t)s*8; // IMT region = negative offsets before the vtable
+        if(!rd_rd(slotaddr)) continue;
+        uintptr_t thunk = *(uintptr_t*)slotaddr;
+        if(!rd_rd(thunk)) continue;
+        for(int o=0; o<0x60; o++){                        // the thunk embeds `mov r11, <bad_cell>` (49 BB <imm8>)
+            if(!rd_rd(thunk+o+8)) break;
+            if(*(uintptr_t*)(thunk+o) == bad_cell){
+                printf_log(LOG_NONE,"[RD-IMTFIX] slot @%p (vt-0x%x) thunk %p refs bad_cell %p -> ExposeData %p\n",
+                    (void*)slotaddr,s*8,(void*)thunk,(void*)bad_cell,(void*)expose);
+                *(uintptr_t*)slotaddr = expose;           // dispatch now goes straight to ExposeData
+                rd_imt_done = 1;
+                return;
+            }
+        }
+    }
+}
+// Cheap per-FillBlock tick: once located, watch the cell and fix as soon as it changes.
+static void rd_pawn_tick(void) {
+    if(!rd_pawn_cell) return;
+    rd_imt_fix();           // THE FIX — always on. Proactively repair the mis-built IMT slot (before any pawn dispatches)
+    if(!rd_diag_on()) return;   // everything below is diagnostics (slot scan, entry-guard, cell watch)
+    rd_pawn_scan_strip();   // locate Pawn's REAL IMT dispatch slot (holds AnythingToStrip) — runs even after the plain-cell fix
+    if(rd_pawn_done) return;
+    static int tlog=0; static uintptr_t last=0;
+    if(rd_rd(rd_pawn_cell)){
+        uintptr_t cur=*(uintptr_t*)rd_pawn_cell;
+        if(cur!=last && tlog<40){ tlog++; last=cur;
+            printf_log(LOG_NONE,"[RD-PAWNFIX] tick *cell=%p (tramp=%p)\n",(void*)cur,(void*)rd_pawn_tramp); }
+    }
+    rd_pawn_apply_fix();
+}
+static void rd_repair_pawn(uintptr_t domain, uintptr_t expose_itf) {
+    if(rd_pawn_done || rd_pawn_cell) return;   // already located (tick handles fixing) or done
+    if(!rd_rd(domain) || !rd_rd(expose_itf+0x08)) return;
+    uintptr_t itf_klass = *(uintptr_t*)(expose_itf+0x08);
+    uintptr_t hh = domain + 0xF0;
+    if(!rd_rd(hh+0x20)) return;
+    uint32_t  hsize   = *(uint32_t*)(hh+0x18);
+    uintptr_t buckets = *(uintptr_t*)(hh+0x20);
+    if(!rd_rd(buckets) || hsize==0 || hsize>0x100000) return;
+    // find pawn_klass = klass of any JIT'd method whose klass->name == "Pawn"
+    uintptr_t pawn_klass = 0;
+    for(uint32_t bk=0; bk<hsize && !pawn_klass; bk++){
+        uintptr_t ji=*(uintptr_t*)(buckets+(uintptr_t)bk*8);
+        for(int g=0; rd_rd(ji) && g<20000 && !pawn_klass; ji=*(uintptr_t*)(ji+0x08), g++){
+            uintptr_t m=*(uintptr_t*)(ji+0x00); if(!rd_rd(m)) continue;
+            uintptr_t k=*(uintptr_t*)(m+0x08); if(!rd_rd(k)||!rd_rd(k+0x40)) continue;
+            uintptr_t kn=*(uintptr_t*)(k+0x40); if(!rd_rd(kn)) continue;
+            if(!strncmp((const char*)kn,"Pawn",5)) pawn_klass=k;
+        }
+    }
+    if(!pawn_klass){ printf_log(LOG_NONE,"[RD-PAWNFIX] Pawn klass not in jit hash yet\n"); return; }
+    // (2) Pawn live MonoVTable via runtime_info
+    uintptr_t ri = rd_rd(pawn_klass+0xc8)? *(uintptr_t*)(pawn_klass+0xc8):0;
+    if(!rd_rd(ri)){ printf_log(LOG_NONE,"[RD-PAWNFIX] no runtime_info (klass=%p)\n",(void*)pawn_klass); return; }
+    int domain_id  = rd_rd(domain+0xbc)? *(int*)(domain+0xbc):0;
+    int max_domain = *(uint16_t*)ri;
+    if(domain_id<0 || domain_id>max_domain){ printf_log(LOG_NONE,"[RD-PAWNFIX] domain_id %d > max %d\n",domain_id,max_domain); return; }
+    uintptr_t vtp = ri + 0x8 + (uintptr_t)domain_id*8;
+    uintptr_t pawn_vt = rd_rd(vtp)? *(uintptr_t*)vtp:0;
+    if(!rd_rd(pawn_vt) || *(uintptr_t*)pawn_vt != pawn_klass){ printf_log(LOG_NONE,"[RD-PAWNFIX] vt validate fail vt=%p\n",(void*)pawn_vt); return; }
+    // (3) interface_offset(Pawn, IExposable)
+    int nn=*(uint16_t*)(pawn_klass+0x64);
+    uintptr_t ifaces=*(uintptr_t*)(pawn_klass+0x68), offs=*(uintptr_t*)(pawn_klass+0x70);
+    if(!rd_rd(ifaces)||!rd_rd(offs)||nn<=0||nn>=8192){ printf_log(LOG_NONE,"[RD-PAWNFIX] iface scan fail\n"); return; }
+    int ioff=-1;
+    for(int i=0;i<nn;i++) if(*(uintptr_t*)(ifaces+(uintptr_t)i*8)==itf_klass){ ioff=*(uint16_t*)(offs+(uintptr_t)i*2); break; }
+    if(ioff<0){ printf_log(LOG_NONE,"[RD-PAWNFIX] Pawn doesn't implement IExposable?\n"); return; }
+    uintptr_t cell = pawn_vt + 0x40 + 8*(uintptr_t)ioff;
+    // LOCATED — store state; the per-FillBlock tick fixes the cell the moment it changes (gets corrupted) and
+    // ExposeData is compiled. (At locate time the cell is usually still the uncompiled trampoline.)
+    rd_pawn_cell = cell; rd_pawn_klass = pawn_klass; rd_pawn_domain = domain; rd_pawn_vt = pawn_vt;
+    rd_pawn_tramp = rd_rd(cell)? *(uintptr_t*)cell : 0;
+    printf_log(LOG_NONE,"[RD-PAWNFIX] LOCATED pawn_klass=%p vt=%p ioff=%d cell=%p *cell(tramp)=%p\n",
+        (void*)pawn_klass,(void*)pawn_vt,ioff,(void*)cell,(void*)rd_pawn_tramp);
+    // followup7 leading hypothesis: mono_class_interface_offset bsearch's ifaces[] assumes sort by interface_id
+    // (MonoClass+0x5C). If box64 miscompiled the SORT at class setup, a mis-sorted array makes a CORRECT bsearch
+    // return the wrong interface → interface_offset(Pawn,IExposable) resolves to IStrippable's 112 instead of 14.
+    // Read-only check: log each interface as Name=interface_id + whether the id sequence is monotonic.
+    {
+        int ni = *(uint16_t*)(pawn_klass+0x64);
+        uintptr_t ifc = rd_rd(pawn_klass+0x68)? *(uintptr_t*)(pawn_klass+0x68):0;
+        if(rd_rd(ifc) && ni>0 && ni<8192){
+            int sorted=1; uint32_t prev=0; char buf[480]; int bp=0;
+            for(int i=0;i<ni && i<28 && bp<440;i++){
+                uintptr_t e=*(uintptr_t*)(ifc+(uintptr_t)i*8); if(!rd_rd(e+0x5c)) continue;
+                uint32_t id=*(uint32_t*)(e+0x5c);
+                uintptr_t nm = rd_rd(e+0x40)? *(uintptr_t*)(e+0x40):0;
+                if(i>0 && id<prev) sorted=0; prev=id;
+                bp += snprintf(buf+bp,(size_t)(sizeof(buf)-bp),"%.14s=%u ", rd_rd(nm)?(const char*)nm:"?", id);
+            }
+            printf_log(LOG_NONE,"[RD-IFACES] Pawn n=%d SORTED=%d : %s\n",ni,sorted,buf);
+        }
+    }
+    rd_pawn_apply_fix();   // fix immediately if it's already corrupted
+}
+
+// RimDroid SAVE FIX (2026-06-24, AI-consensus): class-agnostic compile-time repair of a corrupted IMT ExposeData
+// vtable cell. box64 mis-builds the IMT conflict-thunk so the ExposeData vtable cell holds AnythingToStrip's code
+// (a pointer INTO the thunk's own region, ~thunk+0x30) instead of the class's real ExposeData code -> objects
+// (esp. Verse.Pawn) serialize empty. Given the corrupt cell (impl_slot) + the ExposeData INTERFACE method, this
+// reverse-finds the owning MonoVTable (validated by the interface_offset formula: vt+0x40+8*interface_offset ==
+// impl_slot), then writes the class's real ExposeData JIT code (jit_code_hash, most-derived class in the parent
+// chain). Read-only except the single cell write; no Mono calls. Offsets verified vs _libmono.so: MonoVTable
+// +0=klass,+0x10=domain,+0x40=method cells; MonoClass +0x28=parent,+0x40=name,+0x64=ifaceN,+0x68=ifaces,
+// +0x70=iface_offsets; MonoMethod +0x08=klass,+0x18=name; MonoDomain+0xF0=jit_code_hash{size@0x18,buckets@0x20};
+// MonoJitInfo{method@0,next@0x08,code_start@0x10}.
+static void rd_savefix_repair(uintptr_t implslot, uintptr_t expose_itf) {
+    uintptr_t itf_klass = rd_rd(expose_itf+0x08) ? *(uintptr_t*)(expose_itf+0x08) : 0;
+    if(!rd_rd(itf_klass)) return;
+    for(int delta=0x40; delta <= 0x40 + 8*2048; delta += 8) {
+        uintptr_t vt = implslot - (uintptr_t)delta;
+        if(!rd_rd(vt) || !rd_rd(vt+0x10) || !rd_rd(vt+0x70)) continue;
+        uintptr_t klass  = *(uintptr_t*)vt;
+        uintptr_t domain = *(uintptr_t*)(vt+0x10);
+        if(!rd_rd(klass) || !rd_rd(domain) || !rd_rd(klass+0x70)) continue;
+        int nn = *(uint16_t*)(klass+0x64);
+        uintptr_t ifaces = *(uintptr_t*)(klass+0x68);
+        uintptr_t offs   = *(uintptr_t*)(klass+0x70);
+        if(!rd_rd(ifaces) || !rd_rd(offs) || nn<=0 || nn>=8192) continue;
+        int ioff = -1;
+        for(int i=0;i<nn;i++) if(*(uintptr_t*)(ifaces+(uintptr_t)i*8)==itf_klass){ ioff=*(uint16_t*)(offs+(uintptr_t)i*2); break; }
+        if(ioff<0) continue;
+        if(vt + 0x40 + 8*(uintptr_t)ioff != implslot) continue;   // STRONG validation: this IS the owner vtable
+        // Pawn has no detectable conflict-thunk; repair its plain vtable cell directly (one-shot) now that we have a domain.
+        rd_repair_pawn(domain, expose_itf);
+        uintptr_t hh = domain + 0xF0;
+        if(!rd_rd(hh+0x20)) return;
+        uint32_t  hsize   = *(uint32_t*)(hh+0x18);
+        uintptr_t buckets = *(uintptr_t*)(hh+0x20);
+        if(!rd_rd(buckets) || hsize==0 || hsize>0x100000) return;
+        static uintptr_t cand_k[1024], cand_c[1024]; int nc=0;
+        for(uint32_t bk=0; bk<hsize && nc<1024; bk++){
+            uintptr_t ji = *(uintptr_t*)(buckets+(uintptr_t)bk*8);
+            for(int g=0; rd_rd(ji) && g<20000 && nc<1024; ji=*(uintptr_t*)(ji+0x08), g++){
+                uintptr_t m=*(uintptr_t*)(ji+0x00); if(!rd_rd(m)) continue;
+                uintptr_t nmp=*(uintptr_t*)(m+0x18); if(!rd_rd(nmp)) continue;
+                if(!strncmp((const char*)nmp,"ExposeData",11)){ cand_k[nc]=*(uintptr_t*)(m+0x08); cand_c[nc]=*(uintptr_t*)(ji+0x10); nc++; }
+            }
+        }
+        uintptr_t code=0, pk=0;
+        for(uintptr_t c=klass, d=0; rd_rd(c) && d<24 && !code; c=*(uintptr_t*)(c+0x28), d++)
+            for(int i=0;i<nc;i++) if(cand_k[i]==c){ code=cand_c[i]; pk=c; break; }
+        uintptr_t kn  = rd_rd(klass+0x40)? *(uintptr_t*)(klass+0x40):0;
+        uintptr_t pkn = rd_rd(pk+0x40)?    *(uintptr_t*)(pk+0x40):0;
+        if(code && code != *(uintptr_t*)implslot) {
+            *(uintptr_t*)implslot = code;
+            printf_log(LOG_NONE, "[RD-SAVEFIX] %.20s.ExposeData cell %p -> %p (impl '%.20s')\n",
+                rd_rd(kn)?(const char*)kn:"?", (void*)implslot, (void*)code, rd_rd(pkn)?(const char*)pkn:"?");
+        } else {
+            printf_log(LOG_NONE, "[RD-SAVEFIX] %.20s: code not found (nc=%d), cell %p left\n",
+                rd_rd(kn)?(const char*)kn:"?", nc, (void*)implslot);
+        }
+        return;
+    }
+    printf_log(LOG_NONE, "[RD-SAVEFIX] reverse-find FAILED for implslot %p (no owner vtable in scan range)\n", (void*)implslot);
+}
+
 dynablock_t* FillBlock64(uintptr_t addr, int is32bits, int inst_max, int is_new, int noalt) {
     /*
         A Block must have this layout:
@@ -461,6 +817,74 @@ dynablock_t* FillBlock64(uintptr_t addr, int is32bits, int inst_max, int is_new,
         return NULL;
     }
 #endif
+    // RimDroid SAVE FIX (always-on, compile-time, class-agnostic). When an IMT ExposeData conflict-thunk compiles
+    // and its vtable cell is corrupted (the cell points INTO the thunk's own region = AnythingToStrip's code, the
+    // deterministic box64 mis-build signature), repair the cell to the class's real ExposeData code. No trigger,
+    // no runtime trace, no Mono calls. Per-block cost = a couple of byte compares; the heavy repair runs only on
+    // the rare corrupted-conflict-thunk match (capped). Catches Pawn's thunk whenever it compiles.
+    // The save-bug FIX runs by DEFAULT (cheap): the thunk detector locates Pawn from a corrupt container thunk,
+    // then rd_pawn_tick()->rd_imt_fix() repairs the mis-built IMT slot. Only the heavy/noisy DIAGNOSTICS
+    // (firstkey logs, byte dumps, good-phase probe) are gated behind rd_diag_on() (env RIMDROID_SAVEDIAG) —
+    // those did the expensive passes that made good-phase save-LOADS crawl.
+    {
+        rd_pawn_tick();   // THE FIX (rd_imt_fix); its own diagnostics are gated inside
+        static int rd_sf_n = 0, rd_sf_seen = 0;
+        if(rd_sf_n < 256 && (getProtection_fast(addr)&PROT_READ) && (getProtection_fast(addr+12)&PROT_READ)) {
+            uint8_t* b = (uint8_t*)addr;
+            // conflict thunk = starts with `49 BB <key8> 4D 3B D3` (mov r11,key1 ; cmp r10,r11)
+            if(b[0]==0x49 && b[1]==0xbb && b[10]==0x4d && b[11]==0x3b && b[12]==0xd3) {
+                // diagnostic: log this thunk's FIRST key name (AnythingToStrip-first => it's Pawn's thunk)
+                uintptr_t k0 = *(uintptr_t*)(addr+2);
+                if(rd_diag_on() && rd_sf_seen < 80 && rd_rd(k0) && rd_rd(k0+0x18)) {
+                    uintptr_t n0 = *(uintptr_t*)(k0+0x18);
+                    if(rd_rd(n0)) { rd_sf_seen++;
+                        printf_log(LOG_NONE, "[RD-SAVEFIX] thunk @%p firstkey='%.24s'\n", (void*)addr, (const char*)n0); }
+                    // One-shot raw byte dump of the FIRST ExposeData thunk, so we can read its real
+                    // entry encoding (the strict pattern below misses these — different thunk shape).
+                    static int rd_dumped = 0;
+                    if(!rd_dumped && rd_rd(n0) && !strncmp((const char*)n0,"ExposeData",11)
+                       && (getProtection_fast(addr+0x50)&PROT_READ)) {
+                        rd_dumped = 1;
+                        char hex[0x50*3+1]; int hp=0;
+                        for(int q=0;q<0x50;q++) hp += snprintf(hex+hp, (size_t)(sizeof(hex)-hp), "%02x ", b[q]);
+                        printf_log(LOG_NONE, "[RD-SAVEFIX] DUMP @%p (0x50): %s\n", (void*)addr, hex);
+                    }
+                }
+                // scan EVERY entry (handles multi-collision thunks where ExposeData is NOT the first key):
+                // each entry = `49 BB <key> 4D 3B D3 75 ?? 49 BB <impl> 41 FF 23`; cmp at offset p.
+                for(int p=10; p<0x100 && rd_sf_n<256; p++) {
+                    if(!(getProtection_fast(addr+p+17)&PROT_READ)) break;
+                    if(b[p]==0x4d && b[p+1]==0x3b && b[p+2]==0xd3 && b[p+3]==0x75
+                       && b[p+5]==0x49 && b[p+6]==0xbb && b[p+15]==0x41 && b[p+16]==0xff && b[p+17]==0x23) {
+                        uintptr_t key  = *(uintptr_t*)(addr+p-8);
+                        uintptr_t impl = *(uintptr_t*)(addr+p+7);
+                        if(rd_rd(key) && rd_rd(key+0x18)) {
+                            uintptr_t namep = *(uintptr_t*)(key+0x18);
+                            if(rd_rd(namep) && !strncmp((const char*)namep, "ExposeData", 11) && rd_rd(impl)) {
+                                uintptr_t v = *(uintptr_t*)impl;
+                                if(v >= addr && v < addr + 0x100) {   // cell points back into the thunk = corrupted
+                                    rd_sf_n++;
+                                    if(rd_diag_on())
+                                        printf_log(LOG_NONE, "[RD-SAVEFIX] detect corrupt @%p entry+%d key=%p impl=%p *impl=%p\n",
+                                                   (void*)addr, p, (void*)key, (void*)impl, (void*)v);
+                                    rd_savefix_repair(impl, key);   // FIX path: repairs the container cell AND locates Pawn (→ rd_imt_fix)
+                                } else if(rd_diag_on()) {
+                                    // GOOD-PHASE PROBE (diagnostics only): cell NOT corrupt, but locate Pawn anyway so
+                                    // the scan/guard can study a working dispatch. Expensive (this was the good-phase
+                                    // save-LOAD slowdown) → only when RIMDROID_SAVEDIAG is set. Not needed for the fix.
+                                    static int rd_gp_probe_n = 0;
+                                    if(!rd_pawn_cell && !rd_pawn_done && rd_gp_probe_n < 64) {
+                                        rd_gp_probe_n++;
+                                        rd_savefix_repair(impl, key);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     if(current_helper) {
         if(current_helper==redundant_helper) {
             dynarec_log(LOG_INFO, "%04d|Warning: previous FillBlock did not cleaned up correctly (helper=%p, x64addr=%p, db=%p)\n", GetTID(), current_helper, (void*)((dynarec_native_t*)current_helper)->start, ((dynarec_native_t*)current_helper)->dynablock);
