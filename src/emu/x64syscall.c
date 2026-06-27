@@ -71,6 +71,7 @@ int my_sigaltstack(x64emu_t* emu, const x64_stack_t* ss, x64_stack_t* oss);
 void* my_mmap64(x64emu_t* emu, void *addr, unsigned long length, int prot, int flags, int fd, int64_t offset);
 int my_munmap(x64emu_t* emu, void* addr, unsigned long length);
 int my_mprotect(x64emu_t* emu, void *addr, unsigned long len, int prot);
+int my_sched_getaffinity(x64emu_t* emu, int pid, size_t cpusetsize, void* mask);  // RimDroid: cap CPU mask (BOX64_MAXCPU)
 void* my_mremap(x64emu_t* emu, void* old_addr, size_t old_size, size_t new_size, int flags, void* new_addr);
 #ifndef NOALIGN
 int32_t my_epoll_ctl(x64emu_t* emu, int32_t epfd, int32_t op, int32_t fd, void* event);
@@ -617,6 +618,13 @@ void EXPORT x64Syscall_linux(x64emu_t *emu)
             break;
         case 5: // sys_fstat
             S_RAX = my_fstat(emu, S_EDI, (void*)R_RSI);
+            if(S_RAX==-1)
+                S_RAX = -errno;
+            break;
+        case 204: // sys_sched_getaffinity — RimDroid: Mono reads ProcessorCount via the RAW syscall (glibc
+                  // inline-syscall), bypassing the libc wrapper, so BOX64_MAXCPU never capped it on some devices
+                  // (mods crash the loading screen). Route it through my_sched_getaffinity, which caps the mask.
+            S_RAX = my_sched_getaffinity(emu, S_EDI, (size_t)R_RSI, (void*)R_RDX);
             if(S_RAX==-1)
                 S_RAX = -errno;
             break;
