@@ -649,6 +649,14 @@ static void rd_pawn_tick(void) {
     }
     rd_pawn_apply_fix();
 }
+// RimDroid TEST toggle (env RIMDROID_NO_SAVEFIX=1): disable the entire save-fix machinery (FillBlock thunk
+// detector + rd_savefix_repair code-rewrites + rd_imt_fix). Used to confirm whether the save-fix's per-block
+// code rewriting is what causes the reduced-render flicker on loaded saves. Default OFF (the fix stays on).
+static int rd_savefix_off(void) {
+    static int v = -1;
+    if(v < 0) v = getenv("RIMDROID_NO_SAVEFIX") ? 1 : 0;
+    return v;
+}
 static void rd_repair_pawn(uintptr_t domain, uintptr_t expose_itf) {
     if(rd_pawn_done || rd_pawn_cell) return;   // already located (tick handles fixing) or done
     if(!rd_rd(domain) || !rd_rd(expose_itf+0x08)) return;
@@ -826,7 +834,7 @@ dynablock_t* FillBlock64(uintptr_t addr, int is32bits, int inst_max, int is_new,
     // then rd_pawn_tick()->rd_imt_fix() repairs the mis-built IMT slot. Only the heavy/noisy DIAGNOSTICS
     // (firstkey logs, byte dumps, good-phase probe) are gated behind rd_diag_on() (env RIMDROID_SAVEDIAG) —
     // those did the expensive passes that made good-phase save-LOADS crawl.
-    {
+    if(!rd_savefix_off()) {
         rd_pawn_tick();   // THE FIX (rd_imt_fix); its own diagnostics are gated inside
         static int rd_sf_n = 0, rd_sf_seen = 0;
         if(rd_sf_n < 256 && (getProtection_fast(addr)&PROT_READ) && (getProtection_fast(addr+12)&PROT_READ)) {

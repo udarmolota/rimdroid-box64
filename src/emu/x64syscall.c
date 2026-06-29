@@ -624,7 +624,11 @@ void EXPORT x64Syscall_linux(x64emu_t *emu)
         case 204: // sys_sched_getaffinity — RimDroid: Mono reads ProcessorCount via the RAW syscall (glibc
                   // inline-syscall), bypassing the libc wrapper, so BOX64_MAXCPU never capped it on some devices
                   // (mods crash the loading screen). Route it through my_sched_getaffinity, which caps the mask.
-            S_RAX = my_sched_getaffinity(emu, S_EDI, (size_t)R_RSI, (void*)R_RDX);
+            if(getenv("RIMDROID_NO_MODSFIX")) {   // TEST: restore the 0.1.8 path (raw affinity, no wrapper/cap)
+                S_RAX = sched_getaffinity(S_EDI, (size_t)R_RSI, (void*)R_RDX);
+            } else {
+                S_RAX = my_sched_getaffinity(emu, S_EDI, (size_t)R_RSI, (void*)R_RDX);
+            }
             if(S_RAX==-1)
                 S_RAX = -errno;
             break;

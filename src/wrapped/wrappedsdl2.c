@@ -1561,7 +1561,9 @@ EXPORT int my2_SDL_GL_MakeCurrent(void* win, void* ctx) {
 extern __attribute__((weak)) void rimdroid_frame_tick(void);
 EXPORT void my2_SDL_GL_SwapWindow(void* win) {
     g_cnt_swap++;
-    if (rimdroid_frame_tick) rimdroid_frame_tick();   // count this present (any renderer)
+    static int rd_fpstick_off = -1;   // TEST toggle (env RIMDROID_NO_FPSTICK=1): skip the FPS frame counter
+    if (rd_fpstick_off < 0) rd_fpstick_off = getenv("RIMDROID_NO_FPSTICK") ? 1 : 0;
+    if (rimdroid_frame_tick && !rd_fpstick_off) rimdroid_frame_tick();   // count this present (any renderer)
     (void)win;
     printf_log(LOG_NONE, "RIMDROID SDL_GL_SwapWindow(win=%p)\n", win);
     if (&g_osmesa_context && g_osmesa_context) {
