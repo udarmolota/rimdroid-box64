@@ -3,6 +3,7 @@
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <pthread.h>
 #include <errno.h>
 #include <setjmp.h>
@@ -878,8 +879,22 @@ EXPORT int my_pthread_cond_timedwait(x64emu_t* emu, pthread_cond_t* cond, void* 
 }
 EXPORT int my_pthread_cond_wait(x64emu_t* emu, pthread_cond_t* cond, void* mutex)
 {
-	(void)emu;
+	// RimDroid 1.6 direct-Vulkan bring-up: identify the Unity wait that prevents the
+	// first frame. Limit this to guest threads named RimWorldLinux and the X11 route;
+	// generic pthread logging is far too hot to be useful.
+	static _Atomic int rd_cond_wait_seq = 0;
+	char rd_name[32] = {0};
+	int rd_trace = getenv("RIMDROID_DIRECT_VULKAN") &&
+	               pthread_getname_np(pthread_self(), rd_name, sizeof(rd_name)) == 0 &&
+	               strcmp(rd_name, "RimWorldLinux") == 0;
+	int rd_seq = rd_trace ? atomic_fetch_add(&rd_cond_wait_seq, 1) + 1 : 0;
+	if(rd_trace && rd_seq <= 200)
+		printf_log(LOG_NONE, "RIMDROID: pthread_cond_wait ENTER #%d tid=%d rip=%p cond=%p aligned=%p mutex=%p\n",
+		           rd_seq, GetTID(), (void*)R_RIP, cond, alignCond(cond), mutex);
 	int ret = pthread_cond_wait(alignCond(cond), mutex);
+	if(rd_trace && rd_seq <= 200)
+		printf_log(LOG_NONE, "RIMDROID: pthread_cond_wait EXIT #%d tid=%d rip=%p ret=%d\n",
+		           rd_seq, GetTID(), (void*)R_RIP, ret);
 	return ret;
 }
 EXPORT int my_pthread_cond_clockwait(x64emu_t *emu, pthread_cond_t* cond, void* mutex, clockid_t __clock_id, const struct timespec* __abstime)

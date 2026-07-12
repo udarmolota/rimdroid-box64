@@ -6,6 +6,7 @@
 #include <stdarg.h>
 #include <unistd.h>
 #include <sys/syscall.h>
+#include <time.h>
 
 #include "wrappedlibs.h"
 
@@ -148,6 +149,507 @@ static void rd_glGetInternalformativ(uint32_t target, uint32_t internalformat, u
 // Resolve a REAL Zink GL entry point (dlsym + eglGetProcAddress fallback).
 static void* rd_zfa_gl(const char* n) { return rimdroid_gl_proc_resolver(n); }
 
+// ---- RimDroid 1.6 sync-poll shim (AI-brief v15) -----------------------------
+// Unity polls GLsync objects with zero-timeout waits during the texture-atlas
+// bake. On Zink this can turn a poll loop into thousands of tiny flush/batch
+// states per second. Keep the first real driver query, then coalesce repeated
+// polls of the same still-unsignaled sync for a short window.
+#define RD_GL_SYNC_FLUSH_COMMANDS_BIT 0x00000001u
+#define RD_GL_TIMEOUT_EXPIRED        0x911Bu
+#define RD_GL_WAIT_FAILED            0x911Du
+
+static uint32_t (*p_rd_real_glClientWaitSync)(void*, uint32_t, uint64_t) = NULL;
+static void (*p_rd_real_glDeleteSync)(void*) = NULL;
+
+static __thread void* rd_sync_last = NULL;
+static __thread uint64_t rd_sync_last_ns = 0;
+static __thread uint32_t rd_sync_last_flags = 0;
+static __thread uint32_t rd_sync_last_result = RD_GL_TIMEOUT_EXPIRED;
+
+static uint64_t rd_now_ns(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+        return 0;
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static uint64_t rd_sync_poll_window_ns(void)
+{
+    static int init = 0;
+    static uint64_t window_ns = 1000000ull; // default: 1ms
+    if (!init) {
+        init = 1;
+        const char* e = getenv("RIMDROID_GL_SYNC_POLL_US");
+        if (e) {
+            char* end = NULL;
+            unsigned long long us = strtoull(e, &end, 0);
+            if (end != e)
+                window_ns = us * 1000ull;
+        }
+    }
+    return window_ns;
+}
+
+static uint32_t rd_glClientWaitSync(void* sync, uint32_t flags, uint64_t timeout)
+{
+    if (!p_rd_real_glClientWaitSync)
+        return RD_GL_WAIT_FAILED;
+
+    const uint64_t window_ns = rd_sync_poll_window_ns();
+    if (sync && timeout == 0 && window_ns) {
+        uint64_t now = rd_now_ns();
+        int needs_first_flush = (flags & RD_GL_SYNC_FLUSH_COMMANDS_BIT) &&
+                                !(rd_sync_last_flags & RD_GL_SYNC_FLUSH_COMMANDS_BIT);
+        if (now && sync == rd_sync_last && rd_sync_last_result == RD_GL_TIMEOUT_EXPIRED &&
+            rd_sync_last_ns && now - rd_sync_last_ns < window_ns && !needs_first_flush) {
+            static uint64_t skipped = 0;
+            skipped++;
+            if ((skipped & (skipped - 1)) == 0 || (skipped % 50000ull) == 0) {
+                printf_log(LOG_NONE, "RIMDROID GLSYNC coalesced %llu zero-timeout glClientWaitSync polls (window=%lluus)\n",
+                           (unsigned long long)skipped,
+                           (unsigned long long)(window_ns / 1000ull));
+                fflush(NULL);
+            }
+            return RD_GL_TIMEOUT_EXPIRED;
+        }
+        rd_sync_last_ns = now;
+    }
+
+    {
+        static uint64_t rd_wait_total = 0;
+        rd_wait_total++;
+        if ((rd_wait_total % 10000) == 1)
+            { printf_log(LOG_NONE, "RIMDROID SYNCSTAT wait_total=%llu timeout=%llu\n", (unsigned long long)rd_wait_total, (unsigned long long)timeout); fflush(NULL); }
+    }
+    uint32_t ret = p_rd_real_glClientWaitSync(sync, flags, timeout);
+    if (sync && timeout == 0) {
+        rd_sync_last = sync;
+        rd_sync_last_flags = flags;
+        rd_sync_last_result = ret;
+    }
+    return ret;
+}
+
+static void rd_glDeleteSync(void* sync)
+{
+    if (sync == rd_sync_last) {
+        rd_sync_last = NULL;
+        rd_sync_last_ns = 0;
+        rd_sync_last_flags = 0;
+        rd_sync_last_result = RD_GL_TIMEOUT_EXPIRED;
+    }
+    if (p_rd_real_glDeleteSync)
+        p_rd_real_glDeleteSync(sync);
+}
+
+// ---- RimDroid 1.6 arg-sanity shims (AI-brief v13) ----------------------------
+// At the splash-unload frame ONE GL call carries a garbage/huge size: with
+// ARB_buffer_storage it GPU-faulted (DEVICE_LOST on both drivers); with the
+// extension hidden the same frame dies in an "mmap failed: Out of memory" loop
+// (CPU staging of the garbage size). These shims log anomalous sizes to NAME the
+// call. Threshold 64MB — RimWorld's legit buffers are far smaller.
+#define RD_GL_SANE_SIZE (64ull*1024*1024)
+static void rd_upload_pace(uint64_t sz);   // defined below with the texture accounting
+// ---- GL op-logger (device-lost culprit hunt, 2026-07-11) --------------------------
+// Every death has IDENTICAL counters at the last 256MB-crossing print (sub=13623 etc.) →
+// the guilty command sits at a fixed position in the deterministic upload stream. Gate on
+// the subimage counter: past RIMDROID_GL_LOG_AFTER_SUB, EVERY shimmed GL call is printed
+// with a sequence number, and pacing (RIMDROID_PACE_MB, e.g. 8) adds a glFinish per flush
+// in the armed zone — the last "pace finish OK" exonerates everything before it, so the
+// culprit is among the handful of ops logged after it.
+static uint64_t rd_sub_calls;              // real definition below with the sub shims
+static uint64_t rd_gl_op_seq = 0;
+static int rd_oplog_armed_logged = 0;
+static int rd_gl_oplog_on(void) {
+    static int64_t after = -2;
+    if (after == -2) {
+        const char* e = getenv("RIMDROID_GL_LOG_AFTER_SUB");
+        after = (e && e[0]) ? atoll(e) : -1;
+    }
+    rd_gl_op_seq++;
+    if (after < 0 || (int64_t)rd_sub_calls < after) return 0;
+    if (!rd_oplog_armed_logged) {
+        rd_oplog_armed_logged = 1;
+        printf_log(LOG_NONE, "RIMDROID OPLOG armed at sub=%llu seq=%llu\n",
+                   (unsigned long long)rd_sub_calls, (unsigned long long)rd_gl_op_seq);
+        fflush(NULL);
+    }
+    return 1;
+}
+#define RD_OPLOG(...) do { if (rd_gl_oplog_on()) { printf_log(LOG_NONE, __VA_ARGS__); fflush(NULL); } } while(0)
+static void (*p_rd_real_glBufferStorage)(uint32_t,int64_t,const void*,uint32_t) = NULL;
+static void (*p_rd_real_glBufferData)(uint32_t,int64_t,const void*,uint32_t) = NULL;
+static void (*p_rd_real_glBufferSubData)(uint32_t,int64_t,int64_t,const void*) = NULL;
+static void* (*p_rd_real_glMapBufferRange)(uint32_t,int64_t,int64_t,uint32_t) = NULL;
+static uint64_t rd_buf_total = 0, rd_buf_calls = 0;
+static void rd_glBufferStorage(uint32_t target, int64_t size, const void* data, uint32_t flags) {
+    if (size > 0) { rd_buf_total += (uint64_t)size; rd_buf_calls++; }
+    if ((uint64_t)size > RD_GL_SANE_SIZE)
+        { printf_log(LOG_NONE, "RIMDROID GLSANITY glBufferStorage target=0x%x size=%lld flags=0x%x", target, (long long)size, flags); fflush(NULL); }
+    if (p_rd_real_glBufferStorage) p_rd_real_glBufferStorage(target, size, data, flags);
+    if (size > 0) rd_upload_pace((uint64_t)size);
+}
+static void rd_glBufferData(uint32_t target, int64_t size, const void* data, uint32_t usage) {
+    if (size > 0) { rd_buf_total += (uint64_t)size; rd_buf_calls++; }
+    if ((uint64_t)size > RD_GL_SANE_SIZE)
+        { printf_log(LOG_NONE, "RIMDROID GLSANITY glBufferData target=0x%x size=%lld data=%p usage=0x%x\n", target, (long long)size, data, usage); fflush(NULL); }
+    if (p_rd_real_glBufferData) p_rd_real_glBufferData(target, size, data, usage);
+    if (size > 0) rd_upload_pace((uint64_t)size);
+}
+static void rd_glBufferSubData(uint32_t target, int64_t offset, int64_t size, const void* data) {
+    if ((uint64_t)size > RD_GL_SANE_SIZE || offset < 0)
+        { printf_log(LOG_NONE, "RIMDROID GLSANITY glBufferSubData target=0x%x offset=%lld size=%lld data=%p\n", target, (long long)offset, (long long)size, data); fflush(NULL); }
+    if (p_rd_real_glBufferSubData) p_rd_real_glBufferSubData(target, offset, size, data);
+    if (size > 0) rd_upload_pace((uint64_t)size);
+}
+static void* rd_glMapBufferRange(uint32_t target, int64_t offset, int64_t length, uint32_t access) {
+    if ((uint64_t)length > RD_GL_SANE_SIZE || offset < 0)
+        { printf_log(LOG_NONE, "RIMDROID GLSANITY glMapBufferRange target=0x%x offset=%lld length=%lld access=0x%x\n", target, (long long)offset, (long long)length, access); fflush(NULL); }
+    return p_rd_real_glMapBufferRange ? p_rd_real_glMapBufferRange(target, offset, length, access) : NULL;
+}
+// Texture-family sanity: the death frame is RimWorld's atlas bake, and Turnip dies on a GPU-BO
+// mmap ENOMEM ("mmap failed:" from freedreno_bo.c). Log EVERY allocation >= 2048px (capped) and
+// flag insane dims, to see the atlas size stream that exhausts kgsl mappable memory.
+static void (*p_rd_real_glTexStorage2D)(uint32_t,int32_t,uint32_t,int32_t,int32_t) = NULL;
+static void (*p_rd_real_glTexImage2D)(uint32_t,int32_t,int32_t,int32_t,int32_t,int32_t,uint32_t,uint32_t,const void*) = NULL;
+static void (*p_rd_real_glRenderbufferStorageMultisample)(uint32_t,int32_t,uint32_t,int32_t,int32_t) = NULL;
+static int rd_texlog_n = 0;
+// Cumulative texture-memory estimate: individual sizes are sane, so test the AGGREGATE
+// (kgsl BO mmap dies with ENOMEM). bpp: compressed (DXT/BPTC 0x83xx/0x8e8x) ~1B/px, else 4B/px;
+// mip chains ~×4/3. Logs at every +256MB crossing.
+static uint64_t rd_tex_total = 0;
+static uint64_t rd_rb_total = 0;
+// UPLOAD PACING (the fix for the 3GB kgsl cap): RimWorld 1.6's atlas bake uploads ~1.3GB of
+// textures inside ONE frame — zink keeps every staging BO alive until a flush, so peak GPU-BO
+// usage doubles+ and slams kgsl's ~3GB per-process limit ("kgsl-3d0" = 3.00GB in /proc/maps at
+// death) → mmap ENOMEM → device lost. Force a glFlush every ~192MB of accounted allocations
+// (staging gets submitted+recycled) and a full glFinish every ~768MB (hard reclaim).
+static uint64_t rd_flush_acc = 0, rd_finish_acc = 0;
+// Reset the pacing accumulator at every present: pacing exists to split a GIANT single-frame
+// upload burst (the 1.6 atlas bake records >1GB before the first swap). Uploads spread across
+// normal frames are already submitted by the per-frame flush — without this reset, steady
+// gameplay traffic (Unity's dynamic font/UI atlas glTexSubImage2D) crossed the 192MB threshold
+// every few seconds and the forced mid-frame glFlush showed up as a periodic hitch.
+void rd_upload_pace_frame_reset(void) { rd_flush_acc = 0; }
+static void rd_upload_pace(uint64_t sz) {
+    static void (*p_flush)(void) = NULL; static void (*p_finish)(void) = NULL; static int init = 0;
+    static uint64_t pace_bytes = 0;
+    if (!pace_bytes) {
+        const char* e = getenv("RIMDROID_PACE_MB");
+        pace_bytes = (e && e[0] && atoi(e) > 0) ? ((uint64_t)atoi(e) << 20) : (192ull << 20);
+    }
+    rd_flush_acc += sz; rd_finish_acc += sz;
+    if (rd_flush_acc < pace_bytes) return;
+    if (!init) { init = 1; p_flush = rd_zfa_gl("glFlush"); p_finish = rd_zfa_gl("glFinish"); }
+    rd_flush_acc = 0;
+    // Culprit hunt: in the armed op-log zone, a finish per pacing flush pins the guilty
+    // window — the last "pace finish OK" proves the GPU was alive and done at that point.
+    if (rd_oplog_armed_logged && p_finish) {
+        p_finish();
+        printf_log(LOG_NONE, "RIMDROID pace finish OK @sub=%llu seq=%llu\n",
+                   (unsigned long long)rd_sub_calls, (unsigned long long)rd_gl_op_seq);
+        fflush(NULL);
+        rd_finish_acc = 0;
+        return;
+    }
+    if (0 && p_finish) {   /* v14 test verdict: finish+flushsync = 2MB-slab alloc storm on the flush thread, net 3.2GB in seconds, died at 30s. Reverted. */
+        rd_finish_acc = 0;
+        p_finish();
+        printf_log(LOG_NONE, "RIMDROID GLSANITY pacing glFinish (total=%lluMB)\n", (unsigned long long)(rd_tex_total>>20)); fflush(NULL);
+        return;
+    }
+    // glFlush ONLY: it alone keeps kgsl under the ~3GB cap (mmap fails went 82 -> 0). A mid-bake
+    // glFinish crashed zink (libzfa+0xdc8e1c, NULL+0x30) exactly at the first 768MB threshold —
+    // do not force full waits during the upload storm.
+    if (p_flush) {
+        p_flush();
+        printf_log(LOG_NONE, "RIMDROID GLSANITY pacing glFlush (total=%lluMB)\n", (unsigned long long)(rd_tex_total>>20)); fflush(NULL);
+    }
+}
+static uint64_t rd_tex_calls = 0;
+static void rd_tex_account(uint32_t ifmt, int32_t levels, int32_t w, int32_t h) {
+    if (w <= 0 || h <= 0) return;
+    rd_tex_calls++;
+    uint64_t bpp = ((ifmt & 0xff00) == 0x8300 || (ifmt & 0xfff0) == 0x8e80) ? 1 : 4;
+    uint64_t sz = (uint64_t)w * h * bpp;
+    if (levels > 1) sz = sz * 4 / 3;
+    uint64_t before = rd_tex_total / (256ull*1024*1024);
+    rd_tex_total += sz;
+    if (rd_tex_total / (256ull*1024*1024) != before)
+        { printf_log(LOG_NONE, "RIMDROID GLSANITY cumulative tex=%lluMB calls=%llu buf=%lluMB bufcalls=%llu rb=%lluMB\n", (unsigned long long)(rd_tex_total/1048576), (unsigned long long)rd_tex_calls, (unsigned long long)(rd_buf_total/1048576), (unsigned long long)rd_buf_calls, (unsigned long long)(rd_rb_total/1048576)); fflush(NULL); }
+    rd_upload_pace(sz);
+}
+static void rd_glTexStorage2D(uint32_t target, int32_t levels, uint32_t ifmt, int32_t w, int32_t h) {
+    RD_OPLOG("RIMDROID OP#%llu TexStorage2D lvls=%d ifmt=0x%x %dx%d\n", (unsigned long long)rd_gl_op_seq, levels, ifmt, w, h);
+    rd_tex_account(ifmt, levels, w, h);
+    if ((w >= 2048 || h >= 2048 || w < 0 || h < 0 || levels > 16) && rd_texlog_n < 48)
+        { rd_texlog_n++; printf_log(LOG_NONE, "RIMDROID GLSANITY glTexStorage2D target=0x%x levels=%d ifmt=0x%x %dx%d\n", target, levels, ifmt, w, h); fflush(NULL); }
+    if (p_rd_real_glTexStorage2D) p_rd_real_glTexStorage2D(target, levels, ifmt, w, h);
+}
+static void rd_glTexImage2D(uint32_t target, int32_t level, int32_t ifmt, int32_t w, int32_t h, int32_t border, uint32_t fmt, uint32_t type, const void* px) {
+    if (level == 0) rd_tex_account((uint32_t)ifmt, 1, w, h);
+    if ((w >= 2048 || h >= 2048 || w < 0 || h < 0) && rd_texlog_n < 48)
+        { rd_texlog_n++; printf_log(LOG_NONE, "RIMDROID GLSANITY glTexImage2D target=0x%x level=%d ifmt=0x%x %dx%d\n", target, level, ifmt, w, h); fflush(NULL); }
+    if (p_rd_real_glTexImage2D) p_rd_real_glTexImage2D(target, level, ifmt, w, h, border, fmt, type, px);
+}
+static void (*p_rd_real_glTexStorage3D)(uint32_t,int32_t,uint32_t,int32_t,int32_t,int32_t) = NULL;
+static void rd_glTexStorage3D(uint32_t target, int32_t levels, uint32_t ifmt, int32_t w, int32_t h, int32_t d) {
+    if (d > 0) { for (int i = 0; i < d; i++) rd_tex_account(ifmt, levels, w, h); }
+    if (rd_texlog_n < 96 && (w >= 1024 || h >= 1024 || d >= 8))
+        { rd_texlog_n++; printf_log(LOG_NONE, "RIMDROID GLSANITY glTexStorage3D target=0x%x levels=%d ifmt=0x%x %dx%dx%d\n", target, levels, ifmt, w, h, d); fflush(NULL); }
+    if (p_rd_real_glTexStorage3D) p_rd_real_glTexStorage3D(target, levels, ifmt, w, h, d);
+}
+static void (*p_rd_real_glTexImage3D)(uint32_t,int32_t,int32_t,int32_t,int32_t,int32_t,int32_t,uint32_t,uint32_t,const void*) = NULL;
+static void rd_glTexImage3D(uint32_t target, int32_t level, int32_t ifmt, int32_t w, int32_t h, int32_t d, int32_t border, uint32_t fmt, uint32_t type, const void* px) {
+    if (level == 0 && d > 0) { for (int i = 0; i < d; i++) rd_tex_account((uint32_t)ifmt, 1, w, h); }
+    if (p_rd_real_glTexImage3D) p_rd_real_glTexImage3D(target, level, ifmt, w, h, d, border, fmt, type, px);
+}
+static void (*p_rd_real_glCompressedTexImage2D)(uint32_t,int32_t,uint32_t,int32_t,int32_t,int32_t,int32_t,const void*) = NULL;
+static void rd_glCompressedTexImage2D(uint32_t target, int32_t level, uint32_t ifmt, int32_t w, int32_t h, int32_t border, int32_t imageSize, const void* data) {
+    if (level == 0 && imageSize > 0) { rd_tex_total += (uint64_t)imageSize; rd_upload_pace((uint64_t)imageSize); }
+    if (p_rd_real_glCompressedTexImage2D) p_rd_real_glCompressedTexImage2D(target, level, ifmt, w, h, border, imageSize, data);
+}
+static void (*p_rd_real_glRenderbufferStorage)(uint32_t,uint32_t,int32_t,int32_t) = NULL;
+static void rd_glRenderbufferStorage(uint32_t target, uint32_t ifmt, int32_t w, int32_t h) {
+    if (w > 0 && h > 0) rd_rb_total += (uint64_t)w*h*4;
+    if (p_rd_real_glRenderbufferStorage) p_rd_real_glRenderbufferStorage(target, ifmt, w, h);
+}
+static void rd_glRenderbufferStorageMultisample(uint32_t target, int32_t samples, uint32_t ifmt, int32_t w, int32_t h) {
+    if (w > 0 && h > 0) rd_rb_total += (uint64_t)w*h*4*(samples>0?samples:1);
+    if (rd_texlog_n < 48)
+        { rd_texlog_n++; printf_log(LOG_NONE, "RIMDROID GLSANITY glRenderbufferStorageMultisample samples=%d ifmt=0x%x %dx%d\n", samples, ifmt, w, h); fflush(NULL); }
+    if (p_rd_real_glRenderbufferStorageMultisample) p_rd_real_glRenderbufferStorageMultisample(target, samples, ifmt, w, h);
+}
+// COPY PACING (device-lost fix #2): RimWorld's atlas ASSEMBLY records thousands of
+// Graphics.CopyTexture GPU->GPU copies into ONE batch (~19s with zero flushes — the upload
+// pacing above only counts glTex*/glBuffer* and is blind to copies). The resulting monster
+// IB trips kgsl's GPU-hang watchdog (gpufault_procs +1 with NO pagefault) → the context is
+// killed → VK_ERROR_DEVICE_LOST at the next vkQueueSubmit. Feed copy sizes into the same
+// pacing accumulator so glFlush keeps splitting the batch during the assembly too.
+static void (*p_rd_real_glCopyImageSubData)(uint32_t,uint32_t,int32_t,int32_t,int32_t,int32_t,uint32_t,uint32_t,int32_t,int32_t,int32_t,int32_t,int32_t,int32_t,int32_t) = NULL;
+static void (*p_rd_real_glCopyTexSubImage2D)(uint32_t,int32_t,int32_t,int32_t,int32_t,int32_t,int32_t,int32_t) = NULL;
+static void (*p_rd_real_glBlitFramebuffer)(int32_t,int32_t,int32_t,int32_t,int32_t,int32_t,int32_t,int32_t,uint32_t,uint32_t) = NULL;
+static uint64_t rd_copy_total = 0, rd_copy_calls = 0;
+static void rd_copy_account(int64_t w, int64_t h, int64_t d) {
+    if (w <= 0 || h <= 0) return;
+    if (d <= 0) d = 1;
+    // assume 4B/px: overestimating a compressed destination just flushes a little sooner
+    uint64_t sz = (uint64_t)(w * h * d) * 4;
+    rd_copy_calls++;
+    uint64_t before = rd_copy_total >> 28;
+    rd_copy_total += sz;
+    if ((rd_copy_total >> 28) != before)
+        { printf_log(LOG_NONE, "RIMDROID GLSANITY cumulative copy=%lluMB copycalls=%llu\n", (unsigned long long)(rd_copy_total>>20), (unsigned long long)rd_copy_calls); fflush(NULL); }
+    rd_upload_pace(sz);
+}
+// The atlas assembly turned out to be CPU-side page UPLOADS, not GL copies: the 64MB
+// host-visible maps during the pre-death burst are glTexSubImage2D/glCompressedTexSubImage2D
+// writes into existing 4096 pages (Unity's CopyTexture CPU fallback for DXT). Those entry
+// points were unaccounted → the pacing never fired during the burst → monster batch → hang.
+static void (*p_rd_real_glTexSubImage2D)(uint32_t,int32_t,int32_t,int32_t,int32_t,int32_t,uint32_t,uint32_t,const void*) = NULL;
+static void (*p_rd_real_glCompressedTexSubImage2D)(uint32_t,int32_t,int32_t,int32_t,int32_t,int32_t,uint32_t,int32_t,const void*) = NULL;
+static void (*p_rd_real_glTexSubImage3D)(uint32_t,int32_t,int32_t,int32_t,int32_t,int32_t,int32_t,int32_t,uint32_t,uint32_t,const void*) = NULL;
+static uint64_t rd_sub_total = 0, rd_sub_calls = 0;
+static int rd_sublog_n = 0;
+static void rd_sub_account(uint64_t sz) {
+    rd_sub_calls++;
+    uint64_t before = rd_sub_total >> 28;
+    rd_sub_total += sz;
+    if ((rd_sub_total >> 28) != before)
+        { printf_log(LOG_NONE, "RIMDROID GLSANITY cumulative sub=%lluMB subcalls=%llu copy=%lluMB copycalls=%llu\n", (unsigned long long)(rd_sub_total>>20), (unsigned long long)rd_sub_calls, (unsigned long long)(rd_copy_total>>20), (unsigned long long)rd_copy_calls); fflush(NULL); }
+    rd_upload_pace(sz);
+}
+static void rd_glTexSubImage2D(uint32_t target, int32_t level, int32_t xo, int32_t yo, int32_t w, int32_t h, uint32_t fmt, uint32_t type, const void* px) {
+    if (w > 0 && h > 0) {
+        if (rd_sublog_n < 4) { rd_sublog_n++; printf_log(LOG_NONE, "RIMDROID GLSANITY glTexSubImage2D level=%d %dx%d fmt=0x%x\n", level, w, h, fmt); fflush(NULL); }
+        RD_OPLOG("RIMDROID OP#%llu TexSubImage2D lvl=%d %d,%d %dx%d fmt=0x%x\n", (unsigned long long)rd_gl_op_seq, level, xo, yo, w, h, fmt);
+        rd_sub_account((uint64_t)w * h * 4);
+    }
+    // Self-resolve fallback: this shim is also installed via the SDL_GL_GetProcAddress
+    // special-case path, which does not populate p_rd_real (see the AddBridge call below).
+    if (!p_rd_real_glTexSubImage2D && &g_zfa_handle && g_zfa_handle)
+        p_rd_real_glTexSubImage2D = (void(*)(uint32_t,int32_t,int32_t,int32_t,int32_t,int32_t,uint32_t,uint32_t,const void*))dlsym(g_zfa_handle, "glTexSubImage2D");
+    if (p_rd_real_glTexSubImage2D) p_rd_real_glTexSubImage2D(target, level, xo, yo, w, h, fmt, type, px);
+}
+static void rd_glCompressedTexSubImage2D(uint32_t target, int32_t level, int32_t xo, int32_t yo, int32_t w, int32_t h, uint32_t fmt, int32_t imageSize, const void* data) {
+    if (imageSize > 0) {
+        if (rd_sublog_n < 4) { rd_sublog_n++; printf_log(LOG_NONE, "RIMDROID GLSANITY glCompressedTexSubImage2D level=%d %dx%d fmt=0x%x size=%d\n", level, w, h, fmt, imageSize); fflush(NULL); }
+        RD_OPLOG("RIMDROID OP#%llu CompressedTexSubImage2D lvl=%d %d,%d %dx%d fmt=0x%x sz=%d\n", (unsigned long long)rd_gl_op_seq, level, xo, yo, w, h, fmt, imageSize);
+        rd_sub_account((uint64_t)imageSize);
+    }
+    if (p_rd_real_glCompressedTexSubImage2D) p_rd_real_glCompressedTexSubImage2D(target, level, xo, yo, w, h, fmt, imageSize, data);
+}
+static void rd_glTexSubImage3D(uint32_t target, int32_t level, int32_t xo, int32_t yo, int32_t zo, int32_t w, int32_t h, int32_t d, uint32_t fmt, uint32_t type, const void* px) {
+    if (w > 0 && h > 0 && d > 0) rd_sub_account((uint64_t)w * h * d * 4);
+    if (p_rd_real_glTexSubImage3D) p_rd_real_glTexSubImage3D(target, level, xo, yo, zo, w, h, d, fmt, type, px);
+}
+static void rd_glCopyImageSubData(uint32_t sn, uint32_t st, int32_t sl, int32_t sx, int32_t sy, int32_t sz_, uint32_t dn, uint32_t dt, int32_t dl, int32_t dx, int32_t dy, int32_t dz, int32_t w, int32_t h, int32_t d) {
+    RD_OPLOG("RIMDROID OP#%llu CopyImageSubData src=%u lvl=%d %d,%d,%d dst=%u lvl=%d %d,%d,%d %dx%dx%d\n", (unsigned long long)rd_gl_op_seq, sn, sl, sx, sy, sz_, dn, dl, dx, dy, dz, w, h, d);
+    rd_copy_account(w, h, d);
+    if (p_rd_real_glCopyImageSubData) p_rd_real_glCopyImageSubData(sn, st, sl, sx, sy, sz_, dn, dt, dl, dx, dy, dz, w, h, d);
+}
+static void rd_glCopyTexSubImage2D(uint32_t target, int32_t level, int32_t xo, int32_t yo, int32_t x, int32_t y, int32_t w, int32_t h) {
+    rd_copy_account(w, h, 1);
+    if (p_rd_real_glCopyTexSubImage2D) p_rd_real_glCopyTexSubImage2D(target, level, xo, yo, x, y, w, h);
+}
+static void rd_glBlitFramebuffer(int32_t sx0, int32_t sy0, int32_t sx1, int32_t sy1, int32_t dx0, int32_t dy0, int32_t dx1, int32_t dy1, uint32_t mask, uint32_t filter) {
+    RD_OPLOG("RIMDROID OP#%llu BlitFramebuffer %d,%d-%d,%d -> %d,%d-%d,%d mask=0x%x\n", (unsigned long long)rd_gl_op_seq, sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1, mask);
+    rd_copy_account((int64_t)(dx1 > dx0 ? dx1 - dx0 : dx0 - dx1), (int64_t)(dy1 > dy0 ? dy1 - dy0 : dy0 - dy1), 1);
+    if (p_rd_real_glBlitFramebuffer) p_rd_real_glBlitFramebuffer(sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1, mask, filter);
+}
+// Draw/dispatch/mipmap shims — pure op-log passthroughs for the culprit hunt: draws were
+// invisible to every previous instrument (syncdraw never engaged, upload pacing skips them),
+// yet the killer may be the first draw sampling the freshly-baked atlases.
+static void (*p_rd_real_glDrawArrays)(uint32_t,int32_t,int32_t) = NULL;
+static void (*p_rd_real_glDrawElements)(uint32_t,int32_t,uint32_t,const void*) = NULL;
+static void (*p_rd_real_glDrawElementsBaseVertex)(uint32_t,int32_t,uint32_t,const void*,int32_t) = NULL;
+static void (*p_rd_real_glDrawArraysInstanced)(uint32_t,int32_t,int32_t,int32_t) = NULL;
+static void (*p_rd_real_glDrawElementsInstanced)(uint32_t,int32_t,uint32_t,const void*,int32_t) = NULL;
+static void (*p_rd_real_glDrawElementsInstancedBaseVertex)(uint32_t,int32_t,uint32_t,const void*,int32_t,int32_t) = NULL;
+static void (*p_rd_real_glDispatchCompute)(uint32_t,uint32_t,uint32_t) = NULL;
+static void (*p_rd_real_glGenerateMipmap)(uint32_t) = NULL;
+static void rd_glDrawArrays(uint32_t mode, int32_t first, int32_t count) {
+    RD_OPLOG("RIMDROID OP#%llu DrawArrays mode=0x%x first=%d n=%d\n", (unsigned long long)rd_gl_op_seq, mode, first, count);
+    if (p_rd_real_glDrawArrays) p_rd_real_glDrawArrays(mode, first, count);
+}
+static void rd_glDrawElements(uint32_t mode, int32_t count, uint32_t type, const void* idx) {
+    RD_OPLOG("RIMDROID OP#%llu DrawElements mode=0x%x n=%d type=0x%x\n", (unsigned long long)rd_gl_op_seq, mode, count, type);
+    if (p_rd_real_glDrawElements) p_rd_real_glDrawElements(mode, count, type, idx);
+}
+static void rd_glDrawElementsBaseVertex(uint32_t mode, int32_t count, uint32_t type, const void* idx, int32_t base) {
+    RD_OPLOG("RIMDROID OP#%llu DrawElementsBaseVertex mode=0x%x n=%d base=%d\n", (unsigned long long)rd_gl_op_seq, mode, count, base);
+    if (p_rd_real_glDrawElementsBaseVertex) p_rd_real_glDrawElementsBaseVertex(mode, count, type, idx, base);
+}
+static void rd_glDrawArraysInstanced(uint32_t mode, int32_t first, int32_t count, int32_t inst) {
+    RD_OPLOG("RIMDROID OP#%llu DrawArraysInstanced mode=0x%x n=%d inst=%d\n", (unsigned long long)rd_gl_op_seq, mode, count, inst);
+    if (p_rd_real_glDrawArraysInstanced) p_rd_real_glDrawArraysInstanced(mode, first, count, inst);
+}
+static void rd_glDrawElementsInstanced(uint32_t mode, int32_t count, uint32_t type, const void* idx, int32_t inst) {
+    RD_OPLOG("RIMDROID OP#%llu DrawElementsInstanced mode=0x%x n=%d inst=%d\n", (unsigned long long)rd_gl_op_seq, mode, count, inst);
+    if (p_rd_real_glDrawElementsInstanced) p_rd_real_glDrawElementsInstanced(mode, count, type, idx, inst);
+}
+static void rd_glDrawElementsInstancedBaseVertex(uint32_t mode, int32_t count, uint32_t type, const void* idx, int32_t inst, int32_t base) {
+    RD_OPLOG("RIMDROID OP#%llu DrawElementsInstancedBaseVertex mode=0x%x n=%d inst=%d base=%d\n", (unsigned long long)rd_gl_op_seq, mode, count, inst, base);
+    if (p_rd_real_glDrawElementsInstancedBaseVertex) p_rd_real_glDrawElementsInstancedBaseVertex(mode, count, type, idx, inst, base);
+}
+static void rd_glDispatchCompute(uint32_t x, uint32_t y, uint32_t z) {
+    RD_OPLOG("RIMDROID OP#%llu DispatchCompute %ux%ux%u\n", (unsigned long long)rd_gl_op_seq, x, y, z);
+    if (p_rd_real_glDispatchCompute) p_rd_real_glDispatchCompute(x, y, z);
+}
+static void rd_glGenerateMipmap(uint32_t target) {
+    RD_OPLOG("RIMDROID OP#%llu GenerateMipmap target=0x%x\n", (unsigned long long)rd_gl_op_seq, target);
+    if (p_rd_real_glGenerateMipmap) p_rd_real_glGenerateMipmap(target);
+}
+// Shader identification (culprit = a draw hanging the GPU): the last UseProgram before the
+// loss names the guilty program; ShaderSource dumps every shader's text (keyed by shader id)
+// to RIMDROID_CACHE_DIR/rd_shaders.txt and AttachShader logs the program<->shader mapping.
+static void (*p_rd_real_glUseProgram)(uint32_t) = NULL;
+static void (*p_rd_real_glShaderSource)(uint32_t,int32_t,const char* const*,const int32_t*) = NULL;
+static void (*p_rd_real_glAttachShader)(uint32_t,uint32_t) = NULL;
+static void rd_glUseProgram(uint32_t prog) {
+    RD_OPLOG("RIMDROID OP#%llu UseProgram %u\n", (unsigned long long)rd_gl_op_seq, prog);
+    if (p_rd_real_glUseProgram) p_rd_real_glUseProgram(prog);
+}
+// TEXTURE-COMPRESSION FIX (2026-07-12): Unity's runtime BC-compression shader (Hidden/CompressBC,
+// the only shader writing to a `uimage2D`) HANGS the GPU on Turnip/Adreno 830 — DEVICE_LOST, kgsl
+// hang-class watchdog. It is an iterative BC encoder full of `while(true){ if(cond) break; ... }`
+// loops whose exit condition reinterprets a float loop-counter via floatBitsToInt(); the prime
+// hypothesis is that Turnip miscompiles that float<->int bitcast in the loop condition on A830 so
+// a loop never exits -> infinite loop on the GPU. We already intercept GLSL here, so bound every
+// such loop with a hard iteration cap: if the real break works the cap never fires (identical
+// result); if the exit is miscompiled, the cap breaks the infinite loop (tiny quality cost). Real
+// BC loops are <=~64 iterations, so the default 256 cap is safe. Env RIMDROID_BC_CAP overrides it;
+// RIMDROID_BC_NOCAP=1 disables the transform (A/B). Only the compressor shader is touched.
+static char* rd_bc_bound_loops(const char* src, int* out_n) {
+    const char* NEEDLE = "while(true){";
+    const size_t NL = 12;
+    int cap = 16;   // experiment 2: BC endpoint/palette loops need <=~16 iters; a tight cap tests
+                    // whether a miscompiled exit is running them far past termination (256 still
+                    // DEVICE_LOST). Env RIMDROID_BC_CAP overrides.
+    { const char* e = getenv("RIMDROID_BC_CAP"); if (e && atoi(e) > 0) cap = atoi(e); }
+    char repl[96];
+    int rl = snprintf(repl, sizeof(repl), "for(int _rd_g=0;_rd_g<%d;++_rd_g){", cap);
+    // count occurrences to size the output
+    int n = 0;
+    for (const char* p = src; (p = strstr(p, NEEDLE)); p += NL) n++;
+    if (n == 0) { if (out_n) *out_n = 0; return NULL; }
+    size_t inlen = strlen(src);
+    char* dst = (char*)malloc(inlen + (size_t)n * (size_t)(rl - (int)NL) + 1);
+    if (!dst) { if (out_n) *out_n = 0; return NULL; }
+    char* w = dst; const char* r = src;
+    const char* hit;
+    while ((hit = strstr(r, NEEDLE))) {
+        memcpy(w, r, (size_t)(hit - r)); w += (hit - r);
+        memcpy(w, repl, (size_t)rl);     w += rl;
+        r = hit + NL;
+    }
+    strcpy(w, r);
+    if (out_n) *out_n = n;
+    return dst;
+}
+static void rd_glShaderSource(uint32_t shader, int32_t count, const char* const* strings, const int32_t* lengths) {
+    static FILE* f = NULL; static int tried = 0;
+    if (!tried) {
+        tried = 1;
+        const char* dir = getenv("RIMDROID_CACHE_DIR");
+        if (dir && dir[0]) {
+            char path[512];
+            snprintf(path, sizeof(path), "%s/rd_shaders.txt", dir);
+            f = fopen(path, "w");
+            printf_log(LOG_NONE, "RIMDROID shader dump -> %s (%s)\n", path, f ? "ok" : "FAILED");
+        }
+    }
+    if (f && strings && count > 0) {
+        fprintf(f, "=== shader %u (%d parts) ===\n", shader, count);
+        for (int32_t i = 0; i < count; i++) {
+            if (!strings[i]) continue;
+            if (lengths && lengths[i] >= 0) fwrite(strings[i], 1, (size_t)lengths[i], f);
+            else fputs(strings[i], f);
+        }
+        fputc('\n', f);
+        fflush(f);
+    }
+    // CompressBC loop-bounding: concatenate the parts, and if this is the compressor (writes a
+    // uimage2D), hand the real driver a version with every while(true) loop hard-capped.
+    static int nocap = -1;
+    if (nocap == -1) nocap = getenv("RIMDROID_BC_NOCAP") ? 1 : 0;
+    if (!nocap && strings && count > 0) {
+        size_t total = 0;
+        for (int32_t i = 0; i < count; i++)
+            total += strings[i] ? (lengths && lengths[i] >= 0 ? (size_t)lengths[i] : strlen(strings[i])) : 0;
+        char* joined = (char*)malloc(total + 1);
+        if (joined) {
+            char* w = joined;
+            for (int32_t i = 0; i < count; i++) {
+                if (!strings[i]) continue;
+                size_t l = (lengths && lengths[i] >= 0) ? (size_t)lengths[i] : strlen(strings[i]);
+                memcpy(w, strings[i], l); w += l;
+            }
+            *w = 0;
+            if (strstr(joined, "uimage2D")) {
+                int nloops = 0;
+                char* fixed = rd_bc_bound_loops(joined, &nloops);
+                if (fixed && nloops > 0) {
+                    printf_log(LOG_NONE, "RIMDROID CompressBC shim: bounded %d while-loops on shader %u\n", nloops, shader);
+                    fflush(NULL);
+                    const char* one[1] = { fixed };
+                    if (p_rd_real_glShaderSource) p_rd_real_glShaderSource(shader, 1, one, NULL);
+                    free(fixed); free(joined);
+                    return;
+                }
+                free(fixed);
+            }
+            free(joined);
+        }
+    }
+    if (p_rd_real_glShaderSource) p_rd_real_glShaderSource(shader, count, strings, lengths);
+}
+static void rd_glAttachShader(uint32_t prog, uint32_t shader) {
+    printf_log(LOG_NONE, "RIMDROID GLSANITY AttachShader prog=%u shader=%u\n", prog, shader);
+    if (p_rd_real_glAttachShader) p_rd_real_glAttachShader(prog, shader);
+}
+
 // libzfa lacks the DSA getters (glGetTextureParameteriv/LevelParameteriv, GL4.5)
 // but DOES export the classic GL-1.0 glGetTexParameteriv/glGetTexLevelParameteriv.
 // Returning 0 (the old stub) made Unity read TEXTURE_WIDTH=0 on a freshly-created
@@ -194,21 +696,8 @@ static void rd_glGetQueryObjectui64v(uint32_t id, uint32_t pname, uint64_t* para
     static int n=0; if(n<16){n++; printf_log(LOG_NONE, "RIMDROID glGetQueryObjectui64v id=%u pname=0x%x => %llu\n", id, pname, (unsigned long long)params[0]);}
 }
 
-// DIAGNOSTIC: instrument glTexSubImage2D (crash site).  Logs args + whether a
-// GL_PIXEL_UNPACK_BUFFER (PBO) is bound (if so, `pixels` is a byte OFFSET, not a
-// client pointer), then tail-calls the real libzfa glTexSubImage2D.
-static void rd_glTexSubImage2D(uint32_t target, int32_t level, int32_t xoff, int32_t yoff,
-                               int32_t w, int32_t h, uint32_t format, uint32_t type, void* pixels) {
-    static void (*real)(uint32_t,int32_t,int32_t,int32_t,int32_t,int32_t,uint32_t,uint32_t,const void*) = NULL;
-    static int resolved = 0;
-    if (!resolved) { resolved = 1;
-        if (&g_zfa_handle && g_zfa_handle)
-            real  = (void(*)(uint32_t,int32_t,int32_t,int32_t,int32_t,int32_t,uint32_t,uint32_t,const void*))dlsym(g_zfa_handle, "glTexSubImage2D");
-    }
-    // (instrumentation removed — texture upload confirmed working; logging
-    //  every call flooded the log and slowed content loading.)
-    if (real) real(target, level, xoff, yoff, w, h, format, type, pixels);
-}
+// (the old diagnostic glTexSubImage2D shim merged into the pacing shim above — one definition,
+//  both install paths: the resolver populates p_rd_real, the SDL special-case self-resolves.)
 
 // DL functions from wrappedlibdl.c
 void* my_dlopen(x64emu_t* emu, void *filename, int flag);
@@ -1035,6 +1524,82 @@ EXPORT void my2_SDL_Log(x64emu_t* emu, void* fmt, void *b) {
     my->SDL_LogMessageV(0, 3, fmt, VARARGS);
 }
 
+// Shared GL proc-address resolver used by BOTH the SDL2 GL path (RimWorld 1.5) and the
+// GLX path (RimWorld 1.6, wrappedlibgl.c my_glXGetProcAddress). Resolves a GL entry point
+// from the active renderer (ZFA/OSMesa/GL4ES) via rimdroid_gl_proc_resolver and installs
+// the critical zeroing-getter / no-op stubs for names libzfa.so does not export (a bare
+// NULL pointer would make Unity jump to 0x0 or read garbage → GfxDevice teardown loop).
+// NOT static: called from wrappedlibgl.c (same box64 .so). pa=NULL → use the resolver.
+void* rimdroid_gl_getprocaddr(x64emu_t* emu, bridge_t* bridge, glprocaddress_t pa, const char* rname)
+{
+    if (!rname) return NULL;
+    if (!pa) pa = rimdroid_gl_proc_resolver;
+    // Arg-sanity shims (v13): hand back instrumented wrappers for the buffer-upload family.
+    {
+        wrapper_t w = NULL; void* fn = NULL;
+        if      (!strcmp(rname, "glBufferStorage"))  { p_rd_real_glBufferStorage = rimdroid_gl_proc_resolver(rname); w = vFulpu; fn = (void*)rd_glBufferStorage; }
+        else if (!strcmp(rname, "glBufferData"))     { p_rd_real_glBufferData    = rimdroid_gl_proc_resolver(rname); w = vFulpu; fn = (void*)rd_glBufferData; }
+        else if (!strcmp(rname, "glBufferSubData"))  { p_rd_real_glBufferSubData = rimdroid_gl_proc_resolver(rname); w = vFullp; fn = (void*)rd_glBufferSubData; }
+        else if (!strcmp(rname, "glMapBufferRange")) { p_rd_real_glMapBufferRange= rimdroid_gl_proc_resolver(rname); w = pFullu; fn = (void*)rd_glMapBufferRange; }
+        else if (!strcmp(rname, "glTexStorage2D"))   { p_rd_real_glTexStorage2D  = rimdroid_gl_proc_resolver(rname); w = vFuiuii; fn = (void*)rd_glTexStorage2D; }
+        else if (!strcmp(rname, "glTexImage2D"))     { p_rd_real_glTexImage2D    = rimdroid_gl_proc_resolver(rname); w = vFuiiiiiuup; fn = (void*)rd_glTexImage2D; }
+        else if (!strcmp(rname, "glRenderbufferStorage")) { p_rd_real_glRenderbufferStorage = rimdroid_gl_proc_resolver(rname); w = vFuuii; fn = (void*)rd_glRenderbufferStorage; }
+        else if (!strcmp(rname, "glRenderbufferStorageMultisample")) { p_rd_real_glRenderbufferStorageMultisample = rimdroid_gl_proc_resolver(rname); w = vFuiuii; fn = (void*)rd_glRenderbufferStorageMultisample; }
+        else if (!strcmp(rname, "glTexStorage3D"))   { p_rd_real_glTexStorage3D  = rimdroid_gl_proc_resolver(rname); w = vFuiuiii; fn = (void*)rd_glTexStorage3D; }
+        else if (!strcmp(rname, "glTexImage3D"))     { p_rd_real_glTexImage3D    = rimdroid_gl_proc_resolver(rname); w = vFuiiiiiiuup; fn = (void*)rd_glTexImage3D; }
+        else if (!strcmp(rname, "glCompressedTexImage2D")) { p_rd_real_glCompressedTexImage2D = rimdroid_gl_proc_resolver(rname); w = vFuiuiiiip; fn = (void*)rd_glCompressedTexImage2D; }
+        else if (!strcmp(rname, "glClientWaitSync")) { p_rd_real_glClientWaitSync = rimdroid_gl_proc_resolver(rname); w = uFpuU; fn = (void*)rd_glClientWaitSync; }
+        else if (!strcmp(rname, "glDeleteSync"))     { p_rd_real_glDeleteSync     = rimdroid_gl_proc_resolver(rname); w = vFp;   fn = (void*)rd_glDeleteSync; }
+        else if (!strcmp(rname, "glCopyImageSubData"))  { p_rd_real_glCopyImageSubData  = rimdroid_gl_proc_resolver(rname); w = vFuuiiiiuuiiiiiii; fn = (void*)rd_glCopyImageSubData; }
+        else if (!strcmp(rname, "glCopyTexSubImage2D")) { p_rd_real_glCopyTexSubImage2D = rimdroid_gl_proc_resolver(rname); w = vFuiiiiiii; fn = (void*)rd_glCopyTexSubImage2D; }
+        else if (!strcmp(rname, "glBlitFramebuffer"))   { p_rd_real_glBlitFramebuffer   = rimdroid_gl_proc_resolver(rname); w = vFiiiiiiiiuu; fn = (void*)rd_glBlitFramebuffer; }
+        else if (!strcmp(rname, "glTexSubImage2D"))     { p_rd_real_glTexSubImage2D     = rimdroid_gl_proc_resolver(rname); w = vFuiiiiiuup; fn = (void*)rd_glTexSubImage2D; }
+        else if (!strcmp(rname, "glCompressedTexSubImage2D")) { p_rd_real_glCompressedTexSubImage2D = rimdroid_gl_proc_resolver(rname); w = vFuiiiiiuip; fn = (void*)rd_glCompressedTexSubImage2D; }
+        else if (!strcmp(rname, "glTexSubImage3D"))     { p_rd_real_glTexSubImage3D     = rimdroid_gl_proc_resolver(rname); w = vFuiiiiiiiuup; fn = (void*)rd_glTexSubImage3D; }
+        else if (!strcmp(rname, "glDrawArrays"))        { p_rd_real_glDrawArrays        = rimdroid_gl_proc_resolver(rname); w = vFuii;  fn = (void*)rd_glDrawArrays; }
+        else if (!strcmp(rname, "glDrawElements"))      { p_rd_real_glDrawElements      = rimdroid_gl_proc_resolver(rname); w = vFuiup; fn = (void*)rd_glDrawElements; }
+        else if (!strcmp(rname, "glDrawElementsBaseVertex")) { p_rd_real_glDrawElementsBaseVertex = rimdroid_gl_proc_resolver(rname); w = vFuiupi; fn = (void*)rd_glDrawElementsBaseVertex; }
+        else if (!strcmp(rname, "glDrawArraysInstanced")) { p_rd_real_glDrawArraysInstanced = rimdroid_gl_proc_resolver(rname); w = vFuiii; fn = (void*)rd_glDrawArraysInstanced; }
+        else if (!strcmp(rname, "glDrawElementsInstanced")) { p_rd_real_glDrawElementsInstanced = rimdroid_gl_proc_resolver(rname); w = vFuiupi; fn = (void*)rd_glDrawElementsInstanced; }
+        else if (!strcmp(rname, "glDrawElementsInstancedBaseVertex")) { p_rd_real_glDrawElementsInstancedBaseVertex = rimdroid_gl_proc_resolver(rname); w = vFuiupii; fn = (void*)rd_glDrawElementsInstancedBaseVertex; }
+        else if (!strcmp(rname, "glDispatchCompute"))   { p_rd_real_glDispatchCompute   = rimdroid_gl_proc_resolver(rname); w = vFuuu; fn = (void*)rd_glDispatchCompute; }
+        else if (!strcmp(rname, "glGenerateMipmap"))    { p_rd_real_glGenerateMipmap    = rimdroid_gl_proc_resolver(rname); w = vFu;   fn = (void*)rd_glGenerateMipmap; }
+        else if (!strcmp(rname, "glUseProgram"))        { p_rd_real_glUseProgram        = rimdroid_gl_proc_resolver(rname); w = vFu;    fn = (void*)rd_glUseProgram; }
+        else if (!strcmp(rname, "glShaderSource"))      { p_rd_real_glShaderSource      = rimdroid_gl_proc_resolver(rname); w = vFuipp; fn = (void*)rd_glShaderSource; }
+        else if (!strcmp(rname, "glAttachShader"))      { p_rd_real_glAttachShader      = rimdroid_gl_proc_resolver(rname); w = vFuu;   fn = (void*)rd_glAttachShader; }
+
+        if (fn && bridge) {
+            void* b = (void*)AddBridge(bridge, w, fn, 0, rname);
+            printf_log(LOG_NONE, "RIMDROID GLSANITY shim installed for %s\n", rname);
+            return b;
+        }
+    }
+    void* res = getGLProcAddress(emu, NULL, pa, rname);
+    if (!res) {
+        // libzfa lacks the symbol (Mesa still advertises it as core/extension).
+        // GETTERS must zero/fill their output buffer (a bare no-op leaves it
+        // uninitialised → Unity reads garbage → bad texture upload → crash).
+        wrapper_t w = NULL; void* fn = NULL;
+        if      (!strcmp(rname, "glGetInternalformativ"))        { w = vFuuuip; fn = (void*)rd_glGetInternalformativ; }
+        else if (!strcmp(rname, "glGetTextureParameteriv"))      { w = vFuup;   fn = (void*)rd_glGetTextureParameteriv; }
+        else if (!strcmp(rname, "glGetTextureLevelParameteriv")) { w = vFuiup;  fn = (void*)rd_glGetTextureLevelParameteriv; }
+        else if (!strcmp(rname, "glGetQueryObjectui64v"))        { w = vFuup;   fn = (void*)rd_glGetQueryObjectui64v; }
+        if (fn) {
+            void* b = (void*)AddBridge(bridge, w, fn, 0, rname);
+            printf_log(LOG_NONE, "RIMDROID GetProcAddress zeroing-stub for '%s' => %p\n", rname, b);
+            return b;
+        }
+        // Everything else: a no-op (RAX=0, writes nothing) so a stray call does
+        // not jump to 0x0.  Bridge created once and reused for every such name.
+        static uintptr_t noop_bridge = 0;
+        if (!noop_bridge)
+            noop_bridge = AddBridge(bridge, iFv, (void*)rimdroid_gl_noop, 0, "rimdroid_gl_noop");
+        printf_log(LOG_NONE, "RIMDROID GetProcAddress NULL for '%s' → no-op stub %p\n", rname, (void*)noop_bridge);
+        res = (void*)noop_bridge;
+    }
+    return res;
+}
+
 EXPORT void* my2_SDL_GL_GetProcAddress(x64emu_t* emu, void* name)
 {
     khint_t k;
@@ -1064,31 +1629,7 @@ EXPORT void* my2_SDL_GL_GetProcAddress(x64emu_t* emu, void* name)
         return (void*)b;
     }
     glprocaddress_t pa = (glprocaddress_t)my->SDL_GL_GetProcAddress;
-    if (!pa) pa = rimdroid_gl_proc_resolver;
-    void* res = getGLProcAddress(emu, NULL, pa, rname);
-    if (!res) {
-        // libzfa lacks the symbol (Mesa still advertises it as core/extension).
-        // GETTERS must zero their output buffer (a bare no-op leaves it
-        // uninitialised → Unity reads garbage → bad texture upload → crash).
-        wrapper_t w = NULL; void* fn = NULL;
-        if      (!strcmp(rname, "glGetInternalformativ"))        { w = vFuuuip; fn = (void*)rd_glGetInternalformativ; }
-        else if (!strcmp(rname, "glGetTextureParameteriv"))      { w = vFuup;   fn = (void*)rd_glGetTextureParameteriv; }
-        else if (!strcmp(rname, "glGetTextureLevelParameteriv")) { w = vFuiup;  fn = (void*)rd_glGetTextureLevelParameteriv; }
-        else if (!strcmp(rname, "glGetQueryObjectui64v"))        { w = vFuup;   fn = (void*)rd_glGetQueryObjectui64v; }
-        if (fn) {
-            void* b = (void*)AddBridge(my_lib->w.bridge, w, fn, 0, rname);
-            printf_log(LOG_NONE, "RIMDROID GetProcAddress zeroing-stub for '%s' => %p\n", rname, b);
-            return b;
-        }
-        // Everything else: a no-op (RAX=0, writes nothing) so a stray call does
-        // not jump to 0x0.  Bridge created once and reused for every such name.
-        static uintptr_t noop_bridge = 0;
-        if (!noop_bridge)
-            noop_bridge = AddBridge(my_lib->w.bridge, iFv, (void*)rimdroid_gl_noop, 0, "rimdroid_gl_noop");
-        printf_log(LOG_NONE, "RIMDROID GetProcAddress NULL for '%s' → no-op stub %p\n", rname, (void*)noop_bridge);
-        res = (void*)noop_bridge;
-    }
-    return res;
+    return rimdroid_gl_getprocaddr(emu, my_lib->w.bridge, pa, rname);
 }
 
 #define nb_once 16
@@ -1564,6 +2105,7 @@ EXPORT void my2_SDL_GL_SwapWindow(void* win) {
     static int rd_fpstick_off = -1;   // TEST toggle (env RIMDROID_NO_FPSTICK=1): skip the FPS frame counter
     if (rd_fpstick_off < 0) rd_fpstick_off = getenv("RIMDROID_NO_FPSTICK") ? 1 : 0;
     if (rimdroid_frame_tick && !rd_fpstick_off) rimdroid_frame_tick();   // count this present (any renderer)
+    rd_upload_pace_frame_reset();   // pacing only guards SINGLE-frame upload bursts (see def)
     (void)win;
     printf_log(LOG_NONE, "RIMDROID SDL_GL_SwapWindow(win=%p)\n", win);
     if (&g_osmesa_context && g_osmesa_context) {

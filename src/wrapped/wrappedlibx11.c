@@ -1222,6 +1222,104 @@ EXPORT int32_t my_XPeekIfEvent(x64emu_t* emu, void* d,void* ev, EventHandler h, 
     return ret;
 }
 
+static int rd_xlib_trace_enabled(void)
+{
+    static int v = -1;
+    if(v < 0) {
+        const char* e = getenv("RIMDROID_XPOLL_TRACE");
+        v = (!e || e[0] != '0') && getenv("RIMDROID_X11_SOCKET_DIR") ? 1 : 0;
+    }
+    return v;
+}
+
+static int rd_xlib_should_log(unsigned long long n, int ret)
+{
+    return ret > 0 || n <= 80 || (n <= 5000 && (n % 250) == 0) || (n % 5000) == 0;
+}
+
+static const char* rd_xevent_name(int type)
+{
+    switch(type) {
+        case 2: return "KeyPress";
+        case 3: return "KeyRelease";
+        case 4: return "ButtonPress";
+        case 5: return "ButtonRelease";
+        case 6: return "MotionNotify";
+        case 7: return "EnterNotify";
+        case 8: return "LeaveNotify";
+        case 9: return "FocusIn";
+        case 10: return "FocusOut";
+        case 12: return "Expose";
+        case 15: return "VisibilityNotify";
+        case 19: return "MapNotify";
+        case 21: return "ReparentNotify";
+        case 22: return "ConfigureNotify";
+        case 28: return "PropertyNotify";
+        case 33: return "ClientMessage";
+        default: return "?";
+    }
+}
+
+static void rd_xlib_log_count(const char* name, unsigned long long n, void* dpy, int mode, int ret)
+{
+    if(!rd_xlib_trace_enabled() || !rd_xlib_should_log(n, ret)) return;
+    printf_log(LOG_NONE, "RIMDROID: XLIB %s#%llu dpy=%p mode=%d ret=%d\n",
+               name, n, dpy, mode, ret);
+}
+
+static void rd_xlib_log_event(const char* name, unsigned long long n, void* dpy, int ret, void* ev)
+{
+    if(!rd_xlib_trace_enabled() || !rd_xlib_should_log(n, ret)) return;
+    int type = (ret == 0 && ev) ? *(int*)ev : -1;
+    printf_log(LOG_NONE, "RIMDROID: XLIB %s#%llu dpy=%p ret=%d event=%d(%s)\n",
+               name, n, dpy, ret, type, rd_xevent_name(type));
+}
+
+EXPORT int32_t my_XPending(x64emu_t* emu, void* dpy)
+{
+    (void)emu;
+    int32_t ret = my->XPending(dpy);
+    static unsigned long long n = 0;
+    rd_xlib_log_count("XPending", ++n, dpy, -1, ret);
+    return ret;
+}
+
+EXPORT int32_t my_XEventsQueued(x64emu_t* emu, void* dpy, int mode)
+{
+    (void)emu;
+    int32_t ret = my->XEventsQueued(dpy, mode);
+    static unsigned long long n = 0;
+    rd_xlib_log_count("XEventsQueued", ++n, dpy, mode, ret);
+    return ret;
+}
+
+EXPORT int32_t my__XEventsQueued(x64emu_t* emu, void* dpy, int mode)
+{
+    (void)emu;
+    int32_t ret = my->_XEventsQueued(dpy, mode);
+    static unsigned long long n = 0;
+    rd_xlib_log_count("_XEventsQueued", ++n, dpy, mode, ret);
+    return ret;
+}
+
+EXPORT int32_t my_XNextEvent(x64emu_t* emu, void* dpy, void* ev)
+{
+    (void)emu;
+    int32_t ret = my->XNextEvent(dpy, ev);
+    static unsigned long long n = 0;
+    rd_xlib_log_event("XNextEvent", ++n, dpy, ret, ev);
+    return ret;
+}
+
+EXPORT int32_t my_XPeekEvent(x64emu_t* emu, void* dpy, void* ev)
+{
+    (void)emu;
+    int32_t ret = my->XPeekEvent(dpy, ev);
+    static unsigned long long n = 0;
+    rd_xlib_log_event("XPeekEvent", ++n, dpy, ret, ev);
+    return ret;
+}
+
 void sub_image_wrapper(x64emu_t *emu, uintptr_t fnc);
 typedef void* (*sub_image_wrapper_t)(void*, int32_t, int32_t, uint32_t, uint32_t);
 

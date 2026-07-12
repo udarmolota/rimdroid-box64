@@ -102,6 +102,7 @@
 #() lFl
 #() lFp
 #() lFS
+#() LFE
 #() LFv
 #() LFi
 #() LFu
@@ -444,6 +445,7 @@
 #() vFEip
 #() vFEpi
 #() vFEpu
+#() vFEpL
 #() vFEpp
 #() vFEpV
 #() vFEpA
@@ -999,6 +1001,7 @@
 #() vFEpUp
 #() vFEpLi
 #() vFEpLp
+#() vFEppu
 #() vFEppp
 #() vFEppV
 #() vFEppA
@@ -1172,6 +1175,7 @@
 #() iFEiip
 #() iFEiiN
 #() iFEiLp
+#() iFEipu
 #() iFEipp
 #() iFEipV
 #() iFEipA
@@ -1457,7 +1461,6 @@
 #() uFpupu
 #() uFpupL
 #() uFpupp
-#() uFpubp
 #() uFpUuu
 #() uFpUuU
 #() uFpUUu
@@ -1511,6 +1514,7 @@
 #() UFbuup
 #() dFppdd
 #() dFpppp
+#() lFEipL
 #() lFEipV
 #() lFEpip
 #() lFEppL
@@ -1715,11 +1719,13 @@
 #() vFEippp
 #() vFEpipV
 #() vFEpipA
+#() vFEpuup
 #() vFEpuuV
 #() vFEpuuA
 #() vFEpupp
 #() vFEpupV
 #() vFEpupA
+#() vFEpLip
 #() vFEpLLp
 #() vFEppip
 #() vFEppiV
@@ -1926,6 +1932,7 @@
 #() iFEpipp
 #() iFEpipV
 #() iFEpipA
+#() iFEpupp
 #() iFEpLpp
 #() iFEpLpV
 #() iFEpLpA
@@ -2035,7 +2042,6 @@
 #() iFpuLpp
 #() iFpupui
 #() iFpupuu
-#() iFpupuU
 #() iFpupup
 #() iFpupLu
 #() iFpupLp
@@ -2214,8 +2220,10 @@
 #() dFlplpl
 #() dFppddd
 #() dFppppL
+#() lFEipLi
 #() lFEippL
 #() lFEuipp
+#() lFEppiS
 #() lFEppLL
 #() lFipiIi
 #() lFipili
@@ -2394,6 +2402,7 @@
 #() vFEpippp
 #() vFEpuipV
 #() vFEpuipA
+#() vFEpuuuu
 #() vFEpuppp
 #() vFEpLipp
 #() vFEpLLpp
@@ -2568,6 +2577,7 @@
 #() iFEpippi
 #() iFEpIppp
 #() iFEpuipp
+#() iFEpupuU
 #() iFEpuppp
 #() iFEpLppp
 #() iFEppipp
@@ -2714,7 +2724,6 @@
 #() iFppuppp
 #() iFppUUup
 #() iFppUUpp
-#() iFppUppp
 #() iFppfipp
 #() iFppdidd
 #() iFpplupp
@@ -2957,6 +2966,7 @@
 #() vFEiipupV
 #() vFEpuipuV
 #() vFEpuuipp
+#() vFEpuuuiu
 #() vFEpuLppp
 #() vFEpupppp
 #() vFEppippp
@@ -3104,6 +3114,7 @@
 #() iFEppiipi
 #() iFEppupup
 #() iFEppuppp
+#() iFEppUppp
 #() iFEppLpIu
 #() iFEpppLpp
 #() iFEpppppL
@@ -3398,7 +3409,6 @@
 #() vFpuuuuupp
 #() vFpuuULipp
 #() vFpudddddd
-#() vFpupuupup
 #() vFpuppippp
 #() vFpuppLLLL
 #() vFpliicppp
@@ -3594,6 +3604,7 @@
 #() iWEpuuuipp
 #() iWpuipuppp
 #() vFEpuuuippp
+#() vFEpupuupup
 #() vFEpuppippV
 #() vFEpuppippA
 #() vFEppuipppp
@@ -4198,6 +4209,7 @@
 #() vFEv -> vFE
 #() iFEv -> iFE
 #() lFEv -> lFE
+#() LFEv -> LFE
 #() pFEv -> pFE
 #() iFEvpp -> iFEpp
 #() pFEppv -> pFEpp
@@ -5465,6 +5477,8 @@ wrappedlibc:
   - _ITM_deregisterTMCloneTable
   - _ZGTtdlPv
   - __cxa_finalize
+  - __freelocale
+  - freelocale
 - iFv:
   - fork
   - vfork
@@ -5493,14 +5507,23 @@ wrappedlibc:
   - sysconf
 - LFL:
   - getauxval
+- pFv:
+  - __ctype_b_loc
+  - __ctype_tolower_loc
+  - __ctype_toupper_loc
 - pFL:
   - _ZGTtnaX
   - _ZGTtnam
 - pFp:
   - __deregister_frame_info
+  - __duplocale
+  - __strdup
+  - __uselocale
+  - duplocale
   - getenv
   - mallinfo
   - mallinfo2
+  - uselocale
 - vFpi:
   - __longjmp_chk
   - _longjmp
@@ -5616,6 +5639,8 @@ wrappedlibc:
   - ioctl
   - sched_getaffinity
 - iFipu:
+  - __connect
+  - connect
   - fspick
 - iFipp:
   - __lxstat
@@ -5632,7 +5657,9 @@ wrappedlibc:
 - iFipA:
   - vdprintf
 - iFpLi:
+  - __poll
   - mprotect
+  - poll
 - iFpLp:
   - init_module
 - iFppi:
@@ -5683,6 +5710,9 @@ wrappedlibc:
   - vfscanf
   - vfwprintf
   - vfwscanf
+- lFipL:
+  - __read
+  - read
 - lFipV:
   - __wprintf_chk
 - lFppL:
@@ -5690,6 +5720,9 @@ wrappedlibc:
 - LFppL:
   - strlcat
   - strlcpy
+- pFipp:
+  - __newlocale
+  - newlocale
 - pFpip:
   - fts64_open
   - fts_open
@@ -5739,6 +5772,8 @@ wrappedlibc:
   - __fwprintf_chk
 - iFpipA:
   - __vfwprintf_chk
+- iFpLpp:
+  - ppoll
 - iFpLpV:
   - __snprintf
   - snprintf
@@ -5755,10 +5790,15 @@ wrappedlibc:
   - __vsprintf_chk
   - scandir
   - scandir64
+- lFipLi:
+  - __recv
+  - recv
 - lFippL:
   - readlinkat
 - lFuipp:
   - ptrace
+- lFppiS:
+  - __getdelim
 - lFppLL:
   - __readlink_chk
 - vFpiipV:
@@ -5895,23 +5935,51 @@ wrappedlibfuse:
 wrappedlibgl:
 - iFu:
   - glXSwapIntervalMESA
+- LFv:
+  - glXGetCurrentDrawable
+- pFv:
+  - glXGetCurrentContext
+  - glXGetCurrentDisplay
 - pFp:
   - glGetVkProcAddrNV
   - glXGetProcAddress
   - glXGetProcAddressARB
+- vFpL:
+  - glXSwapBuffers
 - vFpp:
   - glDebugMessageCallback
   - glDebugMessageCallbackAMD
   - glDebugMessageCallbackARB
   - glDebugMessageCallbackKHR
+  - glXDestroyContext
 - iFpp:
   - eglDebugMessageControlKHR
+- pFpi:
+  - glXGetClientString
+  - glXQueryExtensionsString
 - vFipp:
   - glProgramCallbackMESA
 - vFpLi:
   - glXSwapIntervalEXT
 - vFppp:
   - eglSetBlobCacheFuncsANDROID
+- iFpLp:
+  - glXMakeCurrent
+- iFppp:
+  - glXQueryExtension
+  - glXQueryVersion
+- pFpii:
+  - glXQueryServerString
+- pFpip:
+  - glXChooseVisual
+- vFpLip:
+  - glXQueryDrawable
+- iFppip:
+  - glXGetConfig
+- pFpppi:
+  - glXCreateContext
+- pFpppip:
+  - glXCreateContextAttribsARB
 wrappedlibglu:
 - vFpup:
   - gluNurbsCallback
@@ -6545,6 +6613,7 @@ wrappedlibx11:
   - XCloseDisplay
   - XDestroyImage
   - XInitImage
+  - XPending
   - _XInitImageFuncPtrs
 - pFp:
   - XOpenDisplay
@@ -6552,6 +6621,12 @@ wrappedlibx11:
   - XSetIOErrorHandler
 - vFpp:
   - _XDeqAsyncHandler
+- iFpi:
+  - XEventsQueued
+  - _XEventsQueued
+- iFpp:
+  - XNextEvent
+  - XPeekEvent
 - pFiV:
   - XVaCreateNestedList
 - pFpi:
@@ -7370,16 +7445,35 @@ wrappedvorbisfile:
 - lFppiiiippp:
   - ov_read_filter
 wrappedvulkan:
+- vFp:
+  - vkCmdEndRenderPass
+  - vkCmdEndRendering
+- iFp:
+  - vkDeviceWaitIdle
+  - vkEndCommandBuffer
+  - vkQueueWaitIdle
 - vFpp:
+  - vkCmdBeginRendering
   - vkDestroyDevice
   - vkDestroyInstance
+  - vkGetPhysicalDeviceMemoryProperties
+  - vkGetPhysicalDeviceMemoryProperties2
+  - vkGetPhysicalDeviceMemoryProperties2KHR
   - vkGetPhysicalDeviceProperties2
+- iFpu:
+  - vkResetCommandBuffer
+- iFpp:
+  - vkBeginCommandBuffer
+  - vkGetFenceStatus
+  - vkQueuePresentKHR
 - pFpp:
   - vkGetDeviceProcAddr
   - vkGetInstanceProcAddr
 - vFpUp:
   - vkDestroyCudaFunctionNV
   - vkDestroyCudaModuleNV
+- vFppu:
+  - vkCmdBeginRenderPass
 - vFppp:
   - vkDestroyAccelerationStructureKHR
   - vkDestroyAccelerationStructureNV
@@ -7429,10 +7523,20 @@ wrappedvulkan:
   - vkDestroyVideoSessionKHR
   - vkDestroyVideoSessionParametersKHR
   - vkFreeMemory
+- iFpup:
+  - vkResetFences
 - iFppp:
+  - vkAcquireNextImage2KHR
   - vkCreateDeferredOperationKHR
   - vkCreateInstance
+  - vkEnumerateInstanceExtensionProperties
+  - vkGetPhysicalDeviceSurfaceCapabilities2KHR
+  - vkGetPhysicalDeviceSurfaceCapabilitiesKHR
   - vkReleaseCapturedPipelineDataKHR
+- vFpuup:
+  - vkGetDeviceQueue
+- iFpupp:
+  - vkQueueSubmit
 - iFpppp:
   - vkAllocateMemory
   - vkCreateAccelerationStructureKHR
@@ -7490,22 +7594,39 @@ wrappedvulkan:
   - vkCreateWin32SurfaceKHR
   - vkCreateXcbSurfaceKHR
   - vkCreateXlibSurfaceKHR
+  - vkEnumerateDeviceExtensionProperties
+  - vkGetPhysicalDeviceSurfaceFormatsKHR
+  - vkGetSwapchainImagesKHR
   - vkRegisterDeviceEventEXT
+- uFpupp:
+  - vkGetPhysicalDeviceSurfaceSupportKHR
+  - vkGetPhysicalDeviceXcbPresentationSupportKHR
+  - vkGetPhysicalDeviceXlibPresentationSupportKHR
+- vFpuuuu:
+  - vkCmdDraw
+- iFpupuU:
+  - vkWaitForFences
 - iFpuppp:
   - vkCreateShadersEXT
   - vkCreateSharedSwapchainsKHR
 - iFppppp:
   - vkCreateDisplayModeKHR
   - vkRegisterDisplayEventEXT
+- vFpuuuiu:
+  - vkCmdDrawIndexed
 - iFpUuppp:
   - vkCreateExecutionGraphPipelinesAMDX
 - iFppuppp:
   - vkCreateComputePipelines
   - vkCreateGraphicsPipelines
   - vkCreateRayTracingPipelinesNV
+- iFppUppp:
+  - vkAcquireNextImageKHR
 - iFpppuppp:
   - vkCreateDataGraphPipelinesARM
   - vkCreateRayTracingPipelinesKHR
+- vFpupuupup:
+  - vkCmdBindDescriptorSets
 wrappedwaylandclient:
 - vFp:
   - wl_log_set_handler_client

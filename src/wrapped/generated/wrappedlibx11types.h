@@ -15,6 +15,8 @@ typedef void (*vFp_t)(void*);
 typedef int32_t (*iFp_t)(void*);
 typedef void* (*pFp_t)(void*);
 typedef void (*vFpp_t)(void*, void*);
+typedef int32_t (*iFpi_t)(void*, int32_t);
+typedef int32_t (*iFpp_t)(void*, void*);
 typedef void* (*pFiV_t)(int32_t, ...);
 typedef void* (*pFpi_t)(void*, int32_t);
 typedef void* (*pFpp_t)(void*, void*);
@@ -38,11 +40,16 @@ typedef uintptr_t (*LFpLiiuuuiupLp_t)(void*, uintptr_t, int32_t, int32_t, uint32
 	GO(XCloseDisplay, iFp_t) \
 	GO(XDestroyImage, iFp_t) \
 	GO(XInitImage, iFp_t) \
+	GO(XPending, iFp_t) \
 	GO(_XInitImageFuncPtrs, iFp_t) \
 	GO(XOpenDisplay, pFp_t) \
 	GO(XSetErrorHandler, pFp_t) \
 	GO(XSetIOErrorHandler, pFp_t) \
 	GO(_XDeqAsyncHandler, vFpp_t) \
+	GO(XEventsQueued, iFpi_t) \
+	GO(_XEventsQueued, iFpi_t) \
+	GO(XNextEvent, iFpp_t) \
+	GO(XPeekEvent, iFpp_t) \
 	GO(XVaCreateNestedList, pFiV_t) \
 	GO(XSynchronize, pFpi_t) \
 	GO(XSetAfterFunction, pFpp_t) \

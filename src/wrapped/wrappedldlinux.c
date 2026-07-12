@@ -24,6 +24,30 @@ typedef struct my_tls_s {
 EXPORT void* my___tls_get_addr(x64emu_t* emu, void* p)
 {
     my_tls_t *t = (my_tls_t*)p;
+    // RimDroid: the RimWorld 1.6 save crash is a SEGV inside this wrapper — a garbage
+    // descriptor (or module index) arrives from the guest. Validate before dereferencing
+    // and log the guest caller: a Mono-JIT caller address = the known dynarec corruption
+    // family; a libc/loader caller = a box64 TLS infra bug (the save runs on RimWorld's
+    // freshly spawned Saver thread). Capped, always-on (LOG_NONE).
+    int p_readable = ((uintptr_t)p >= 0x10000) && !((uintptr_t)p & 0x7);
+    if (!p_readable || t->i >= (unsigned long)my_context->elfsize) {
+        static int rd_tlsbad_n = 0;
+        if (rd_tlsbad_n < 16) {
+            rd_tlsbad_n++;
+            printf_log(LOG_NONE, "RIMDROID TLSBAD p=%p i=0x%lx o=0x%lx elfsize=%d rip=%p(%s)\n",
+                p, p_readable ? t->i : 0, p_readable ? t->o : 0,
+                my_context->elfsize, (void*)R_RIP, getAddrFunctionName(R_RIP));
+            fflush(NULL);
+        }
+        // For a decodable-but-out-of-range index keep the process alive on a scratch slot
+        // so the save path can be observed further (the caller was doomed either way);
+        // an unreadable p still falls through to the original crash.
+        if (p_readable) {
+            static __thread char rd_tls_scratch[512];
+            memset(rd_tls_scratch, 0, sizeof(rd_tls_scratch));
+            return rd_tls_scratch;
+        }
+    }
     tlsdatasize_t* ptr = emu->tlsdata;
     if (!ptr) {
         refreshTLSData(emu);

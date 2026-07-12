@@ -46,6 +46,7 @@ extern int _nl_msg_cat_cntr __attribute__((weak));
 #include <ftw.h>
 #include <sys/syscall.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/utsname.h>
 #include <sys/mman.h>
 #include <sys/types.h>
@@ -98,6 +99,158 @@ extern int _nl_msg_cat_cntr __attribute__((weak));
 #ifndef LOG_DEBUG
 #define LOG_DEBUG 2
 #endif
+
+#define RD_X11_FD_MAX 4096
+static unsigned char rd_x11_fd[RD_X11_FD_MAX];
+static unsigned long long rd_x11_poll_calls, rd_x11_poll_ready, rd_x11_poll_zero, rd_x11_poll_err;
+static unsigned long long rd_x11_ppoll_calls, rd_x11_ppoll_ready, rd_x11_ppoll_zero, rd_x11_ppoll_err;
+static unsigned long long rd_x11_read_calls, rd_x11_read_bytes, rd_x11_read_eagain, rd_x11_read_eof, rd_x11_read_err;
+static unsigned long long rd_x11_recv_calls, rd_x11_recv_bytes, rd_x11_recv_eagain, rd_x11_recv_eof, rd_x11_recv_err;
+
+static int rd_x11_trace_enabled(void)
+{
+    static int v = -1;
+    if(v < 0) {
+        const char* e = getenv("RIMDROID_XPOLL_TRACE");
+        v = (!e || e[0] != '0') && getenv("RIMDROID_X11_SOCKET_DIR") ? 1 : 0;
+    }
+    return v;
+}
+
+static int rd_x11_is_fd(int fd)
+{
+    return fd >= 0 && fd < RD_X11_FD_MAX && rd_x11_fd[fd];
+}
+
+static int rd_x11_should_log(unsigned long long n)
+{
+    return n <= 80 || (n <= 5000 && (n % 250) == 0) || (n % 5000) == 0;
+}
+
+void rd_x11_diag_dump(const char* where)
+{
+    if(!rd_x11_trace_enabled()) return;
+    printf_log(LOG_NONE,
+        "RIMDROID: X11IO %s poll=%llu ready=%llu zero=%llu err=%llu "
+        "ppoll=%llu ready=%llu zero=%llu err=%llu "
+        "read=%llu bytes=%llu eagain=%llu eof=%llu err=%llu "
+        "recv=%llu bytes=%llu eagain=%llu eof=%llu err=%llu\n",
+        where ? where : "?",
+        rd_x11_poll_calls, rd_x11_poll_ready, rd_x11_poll_zero, rd_x11_poll_err,
+        rd_x11_ppoll_calls, rd_x11_ppoll_ready, rd_x11_ppoll_zero, rd_x11_ppoll_err,
+        rd_x11_read_calls, rd_x11_read_bytes, rd_x11_read_eagain, rd_x11_read_eof, rd_x11_read_err,
+        rd_x11_recv_calls, rd_x11_recv_bytes, rd_x11_recv_eagain, rd_x11_recv_eof, rd_x11_recv_err);
+}
+
+static int rd_poll_has_x11_fd(const struct pollfd* fds, nfds_t nfds)
+{
+    if(!fds) return 0;
+    for(nfds_t i = 0; i < nfds; ++i)
+        if(rd_x11_is_fd(fds[i].fd)) return 1;
+    return 0;
+}
+
+static void rd_log_poll_result(const char* name, const struct pollfd* fds, nfds_t nfds,
+                               int timeout, int ret, int saved_errno, int is_ppoll)
+{
+    unsigned long long* calls = is_ppoll ? &rd_x11_ppoll_calls : &rd_x11_poll_calls;
+    unsigned long long* ready = is_ppoll ? &rd_x11_ppoll_ready : &rd_x11_poll_ready;
+    unsigned long long* zero  = is_ppoll ? &rd_x11_ppoll_zero  : &rd_x11_poll_zero;
+    unsigned long long* err   = is_ppoll ? &rd_x11_ppoll_err   : &rd_x11_poll_err;
+    ++*calls;
+    if(ret > 0) ++*ready; else if(ret == 0) ++*zero; else ++*err;
+    if(!rd_x11_should_log(*calls) && ret == 0) return;
+    char states[256];
+    states[0] = 0;
+    size_t used = 0;
+    if(fds) {
+        for(nfds_t i = 0; i < nfds && used + 32 < sizeof(states); ++i) {
+            if(!rd_x11_is_fd(fds[i].fd)) continue;
+            int n = snprintf(states + used, sizeof(states) - used,
+                             "%sfd=%d ev=0x%x rev=0x%x",
+                             used ? " " : "", fds[i].fd, fds[i].events, fds[i].revents);
+            if(n < 0) break;
+            used += (size_t)n;
+        }
+    }
+    printf_log(LOG_NONE,
+               "RIMDROID: X11IO %s#%llu nfds=%llu timeout=%d ret=%d errno=%d %s\n",
+               name, *calls, (unsigned long long)nfds, timeout, ret,
+               ret < 0 ? saved_errno : 0, states);
+}
+
+static void rd_log_io_result(const char* name, int fd, size_t count, ssize_t ret,
+                             int saved_errno, int is_recv)
+{
+    unsigned long long* calls = is_recv ? &rd_x11_recv_calls : &rd_x11_read_calls;
+    unsigned long long* bytes = is_recv ? &rd_x11_recv_bytes : &rd_x11_read_bytes;
+    unsigned long long* eagain = is_recv ? &rd_x11_recv_eagain : &rd_x11_read_eagain;
+    unsigned long long* eof = is_recv ? &rd_x11_recv_eof : &rd_x11_read_eof;
+    unsigned long long* err = is_recv ? &rd_x11_recv_err : &rd_x11_read_err;
+    ++*calls;
+    if(ret > 0) *bytes += (unsigned long long)ret;
+    else if(ret == 0) ++*eof;
+    else if(saved_errno == EAGAIN || saved_errno == EWOULDBLOCK) ++*eagain;
+    else ++*err;
+    if(!rd_x11_should_log(*calls) && ret >= 0) return;
+    printf_log(LOG_NONE,
+               "RIMDROID: X11IO %s#%llu fd=%d count=%llu ret=%lld errno=%d\n",
+               name, *calls, fd, (unsigned long long)count, (long long)ret,
+               ret < 0 ? saved_errno : 0);
+}
+
+EXPORT int32_t my_poll(x64emu_t* emu, struct pollfd* fds, unsigned long nfds, int timeout)
+{
+    (void)emu;
+    int watch = rd_x11_trace_enabled() && rd_poll_has_x11_fd(fds, (nfds_t)nfds);
+    int ret = poll(fds, (nfds_t)nfds, timeout);
+    int saved = errno;
+    if(watch) rd_log_poll_result("poll", fds, (nfds_t)nfds, timeout, ret, saved, 0);
+    errno = saved;
+    return ret;
+}
+EXPORT int32_t my___poll(x64emu_t* emu, struct pollfd* fds, unsigned long nfds, int timeout)
+    __attribute__((alias("my_poll")));
+
+EXPORT int32_t my_ppoll(x64emu_t* emu, struct pollfd* fds, unsigned long nfds, void* timeout, void* sigmask)
+{
+    (void)emu;
+    int watch = rd_x11_trace_enabled() && rd_poll_has_x11_fd(fds, (nfds_t)nfds);
+    const struct timespec* ts = (const struct timespec*)timeout;
+    int timeout_ms = -1;
+    if(ts) timeout_ms = (int)(ts->tv_sec * 1000 + ts->tv_nsec / 1000000);
+    int ret = ppoll(fds, (nfds_t)nfds, ts, (const sigset_t*)sigmask);
+    int saved = errno;
+    if(watch) rd_log_poll_result("ppoll", fds, (nfds_t)nfds, timeout_ms, ret, saved, 1);
+    errno = saved;
+    return ret;
+}
+
+EXPORT ssize_t my_read(x64emu_t* emu, int fd, void* buf, size_t count)
+{
+    (void)emu;
+    int watch = rd_x11_trace_enabled() && rd_x11_is_fd(fd);
+    ssize_t ret = read(fd, buf, count);
+    int saved = errno;
+    if(watch) rd_log_io_result("read", fd, count, ret, saved, 0);
+    errno = saved;
+    return ret;
+}
+EXPORT ssize_t my___read(x64emu_t* emu, int fd, void* buf, size_t count)
+    __attribute__((alias("my_read")));
+
+EXPORT ssize_t my_recv(x64emu_t* emu, int fd, void* buf, size_t count, int flags)
+{
+    (void)emu;
+    int watch = rd_x11_trace_enabled() && rd_x11_is_fd(fd);
+    ssize_t ret = recv(fd, buf, count, flags);
+    int saved = errno;
+    if(watch) rd_log_io_result("recv", fd, count, ret, saved, 1);
+    errno = saved;
+    return ret;
+}
+EXPORT ssize_t my___recv(x64emu_t* emu, int fd, void* buf, size_t count, int flags)
+    __attribute__((alias("my_recv")));
 
 
 #define LIBNAME libc
@@ -1667,6 +1820,14 @@ EXPORT int my___fxstat(x64emu_t *emu, int vers, int fd, void* buf)
     return r;
 }
 EXPORT int my___fxstat64(x64emu_t *emu, int vers, int fd, void* buf) __attribute__((alias("my___fxstat")));
+
+// RimDroid: bionic has strdup()/getdelim() but NOT the glibc-internal __strdup/__getdelim aliases that a
+// glibc x86_64 ELF (e.g. a .NET NativeAOT binary) pulls in via PLT — without these it aborts at load.
+// box64 shares the host heap, so the buffers strdup/getdelim allocate are safe for the guest to free.
+// (Routed via GO2 in wrappedlibc_private.h.) Helps any glibc ELF under box64, not just our patcher.
+EXPORT void* my___strdup(x64emu_t* emu, void* s) { (void)emu; return strdup((char*)s); }
+EXPORT ssize_t my___getdelim(x64emu_t* emu, void* lineptr, void* n, int delim, void* stream)
+{ (void)emu; return getdelim((char**)lineptr, (size_t*)n, delim, (FILE*)stream); }
 
 EXPORT int my_statx(x64emu_t* emu, int dirfd, void* path, int flags, uint32_t mask, void* buf)
 {
@@ -3520,15 +3681,63 @@ void InitCpuModel()
 }
 #endif
 
-#ifdef ANDROID
-void ctSetup()
-{
-}
-#else
 EXPORT const unsigned short int *my___ctype_b;
 EXPORT const int32_t *my___ctype_tolower;
 EXPORT const int32_t *my___ctype_toupper;
 
+#ifdef ANDROID
+// RimDroid: bionic has NO glibc ctype tables (__ctype_b_loc & co), and its locale_t
+// is an opaque bionic struct. But glibc-built guests (e.g. the static libstdc++ inside
+// Unity 2022's UnityPlayer.so) index glibc-format ctype tables DIRECTLY:
+//     isdigit(c) == table[c] & 0x0800   (2-byte mask per char, indices -128..255)
+// and read locale_t fields at glibc offsets (see rd_glibc_locale below). RimWorld 1.6
+// crashed with SIGSEGV in "MonoManager ReloadAssembly" exactly on such a lookup.
+// Build the C-locale tables ourselves, glibc layout, pointer at index 0 (+128).
+
+// glibc <ctype.h> mask bits (x86_64 layout: _ISbit(x) = x<8 ? 1<<(x+8) : 1<<(x-8))
+#define RD_CT_UPPER  0x0100
+#define RD_CT_LOWER  0x0200
+#define RD_CT_ALPHA  0x0400
+#define RD_CT_DIGIT  0x0800
+#define RD_CT_XDIGIT 0x1000
+#define RD_CT_SPACE  0x2000
+#define RD_CT_PRINT  0x4000
+#define RD_CT_GRAPH  0x8000
+#define RD_CT_BLANK  0x0001
+#define RD_CT_CNTRL  0x0002
+#define RD_CT_PUNCT  0x0004
+#define RD_CT_ALNUM  0x0008
+
+static unsigned short rd_ctype_b_table[384];      // indices -128..255 (glibc convention)
+static int32_t        rd_ctype_tolower_table[384];
+static int32_t        rd_ctype_toupper_table[384];
+
+void ctSetup()
+{
+    for (int c = -128; c < 256; c++) {
+        int idx = c + 128;
+        unsigned short m = 0;
+        if (c >= 0 && c < 128) {   // C locale classifies ASCII only
+            if (c >= 'A' && c <= 'Z') m |= RD_CT_UPPER | RD_CT_ALPHA | RD_CT_ALNUM;
+            if (c >= 'a' && c <= 'z') m |= RD_CT_LOWER | RD_CT_ALPHA | RD_CT_ALNUM;
+            if (c >= '0' && c <= '9') m |= RD_CT_DIGIT | RD_CT_ALNUM | RD_CT_XDIGIT;
+            if ((c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) m |= RD_CT_XDIGIT;
+            if (c == ' ' || (c >= '\t' && c <= '\r')) m |= RD_CT_SPACE;
+            if (c == ' ' || c == '\t') m |= RD_CT_BLANK;
+            if (c < 32 || c == 127) m |= RD_CT_CNTRL;
+            if (c >= 33 && c <= 126) m |= RD_CT_GRAPH | RD_CT_PRINT;
+            if (c == ' ') m |= RD_CT_PRINT;
+            if ((m & RD_CT_GRAPH) && !(m & RD_CT_ALNUM)) m |= RD_CT_PUNCT;
+        }
+        rd_ctype_b_table[idx] = m;
+        rd_ctype_tolower_table[idx] = (c >= 'A' && c <= 'Z') ? c + 32 : c;
+        rd_ctype_toupper_table[idx] = (c >= 'a' && c <= 'z') ? c - 32 : c;
+    }
+    my___ctype_b       = rd_ctype_b_table + 128;
+    my___ctype_tolower = rd_ctype_tolower_table + 128;
+    my___ctype_toupper = rd_ctype_toupper_table + 128;
+}
+#else
 void ctSetup()
 {
     my___ctype_b = *(__ctype_b_loc());
@@ -3536,6 +3745,93 @@ void ctSetup()
     my___ctype_tolower = *(__ctype_tolower_loc());
 }
 #endif
+
+// __ctype_*_loc(): return the address of our table pointers (bionic has none; on
+// glibc hosts my___ctype_* were seeded from the host in ctSetup, so this is equivalent).
+EXPORT const unsigned short int** my___ctype_b_loc(x64emu_t* emu)       { (void)emu; return &my___ctype_b; }
+EXPORT const int32_t**            my___ctype_tolower_loc(x64emu_t* emu) { (void)emu; return &my___ctype_tolower; }
+EXPORT const int32_t**            my___ctype_toupper_loc(x64emu_t* emu) { (void)emu; return &my___ctype_toupper; }
+
+// RimDroid: glibc `struct __locale_struct` emulation. Guest glibc code does NOT treat
+// locale_t as opaque — libstdc++'s classic_table() literally returns loc->__ctype_b
+// (offset 104). Forwarding newlocale() to bionic hands the guest a bionic object whose
+// bytes at glibc offsets are garbage → SIGSEGV on first isdigit() through a stream
+// (hit by RimWorld 1.6 / Unity 2022 during MonoManager ReloadAssembly). Under
+// emulation every locale is "C", one static singleton, layout-compatible with glibc.
+typedef struct rd_glibc_locale_s {
+    void*                     locales[13];   // struct __locale_data* — unused, NULL
+    const unsigned short int* ctype_b;       // offset 104: the field libstdc++ reads
+    const int32_t*            ctype_tolower; // offset 112
+    const int32_t*            ctype_toupper; // offset 120
+    const char*               names[13];
+} rd_glibc_locale_t;
+
+static rd_glibc_locale_t rd_c_locale;                     // the "C" locale singleton
+static void*             rd_current_locale = (void*)-1L;  // LC_GLOBAL_LOCALE
+
+static rd_glibc_locale_t* rd_get_c_locale(void)
+{
+    if (!rd_c_locale.ctype_b) {
+        for (int i = 0; i < 13; i++) { rd_c_locale.locales[i] = NULL; rd_c_locale.names[i] = "C"; }
+        rd_c_locale.ctype_b       = my___ctype_b;
+        rd_c_locale.ctype_tolower = my___ctype_tolower;
+        rd_c_locale.ctype_toupper = my___ctype_toupper;
+    }
+    return &rd_c_locale;
+}
+
+EXPORT void* my_newlocale(x64emu_t* emu, int mask, void* name, void* base)
+{
+    (void)emu; (void)mask; (void)name; (void)base;
+    return rd_get_c_locale();
+}
+EXPORT void* my_duplocale(x64emu_t* emu, void* loc)
+{
+    (void)emu; (void)loc;
+    return rd_get_c_locale();
+}
+EXPORT void my_freelocale(x64emu_t* emu, void* loc)
+{
+    (void)emu; (void)loc;   // ours is static — nothing to free
+}
+EXPORT void* my_uselocale(x64emu_t* emu, void* loc)
+{
+    (void)emu;
+    void* old = rd_current_locale;
+    if (loc) rd_current_locale = loc;
+    return old;
+}
+
+// RimDroid: X11 unix-socket path redirect. Guest libxcb/libX11 connect to the
+// hardcoded "/tmp/.X11-unix/X<n>", but Android apps cannot create /tmp — our
+// in-process X server (see Java com.rimdroid.xserver) listens under the app dir
+// instead ($RIMDROID_X11_SOCKET_DIR). Rewrite the sun_path transparently.
+// glibc and bionic share the sockaddr_un layout (2-byte family + 108-byte path),
+// so the guest struct can be read directly.
+EXPORT int my_connect(x64emu_t* emu, int fd, void* addr, uint32_t addrlen)
+{
+    (void)emu;
+    struct sockaddr_un* un = (struct sockaddr_un*)addr;
+    if (un && addrlen > 2 && un->sun_family == AF_UNIX
+            && !strncmp(un->sun_path, "/tmp/.X11-unix/", 15)) {
+        const char* dir = getenv("RIMDROID_X11_SOCKET_DIR");
+        if (dir && *dir) {
+            struct sockaddr_un redirected;
+            memset(&redirected, 0, sizeof(redirected));
+            redirected.sun_family = AF_UNIX;
+            const char* base = strrchr(un->sun_path, '/');
+            snprintf(redirected.sun_path, sizeof(redirected.sun_path), "%s%s", dir, base);
+            printf_log(LOG_INFO, "RIMDROID connect redirect: %s -> %s\n", un->sun_path, redirected.sun_path);
+            int ret = connect(fd, (struct sockaddr*)&redirected, sizeof(redirected));
+            if(ret == 0 && fd >= 0 && fd < RD_X11_FD_MAX) {
+                rd_x11_fd[fd] = 1;
+                printf_log(LOG_NONE, "RIMDROID: X11IO tracking fd=%d\n", fd);
+            }
+            return ret;
+        }
+    }
+    return connect(fd, (struct sockaddr*)addr, addrlen);
+}
 
 // RimDroid: Android's bionic libc lacks bcmp and getprotobyname_r, which
 // RimWorld 1.6's Mono (libmonobdwgc-2.0.so) imports.  As plain GO entries box64
@@ -3703,8 +3999,16 @@ EXPORT void* my_mmap64(x64emu_t* emu, void *addr, size_t length, int prot, int f
     // device-specific OOM-at-Mono-init (39-bit-VA phones) needs the failing size/flags/errno, and
     // full BOX64_LOG=2 is unusable there: the log flood kills the in-process app before logs flush.
     if(ret==MAP_FAILED && emu) {
-        printf_log(LOG_DEBUG, "[RD] GUEST mmap FAILED: hint=%p size=0x%zx prot=0x%x flags=0x%x fd=%d -> %s (%d)\n",
-            addr, length, prot, flags, fd, strerror(e), e);
+        // LOG_NONE + RIP: the 1.6 splash-unload frame dies with bare Mono "mmap failed: Out of
+        // memory" — we need the size and the guest caller even at BOX64_LOG=0 (capped).
+        static int rd_mmfail_n = 0;
+        if (rd_mmfail_n < 16) {
+            rd_mmfail_n++;
+            printf_log(LOG_NONE, "RIMDROID MMAPFAIL hint=%p size=0x%zx (%.1f MB) prot=0x%x flags=0x%x fd=%d -> %s (%d) rip=%p(%s)\n",
+                addr, length, length/1048576.0, prot, flags, fd, strerror(e), e,
+                (void*)R_RIP, getAddrFunctionName(R_RIP));
+            fflush(NULL);
+        }
     }
     if((ret==MAP_FAILED && (emu || box64_is32bits)) && (BOX64ENV(log)>=LOG_DEBUG || BOX64ENV(dynarec_log)>=LOG_DEBUG)) {printf_log_prefix(0, LOG_NONE, "%s (%d)\n", strerror(errno), errno);}
     if(((ret!=MAP_FAILED) && (emu || box64_is32bits)) && (BOX64ENV(log)>=LOG_DEBUG || BOX64ENV(dynarec_log)>=LOG_DEBUG)) {printf_log_prefix(0, LOG_NONE, "%p\n", ret);}

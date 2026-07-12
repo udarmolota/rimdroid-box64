@@ -567,7 +567,27 @@ int my_sigactionhandler_oldcode_64(x64emu_t* emu, int32_t sig, int simple, sigin
         skip = 3;   // other signal can resume in dynarec
     }
     //TODO: SIGABRT generate what?
-    printf_log((sig==10)?LOG_DEBUG:log_minimum, "Signal %d: si_addr=%p, TRAPNO=%d, ERR=%d, RIP=%p, prot=%x, mmapped:%d\n", sig, (void*)info2->si_addr, sigcontext->uc_mcontext.gregs[X64_TRAPNO], sigcontext->uc_mcontext.gregs[X64_ERR],sigcontext->uc_mcontext.gregs[X64_RIP], prot, mmapped);
+    // RimDroid: force SIGSEGV forwarded to a guest handler to LOG_NONE so the RELIABLE
+    // box64 fault RIP/RBP/RSP is visible even at BOX64_LOG=0 (Mono catches SIGSEGV for
+    // implicit null-checks AND fatal crashes, then mangles its own backtrace — this line,
+    // printed BEFORE forwarding, is the trustworthy crash locator). Grep "RIMDROID SEGV".
+    // When the fault hit NATIVE code (e.g. inside libzfa via a bridge), the guest RIP only
+    // names the bridge; log the real native PC + dladdr module/symbol to pinpoint it.
+    if ((sig==X64_SIGSEGV || sig==X64_SIGABRT || sig==X64_SIGBUS) && ucntx) {
+        uintptr_t npc = (uintptr_t)((ucontext_t*)ucntx)->uc_mcontext.pc;
+        Dl_info dli = {0};
+        extern volatile int rd_glx_swap_phase;   // wrappedlibgl.c: 1=glFinish, 2=zfaFlushFront
+        if (npc && dladdr((void*)npc, &dli) && dli.dli_fname) {
+            const char* base = strrchr(dli.dli_fname, '/');
+            printf_log(LOG_NONE, "RIMDROID SEGV native pc=%p %s(%s+0x%lx) swap_phase=%d\n", (void*)npc,
+                       base?base+1:dli.dli_fname, dli.dli_sname?dli.dli_sname:"?",
+                       (unsigned long)(npc - (uintptr_t)(dli.dli_saddr?dli.dli_saddr:dli.dli_fbase)),
+                       rd_glx_swap_phase);
+        } else {
+            printf_log(LOG_NONE, "RIMDROID SEGV native pc=%p (no dladdr) swap_phase=%d\n", (void*)npc, rd_glx_swap_phase);
+        }
+    }
+    printf_log((sig==10)?LOG_DEBUG:((sig==X64_SIGSEGV||sig==X64_SIGABRT||sig==X64_SIGBUS)?LOG_NONE:log_minimum), "RIMDROID SEGV Signal %d: si_addr=%p, TRAPNO=%d, ERR=%d, RIP=%p(%s), RBP=%p, RSP=%p, prot=%x, mmapped:%d\n", sig, (void*)info2->si_addr, sigcontext->uc_mcontext.gregs[X64_TRAPNO], sigcontext->uc_mcontext.gregs[X64_ERR],sigcontext->uc_mcontext.gregs[X64_RIP], getAddrFunctionName(sigcontext->uc_mcontext.gregs[X64_RIP]), (void*)sigcontext->uc_mcontext.gregs[X64_RBP], (void*)sigcontext->uc_mcontext.gregs[X64_RSP], prot, mmapped);
     #ifdef DYNAREC
     if(sig==3)
         SerializeAllMapping();  // Signal Interupt: it's a good time to serialize the mappings if needed
