@@ -216,13 +216,13 @@ static uint32_t rd_glClientWaitSync(void* sync, uint32_t flags, uint64_t timeout
         rd_sync_last_ns = now;
     }
 
+    uint32_t ret = p_rd_real_glClientWaitSync(sync, flags, timeout);
     {
         static uint64_t rd_wait_total = 0;
         rd_wait_total++;
         if ((rd_wait_total % 10000) == 1)
             { printf_log(LOG_NONE, "RIMDROID SYNCSTAT wait_total=%llu timeout=%llu\n", (unsigned long long)rd_wait_total, (unsigned long long)timeout); fflush(NULL); }
     }
-    uint32_t ret = p_rd_real_glClientWaitSync(sync, flags, timeout);
     if (sync && timeout == 0) {
         rd_sync_last = sync;
         rd_sync_last_flags = flags;
@@ -561,6 +561,51 @@ static void rd_glUseProgram(uint32_t prog) {
 // result); if the exit is miscompiled, the cap breaks the infinite loop (tiny quality cost). Real
 // BC loops are <=~64 iterations, so the default 256 cap is safe. Env RIMDROID_BC_CAP overrides it;
 // RIMDROID_BC_NOCAP=1 disables the transform (A/B). Only the compressor shader is touched.
+// Force CompressBC's existing low-quality algorithm at compile time. The first _Quality token is
+// its uniform declaration and must remain intact; replacing later references lets Mesa eliminate
+// the large endpoint-search branches before ir3 compilation. RIMDROID_BC_QUALITY may select a
+// different compile-time value in [0, 1].
+static char* rd_bc_force_quality(const char* src, int* out_n) {
+    const char* TOKEN = "_Quality";
+    const size_t TL = 8;
+    const char* declaration = strstr(src, TOKEN);
+    if (!declaration) { if (out_n) *out_n = 0; return NULL; }
+
+    float quality = 0.0f;
+    const char* e = getenv("RIMDROID_BC_QUALITY");
+    if (e && e[0]) {
+        quality = strtof(e, NULL);
+        if (quality < 0.0f) quality = 0.0f;
+        if (quality > 1.0f) quality = 1.0f;
+    }
+    char repl[32];
+    int rl = snprintf(repl, sizeof(repl), "%.6f", quality);
+
+    const char* start = declaration + TL;
+    int n = 0;
+    for (const char* p = start; (p = strstr(p, TOKEN)); p += TL) n++;
+    if (n == 0) { if (out_n) *out_n = 0; return NULL; }
+
+    const size_t prefix = (size_t)(start - src);
+    const size_t inlen = strlen(src);
+    const size_t outlen = inlen - (size_t)n * TL + (size_t)n * (size_t)rl;
+    char* dst = (char*)malloc(outlen + 1);
+    if (!dst) { if (out_n) *out_n = 0; return NULL; }
+
+    memcpy(dst, src, prefix);
+    char* w = dst + prefix;
+    const char* r = start;
+    const char* hit;
+    while ((hit = strstr(r, TOKEN))) {
+        memcpy(w, r, (size_t)(hit - r)); w += hit - r;
+        memcpy(w, repl, (size_t)rl); w += rl;
+        r = hit + TL;
+    }
+    strcpy(w, r);
+    if (out_n) *out_n = n;
+    return dst;
+}
+
 static char* rd_bc_bound_loops(const char* src, int* out_n) {
     const char* NEEDLE = "while(true){";
     const size_t NL = 12;
@@ -610,11 +655,13 @@ static void rd_glShaderSource(uint32_t shader, int32_t count, const char* const*
         fputc('\n', f);
         fflush(f);
     }
-    // CompressBC loop-bounding: concatenate the parts, and if this is the compressor (writes a
-    // uimage2D), hand the real driver a version with every while(true) loop hard-capped.
+    // CompressBC transforms: concatenate the parts, force the existing low-quality path, then
+    // optionally hand the driver a version with every remaining while(true) loop hard-capped.
     static int nocap = -1;
+    static int native_quality = -1;
     if (nocap == -1) nocap = getenv("RIMDROID_BC_NOCAP") ? 1 : 0;
-    if (!nocap && strings && count > 0) {
+    if (native_quality == -1) native_quality = getenv("RIMDROID_BC_NATIVE_QUALITY") ? 1 : 0;
+    if (strings && count > 0) {
         size_t total = 0;
         for (int32_t i = 0; i < count; i++)
             total += strings[i] ? (lengths && lengths[i] >= 0 ? (size_t)lengths[i] : strlen(strings[i])) : 0;
@@ -628,17 +675,24 @@ static void rd_glShaderSource(uint32_t shader, int32_t count, const char* const*
             }
             *w = 0;
             if (strstr(joined, "uimage2D")) {
+                int nquality = 0;
                 int nloops = 0;
-                char* fixed = rd_bc_bound_loops(joined, &nloops);
-                if (fixed && nloops > 0) {
-                    printf_log(LOG_NONE, "RIMDROID CompressBC shim: bounded %d while-loops on shader %u\n", nloops, shader);
+                char* quality_fixed = native_quality ? NULL : rd_bc_force_quality(joined, &nquality);
+                const char* cap_input = quality_fixed ? quality_fixed : joined;
+                char* loop_fixed = nocap ? NULL : rd_bc_bound_loops(cap_input, &nloops);
+                const char* fixed = loop_fixed ? loop_fixed : quality_fixed;
+                if (fixed) {
+                    printf_log(LOG_NONE, "RIMDROID CompressBC shim: shader %u quality_refs=%d bounded_loops=%d%s%s\n",
+                        shader, nquality, nloops, native_quality ? " native-quality" : " low-quality",
+                        nocap ? " no-cap" : "");
                     fflush(NULL);
                     const char* one[1] = { fixed };
                     if (p_rd_real_glShaderSource) p_rd_real_glShaderSource(shader, 1, one, NULL);
-                    free(fixed); free(joined);
+                    free(loop_fixed); free(quality_fixed); free(joined);
                     return;
                 }
-                free(fixed);
+                free(loop_fixed);
+                free(quality_fixed);
             }
             free(joined);
         }

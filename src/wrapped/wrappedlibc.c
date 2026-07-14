@@ -1969,9 +1969,10 @@ typedef int (*__compar_d_fn_t)(const void*, const void*, void*);
 static size_t qsort_r_partition(void* base, size_t size, __compar_d_fn_t compar, void* arg, size_t lo, size_t hi)
 {
     void* tmp = alloca(size);
-    void* pivot = ((char*)base) + lo * size;
+    void* pivot = alloca(size);
+    memcpy(pivot, ((char*)base) + hi * size, size);
     size_t i = lo;
-    for (size_t j = lo; j <= hi; j++)
+    for (size_t j = lo; j < hi; j++)
     {
         void* base_i = ((char*)base) + i * size;
         void* base_j = ((char*)base) + j * size;
@@ -2003,7 +2004,9 @@ static void qsort_r_helper(void* base, size_t size, __compar_d_fn_t compar, void
 
 static void qsort_r(void* base, size_t nmemb, size_t size, __compar_d_fn_t compar, void* arg)
 {
-    return qsort_r_helper(base, size, compar, arg, 0, nmemb - 1);
+    if (nmemb < 2 || !size)
+        return;
+    qsort_r_helper(base, size, compar, arg, 0, nmemb - 1);
 }
 #endif
 
