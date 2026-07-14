@@ -5,6 +5,8 @@
 #include <string.h>
 #include <assert.h>
 #include <unistd.h>   // RimDroid [RD-DELTA] capture: access() for the file trigger
+#include <sys/mman.h> // RimDroid: page-probe support in rd_rd (real readability check)
+#include <fcntl.h>    // RimDroid: open(/dev/null) for the write()-based readability probe
 
 #include "os.h"
 #include "debug.h"
@@ -425,17 +427,77 @@ dynablock_t* CreateEmptyBlock(uintptr_t addr, int is32bits, int is_new) {
 // guarded by getProtection_fast) used ONE-SHOT to recover the Pawn ExposeData IMT conflict-thunk + its
 // vtable neighbourhood, so the correct-slot DELTA can be computed offline. Inert unless armed by the
 // /sdcard/Download/rd_capture trigger (see FillBlock64). printf_log(LOG_NONE) => always written to the log.
-// readable? getProtection_fast under-reports Mono's GC/metadata heap (not box64-tracked), so accept plausible
-// Mono ranges too: guest heap 0x70xx..0x74xx, libmono image 0x3f04xx..0x3f06xx.
-static int rd_rd(uintptr_t p) {
-    if(!p) return 0;
-    if(getProtection_fast(p)&PROT_READ) return 1;
-    // box64 doesn't track Mono/Unity's own data allocations (vtables, heap), so getProtection_fast
-    // returns 0 for them — fall back to plausible-Mono-pointer ranges. The managed-heap/vtable
-    // region's exact base is ASLR-dependent (Y700 ~0x72xx, Samsung ~0x74xx), so use a WIDE window
-    // (0x60–0x80) rather than a tight one; every deref is structure-validated downstream.
-    if((p>=0x6000000000ULL && p<0x8000000000ULL) || (p>=0x3f04000000ULL && p<0x3f06000000ULL)) return 1;
+// readable? getProtection_fast under-reports Mono's GC/metadata heap (not box64-tracked). The old
+// fallback ACCEPTED any pointer in a wide 0x60–0x80 window unverified — that's exactly what crashed
+// the RimWorld-1.6 save: the repair scan followed a garbage pointer inside the window, rd_rd blessed
+// it, the deref SEGV'd (si_addr 0x70xx… every time). Now REALLY verify: probe the page with mincore()
+// (any mapped page → 0; unmapped → -1/ENOMEM), cached per page in a direct-mapped table so the big
+// array walks cost ~one syscall per distinct page. Probes p AND p+7 so an 8-byte read that straddles
+// a page boundary is fully covered (u16/char readers are just over-checked by a few bytes).
+static uintptr_t rd_pg_cache[4096];
+static int rd_nullfd = -2;
+static int rd_memfd = -2;
+
+static ssize_t rd_safe_copy(void* dst, uintptr_t src, size_t size) {
+    // Never dereference untrusted Mono/JIT addresses while inspecting generated code. /proc/self/mem
+    // turns an unmapped/protected source into a short read/error instead of delivering SIGSEGV here.
+    if(rd_memfd == -2) rd_memfd = open("/proc/self/mem", O_RDONLY | O_CLOEXEC);
+    if(rd_memfd < 0) return -1;
+    ssize_t r;
+    do { r = pread(rd_memfd, dst, size, (off_t)src); } while(r < 0 && errno == EINTR);
+    return r;
+}
+
+static void rd_rd_cache_reset(void) {
+    // Mono flips JIT pages between writable/readable and execute-only. A positive result from an
+    // earlier FillBlock is therefore not evidence that the page is readable during this repair.
+    memset(rd_pg_cache, 0, sizeof(rd_pg_cache));
+}
+
+static int rd_rd_page(uintptr_t page) {
+    // Probe REAL readability, not just "mapped": mincore() returns success for PROT_NONE pages
+    // (Mono/BDWGC guard pages!), which still SEGV on read — that was the residual save-crash hole.
+    // write(/dev/null, page, 1) makes the KERNEL read the byte: returns 1 iff readable, -1/EFAULT
+    // for unmapped AND PROT_NONE alike. Positive results cached per page (direct-mapped); negatives
+    // are NOT cached (protections can change; a bad probe just costs one cheap syscall again).
+    unsigned idx = (unsigned)((page >> 12) & 4095);
+    if(rd_pg_cache[idx] == (page|1)) return 1;
+    if(rd_nullfd == -2) rd_nullfd = open("/dev/null", O_WRONLY | O_CLOEXEC);
+    if(rd_nullfd < 0) return 0;   // no probe fd → treat as unreadable (repair backs off, never crashes)
+    ssize_t r;
+    do { r = write(rd_nullfd, (const void*)page, 1); } while(r < 0 && errno == EINTR);
+    if(r == 1) { rd_pg_cache[idx] = page|1; return 1; }
     return 0;
+}
+static int rd_rd(uintptr_t p) {
+    // Do NOT short-circuit on getProtection_fast: box64's guest-side prot table can disagree with the
+    // real host protection (seen live: klass=0x40040000, a Mono JIT code page — guest table said READ,
+    // host page was execute-only → ldrh faulted with ERR=5 right after the check passed). The kernel
+    // write-probe is the only truth; the page cache keeps it cheap.
+    if(!p) return 0;
+    if(p < 0x10000 || p >= 0x8000000000ULL) return 0;   // quick reject: junk/kernel-ish values
+    uintptr_t pg1 = p & ~(uintptr_t)0xFFF, pg2 = (p+7) & ~(uintptr_t)0xFFF;
+    if(!rd_rd_page(pg1)) return 0;
+    return (pg2==pg1) ? 1 : rd_rd_page(pg2);
+}
+
+static int rd_write_ptr(uintptr_t p, uintptr_t v) {
+    if(!rd_rd(p)) return 0;
+    uint32_t oldprot = getProtection_fast(p);
+    uintptr_t page = p & ~(uintptr_t)(box64_pagesize - 1);
+
+    if(!oldprot) return 0;
+    if(mprotect((void*)page, box64_pagesize, (oldprot | PROT_WRITE) & ~PROT_CUSTOM))
+        return 0;
+    updateProtection(page, box64_pagesize, oldprot | PROT_WRITE);
+
+    *(uintptr_t*)p = v;
+
+    if(!(oldprot & PROT_WRITE)) {
+        mprotect((void*)page, box64_pagesize, oldprot & ~PROT_CUSTOM);
+        updateProtection(page, box64_pagesize, oldprot);
+    }
+    return 1;
 }
 
 // The save-bug FIX (locate Pawn, rd_imt_fix) runs by DEFAULT. The heavy/noisy DIAGNOSTICS (good-phase probe,
@@ -478,13 +540,14 @@ static uintptr_t rd_find_code_by_name(const char* name, int len) {
     uint32_t  hsize   = *(uint32_t*)(hh+0x18);
     uintptr_t buckets = *(uintptr_t*)(hh+0x20);
     if(!rd_rd(buckets) || hsize==0 || hsize>0x100000) return 0;
-    for(uintptr_t c=rd_pawn_klass, d=0; rd_rd(c) && d<24; c=*(uintptr_t*)(c+0x28), d++)
+    for(uintptr_t c=rd_pawn_klass, d=0; rd_rd(c) && rd_rd(c+0x28) && d<24; c=*(uintptr_t*)(c+0x28), d++)
         for(uint32_t bk=0; bk<hsize; bk++){
+            if(!rd_rd(buckets+(uintptr_t)bk*8)) break;   // guard the array walk, not just the base
             uintptr_t ji=*(uintptr_t*)(buckets+(uintptr_t)bk*8);
-            for(int g=0; rd_rd(ji) && g<20000; ji=*(uintptr_t*)(ji+0x08), g++){
-                uintptr_t m=*(uintptr_t*)(ji+0x00); if(!rd_rd(m)) continue;
+            for(int g=0; rd_rd(ji) && rd_rd(ji+0x08) && rd_rd(ji+0x10) && g<20000; ji=*(uintptr_t*)(ji+0x08), g++){
+                uintptr_t m=*(uintptr_t*)(ji+0x00); if(!rd_rd(m) || !rd_rd(m+0x08) || !rd_rd(m+0x18)) continue;
                 if(*(uintptr_t*)(m+0x08)!=c) continue;
-                uintptr_t nmp=*(uintptr_t*)(m+0x18); if(!rd_rd(nmp)) continue;
+                uintptr_t nmp=*(uintptr_t*)(m+0x18); if(!rd_rd(nmp) || (len>8 && !rd_rd(nmp+len-1))) continue;
                 if(!strncmp((const char*)nmp,name,(size_t)len)) return *(uintptr_t*)(ji+0x10);
             }
         }
@@ -502,14 +565,17 @@ static void rd_name_of_code(uintptr_t code, char* out, int outlen) {
     uintptr_t buckets = *(uintptr_t*)(hh+0x20);
     if(!rd_rd(buckets) || hsize==0 || hsize>0x100000) return;
     for(uint32_t bk=0; bk<hsize; bk++){
+        if(!rd_rd(buckets+(uintptr_t)bk*8)) break;   // guard the array walk
         uintptr_t ji=*(uintptr_t*)(buckets+(uintptr_t)bk*8);
-        for(int g=0; rd_rd(ji) && g<20000; ji=*(uintptr_t*)(ji+0x08), g++){
+        for(int g=0; rd_rd(ji) && rd_rd(ji+0x08) && rd_rd(ji+0x10) && g<20000; ji=*(uintptr_t*)(ji+0x08), g++){
             if(*(uintptr_t*)(ji+0x10)!=code) continue;
-            uintptr_t m=*(uintptr_t*)(ji+0x00); if(!rd_rd(m)) return;
+            uintptr_t m=*(uintptr_t*)(ji+0x00); if(!rd_rd(m) || !rd_rd(m+0x08) || !rd_rd(m+0x18)) return;
             uintptr_t nmp=*(uintptr_t*)(m+0x18);
             uintptr_t kl=*(uintptr_t*)(m+0x08);
-            uintptr_t kn= rd_rd(kl+0x40)? *(uintptr_t*)(kl+0x40):0;
-            snprintf(out,(size_t)outlen,"%.24s.%.24s", rd_rd(kn)?(const char*)kn:"?", rd_rd(nmp)?(const char*)nmp:"?");
+            uintptr_t kn= (rd_rd(kl) && rd_rd(kl+0x40))? *(uintptr_t*)(kl+0x40):0;
+            if(kn  && !rd_rd(kn+23))  kn  = 0;   // %.24s reads up to 24 bytes
+            if(nmp && !rd_rd(nmp+23)) nmp = 0;
+            snprintf(out,(size_t)outlen,"%.24s.%.24s", kn?(const char*)kn:"?", nmp?(const char*)nmp:"?");
             return;
         }
     }
@@ -734,6 +800,9 @@ static void rd_repair_pawn(uintptr_t domain, uintptr_t expose_itf) {
 // +0x70=iface_offsets; MonoMethod +0x08=klass,+0x18=name; MonoDomain+0xF0=jit_code_hash{size@0x18,buckets@0x20};
 // MonoJitInfo{method@0,next@0x08,code_start@0x10}.
 static void rd_savefix_repair(uintptr_t implslot, uintptr_t expose_itf) {
+    // Keep the page cache useful within this large scan, but never reuse readability results from
+    // earlier JIT phases: Android XOM can make a previously readable Mono code page execute-only.
+    rd_rd_cache_reset();
     uintptr_t itf_klass = rd_rd(expose_itf+0x08) ? *(uintptr_t*)(expose_itf+0x08) : 0;
     if(!rd_rd(itf_klass)) return;
     for(int delta=0x40; delta <= 0x40 + 8*2048; delta += 8) {
@@ -742,12 +811,17 @@ static void rd_savefix_repair(uintptr_t implslot, uintptr_t expose_itf) {
         uintptr_t klass  = *(uintptr_t*)vt;
         uintptr_t domain = *(uintptr_t*)(vt+0x10);
         if(!rd_rd(klass) || !rd_rd(domain) || !rd_rd(klass+0x70)) continue;
+        if(!rd_rd(klass+0x64)) continue;   // covers nn(+0x64) and ifaces ptr(+0x68)
         int nn = *(uint16_t*)(klass+0x64);
         uintptr_t ifaces = *(uintptr_t*)(klass+0x68);
         uintptr_t offs   = *(uintptr_t*)(klass+0x70);
         if(!rd_rd(ifaces) || !rd_rd(offs) || nn<=0 || nn>=8192) continue;
         int ioff = -1;
-        for(int i=0;i<nn;i++) if(*(uintptr_t*)(ifaces+(uintptr_t)i*8)==itf_klass){ ioff=*(uint16_t*)(offs+(uintptr_t)i*2); break; }
+        for(int i=0;i<nn;i++){
+            // guard EVERY step of the walk (base being readable says nothing about base+64KB)
+            if(!rd_rd(ifaces+(uintptr_t)i*8) || !rd_rd(offs+(uintptr_t)i*2)) break;
+            if(*(uintptr_t*)(ifaces+(uintptr_t)i*8)==itf_klass){ ioff=*(uint16_t*)(offs+(uintptr_t)i*2); break; }
+        }
         if(ioff<0) continue;
         if(vt + 0x40 + 8*(uintptr_t)ioff != implslot) continue;   // STRONG validation: this IS the owner vtable
         // Pawn has no detectable conflict-thunk; repair its plain vtable cell directly (one-shot) now that we have a domain.
@@ -759,22 +833,30 @@ static void rd_savefix_repair(uintptr_t implslot, uintptr_t expose_itf) {
         if(!rd_rd(buckets) || hsize==0 || hsize>0x100000) return;
         static uintptr_t cand_k[1024], cand_c[1024]; int nc=0;
         for(uint32_t bk=0; bk<hsize && nc<1024; bk++){
+            if(!rd_rd(buckets+(uintptr_t)bk*8)) break;   // bucket-array walk can run past the mapping
             uintptr_t ji = *(uintptr_t*)(buckets+(uintptr_t)bk*8);
-            for(int g=0; rd_rd(ji) && g<20000 && nc<1024; ji=*(uintptr_t*)(ji+0x08), g++){
-                uintptr_t m=*(uintptr_t*)(ji+0x00); if(!rd_rd(m)) continue;
-                uintptr_t nmp=*(uintptr_t*)(m+0x18); if(!rd_rd(nmp)) continue;
+            for(int g=0; rd_rd(ji) && rd_rd(ji+0x08) && rd_rd(ji+0x10) && g<20000 && nc<1024; ji=*(uintptr_t*)(ji+0x08), g++){
+                uintptr_t m=*(uintptr_t*)(ji+0x00); if(!rd_rd(m) || !rd_rd(m+0x08) || !rd_rd(m+0x18)) continue;
+                uintptr_t nmp=*(uintptr_t*)(m+0x18); if(!rd_rd(nmp) || !rd_rd(nmp+10)) continue;
                 if(!strncmp((const char*)nmp,"ExposeData",11)){ cand_k[nc]=*(uintptr_t*)(m+0x08); cand_c[nc]=*(uintptr_t*)(ji+0x10); nc++; }
             }
         }
         uintptr_t code=0, pk=0;
-        for(uintptr_t c=klass, d=0; rd_rd(c) && d<24 && !code; c=*(uintptr_t*)(c+0x28), d++)
+        for(uintptr_t c=klass, d=0; rd_rd(c) && rd_rd(c+0x28) && d<24 && !code; c=*(uintptr_t*)(c+0x28), d++)
             for(int i=0;i<nc;i++) if(cand_k[i]==c){ code=cand_c[i]; pk=c; break; }
         uintptr_t kn  = rd_rd(klass+0x40)? *(uintptr_t*)(klass+0x40):0;
         uintptr_t pkn = rd_rd(pk+0x40)?    *(uintptr_t*)(pk+0x40):0;
+        if(kn  && !rd_rd(kn+19))  kn = 0;    // %.20s below reads up to 20 bytes
+        if(pkn && !rd_rd(pkn+19)) pkn = 0;
+        if(!rd_rd(implslot)) return;
         if(code && code != *(uintptr_t*)implslot) {
-            *(uintptr_t*)implslot = code;
-            printf_log(LOG_NONE, "[RD-SAVEFIX] %.20s.ExposeData cell %p -> %p (impl '%.20s')\n",
-                rd_rd(kn)?(const char*)kn:"?", (void*)implslot, (void*)code, rd_rd(pkn)?(const char*)pkn:"?");
+            if(rd_write_ptr(implslot, code)) {
+                printf_log(LOG_NONE, "[RD-SAVEFIX] %.20s.ExposeData cell %p -> %p (impl '%.20s')\n",
+                    rd_rd(kn)?(const char*)kn:"?", (void*)implslot, (void*)code, rd_rd(pkn)?(const char*)pkn:"?");
+            } else {
+                printf_log(LOG_NONE, "[RD-SAVEFIX] %.20s.ExposeData cell %p write FAILED -> %p (impl '%.20s')\n",
+                    rd_rd(kn)?(const char*)kn:"?", (void*)implslot, (void*)code, rd_rd(pkn)?(const char*)pkn:"?");
+            }
         } else {
             printf_log(LOG_NONE, "[RD-SAVEFIX] %.20s: code not found (nc=%d), cell %p left\n",
                 rd_rd(kn)?(const char*)kn:"?", nc, (void*)implslot);
@@ -837,12 +919,15 @@ dynablock_t* FillBlock64(uintptr_t addr, int is32bits, int inst_max, int is_new,
     if(!rd_savefix_off()) {
         rd_pawn_tick();   // THE FIX (rd_imt_fix); its own diagnostics are gated inside
         static int rd_sf_n = 0, rd_sf_seen = 0;
-        if(rd_sf_n < 256 && (getProtection_fast(addr)&PROT_READ) && (getProtection_fast(addr+12)&PROT_READ)) {
-            uint8_t* b = (uint8_t*)addr;
+        uint8_t rd_thunk[0x100];
+        ssize_t rd_thunk_n = rd_sf_n < 256 ? rd_safe_copy(rd_thunk, addr, sizeof(rd_thunk)) : -1;
+        if(rd_thunk_n >= 18) {
+            uint8_t* b = rd_thunk;
             // conflict thunk = starts with `49 BB <key8> 4D 3B D3` (mov r11,key1 ; cmp r10,r11)
             if(b[0]==0x49 && b[1]==0xbb && b[10]==0x4d && b[11]==0x3b && b[12]==0xd3) {
                 // diagnostic: log this thunk's FIRST key name (AnythingToStrip-first => it's Pawn's thunk)
-                uintptr_t k0 = *(uintptr_t*)(addr+2);
+                uintptr_t k0;
+                memcpy(&k0, b+2, sizeof(k0));
                 if(rd_diag_on() && rd_sf_seen < 80 && rd_rd(k0) && rd_rd(k0+0x18)) {
                     uintptr_t n0 = *(uintptr_t*)(k0+0x18);
                     if(rd_rd(n0)) { rd_sf_seen++;
@@ -851,7 +936,7 @@ dynablock_t* FillBlock64(uintptr_t addr, int is32bits, int inst_max, int is_new,
                     // entry encoding (the strict pattern below misses these — different thunk shape).
                     static int rd_dumped = 0;
                     if(!rd_dumped && rd_rd(n0) && !strncmp((const char*)n0,"ExposeData",11)
-                       && (getProtection_fast(addr+0x50)&PROT_READ)) {
+                       && rd_thunk_n >= 0x50) {
                         rd_dumped = 1;
                         char hex[0x50*3+1]; int hp=0;
                         for(int q=0;q<0x50;q++) hp += snprintf(hex+hp, (size_t)(sizeof(hex)-hp), "%02x ", b[q]);
@@ -860,12 +945,12 @@ dynablock_t* FillBlock64(uintptr_t addr, int is32bits, int inst_max, int is_new,
                 }
                 // scan EVERY entry (handles multi-collision thunks where ExposeData is NOT the first key):
                 // each entry = `49 BB <key> 4D 3B D3 75 ?? 49 BB <impl> 41 FF 23`; cmp at offset p.
-                for(int p=10; p<0x100 && rd_sf_n<256; p++) {
-                    if(!(getProtection_fast(addr+p+17)&PROT_READ)) break;
+                for(int p=10; p+17<rd_thunk_n && rd_sf_n<256; p++) {
                     if(b[p]==0x4d && b[p+1]==0x3b && b[p+2]==0xd3 && b[p+3]==0x75
                        && b[p+5]==0x49 && b[p+6]==0xbb && b[p+15]==0x41 && b[p+16]==0xff && b[p+17]==0x23) {
-                        uintptr_t key  = *(uintptr_t*)(addr+p-8);
-                        uintptr_t impl = *(uintptr_t*)(addr+p+7);
+                        uintptr_t key, impl;
+                        memcpy(&key,  b+p-8, sizeof(key));
+                        memcpy(&impl, b+p+7, sizeof(impl));
                         if(rd_rd(key) && rd_rd(key+0x18)) {
                             uintptr_t namep = *(uintptr_t*)(key+0x18);
                             if(rd_rd(namep) && !strncmp((const char*)namep, "ExposeData", 11) && rd_rd(impl)) {
