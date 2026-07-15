@@ -455,9 +455,15 @@ int AddElfHeader(box64context_t* ctx, elfheader_t* head) {
     while(idx<ctx->elfsize && ctx->elfs[idx]) idx++;
     if(idx == ctx->elfsize) {
         if(idx==ctx->elfcap) {
-            // resize...
+            // ctx->elfs[] is read lock-free by several hot paths (e.g. my___tls_get_addr indexing
+            // ctx->elfs[t->i]). An in-place box_realloc can move the array, so a concurrent reader
+            // could dereference the freed old block. Build a new array, publish it atomically, and
+            // deliberately leak the old one (16 pointers, a few bytes) instead of freeing it — cheap
+            // and makes stale readers see valid memory instead of racing a free.
+            elfheader_t** newelfs = (elfheader_t**)box_calloc(ctx->elfcap + 16, sizeof(elfheader_t*));
+            memcpy(newelfs, ctx->elfs, sizeof(elfheader_t*) * ctx->elfcap);
             ctx->elfcap += 16;
-            ctx->elfs = (elfheader_t**)box_realloc(ctx->elfs, sizeof(elfheader_t*) * ctx->elfcap);
+            __atomic_store_n(&ctx->elfs, newelfs, __ATOMIC_RELEASE);
         }
         ctx->elfs[idx] = head;
         ctx->elfsize++;
