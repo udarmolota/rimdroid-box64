@@ -588,15 +588,6 @@ int my_sigactionhandler_oldcode_64(x64emu_t* emu, int32_t sig, int simple, sigin
         }
     }
     printf_log((sig==10)?LOG_DEBUG:((sig==X64_SIGSEGV||sig==X64_SIGABRT||sig==X64_SIGBUS)?LOG_NONE:log_minimum), "RIMDROID SEGV Signal %d: si_addr=%p, TRAPNO=%d, ERR=%d, RIP=%p(%s), RBP=%p, RSP=%p, prot=%x, mmapped:%d\n", sig, (void*)info2->si_addr, sigcontext->uc_mcontext.gregs[X64_TRAPNO], sigcontext->uc_mcontext.gregs[X64_ERR],sigcontext->uc_mcontext.gregs[X64_RIP], getAddrFunctionName(sigcontext->uc_mcontext.gregs[X64_RIP]), (void*)sigcontext->uc_mcontext.gregs[X64_RBP], (void*)sigcontext->uc_mcontext.gregs[X64_RSP], prot, mmapped);
-    // RimDroid: register-only dump (NO memory deref — signal-handler-safe) for the TLS save crash.
-    // On the __tls_get_addr path the descriptor pointer arrives in RDI; a garbage RDI here (e.g.
-    // 0x71`00000063: junk high 32 bits over a valid low 32) confirms the "wrong register value"
-    // corruption reached the TLS arg even if the my___tls_get_addr guard was bypassed.
-    if (sig==X64_SIGSEGV || sig==X64_SIGBUS)
-        printf_log(LOG_NONE, "RIMDROID SEGV regs: RDI=%p RSI=%p RAX=%p RBX=%p R14=%p R15=%p\n",
-            (void*)sigcontext->uc_mcontext.gregs[X64_RDI], (void*)sigcontext->uc_mcontext.gregs[X64_RSI],
-            (void*)sigcontext->uc_mcontext.gregs[X64_RAX], (void*)sigcontext->uc_mcontext.gregs[X64_RBX],
-            (void*)sigcontext->uc_mcontext.gregs[X64_R14], (void*)sigcontext->uc_mcontext.gregs[X64_R15]);
     #ifdef DYNAREC
     if(sig==3)
         SerializeAllMapping();  // Signal Interupt: it's a good time to serialize the mappings if needed

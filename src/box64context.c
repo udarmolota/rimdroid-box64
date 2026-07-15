@@ -455,25 +455,16 @@ int AddElfHeader(box64context_t* ctx, elfheader_t* head) {
     while(idx<ctx->elfsize && ctx->elfs[idx]) idx++;
     if(idx == ctx->elfsize) {
         if(idx==ctx->elfcap) {
-            // RimDroid: the old in-place box_realloc here raced readers — my___tls_get_addr (and
-            // others) index ctx->elfs[] LOCKLESS from guest threads, so a concurrent dlopen that
-            // realloc'd the array left them reading FREED memory → garbage elfheader* → SEGV (the
-            // RimWorld-1.6 save crash family: fault at h->tlsbase with a junk/unmapped h). Fix:
-            // build a NEW array, copy, atomically publish, and DELIBERATELY LEAK the old one
-            // (~128 B per 16 libs — nothing) so stale readers keep dereferencing valid memory.
-            elfheader_t** rd_newelfs = (elfheader_t**)box_calloc(ctx->elfcap + 16, sizeof(elfheader_t*));
-            memcpy(rd_newelfs, ctx->elfs, sizeof(elfheader_t*) * ctx->elfcap);
+            // resize...
             ctx->elfcap += 16;
-            __atomic_store_n(&ctx->elfs, rd_newelfs, __ATOMIC_RELEASE);   // old array leaked on purpose
+            ctx->elfs = (elfheader_t**)box_realloc(ctx->elfs, sizeof(elfheader_t*) * ctx->elfcap);
         }
         ctx->elfs[idx] = head;
         ctx->elfsize++;
     } else {
         ctx->elfs[idx] = head;
     }
-    // RimDroid: always-on (rare event). A mid-game ELFADD right before a save crash = the dlopen
-    // race window; grep alongside "RIMDROID TLSBAD/TLSSLOT/SEGV".
-    printf_log(LOG_NONE, "RIMDROID ELFADD \"%s\" #%d elfsize=%d cap=%d\n", ElfName(head), idx, ctx->elfsize, ctx->elfcap);
+    printf_log(LOG_DEBUG, "Adding \"%s\" as #%d in elf collection\n", ElfName(head), idx);
     return idx;
 }
 
@@ -486,9 +477,6 @@ void RemoveElfHeader(box64context_t* ctx, elfheader_t* head) {
             ctx->tlssize -= GetTLSSize(head);
         }*/
     }
-    // RimDroid: always-on (rare event). An ELFREMOVE before a TLS save crash = a guest thread was
-    // still using this module's TLS while it was dlclose'd (freed elfheader deref).
-    printf_log(LOG_NONE, "RIMDROID ELFREMOVE \"%s\" %p\n", ElfName(head), (void*)head);
     for(int i=0; i<ctx->elfsize; ++i)
         if(ctx->elfs[i] == head) {
             ctx->elfs[i] = NULL;
