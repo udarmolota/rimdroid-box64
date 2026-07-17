@@ -587,7 +587,12 @@ int my_sigactionhandler_oldcode_64(x64emu_t* emu, int32_t sig, int simple, sigin
             printf_log(LOG_NONE, "RIMDROID SEGV native pc=%p (no dladdr) swap_phase=%d\n", (void*)npc, rd_glx_swap_phase);
         }
     }
-    printf_log((sig==10)?LOG_DEBUG:((sig==X64_SIGSEGV||sig==X64_SIGABRT||sig==X64_SIGBUS)?LOG_NONE:log_minimum), "RIMDROID SEGV Signal %d: si_addr=%p, TRAPNO=%d, ERR=%d, RIP=%p(%s), RBP=%p, RSP=%p, prot=%x, mmapped:%d\n", sig, (void*)info2->si_addr, sigcontext->uc_mcontext.gregs[X64_TRAPNO], sigcontext->uc_mcontext.gregs[X64_ERR],sigcontext->uc_mcontext.gregs[X64_RIP], getAddrFunctionName(sigcontext->uc_mcontext.gregs[X64_RIP]), (void*)sigcontext->uc_mcontext.gregs[X64_RBP], (void*)sigcontext->uc_mcontext.gregs[X64_RSP], prot, mmapped);
+    // RimDroid: log the RAW kernel si_code (before any reclassification below) + RBX. si_code is the
+    // decider for the SMC-backpatch crash hypothesis: a write to a PROT_DYNAREC page (prot=0x87) that
+    // the kernel MISreports as SEGV_MAPERR(1) instead of SEGV_ACCERR(2) is a false-MAPERR that the fix
+    // at ~L1106 must reclassify; si_code==2 here would mean it reached the SMC handler and failed
+    // (a different bug). RBX because the observed fatal RIP (libmono+0x111610) is `lock cmpxchg [rbx-4]`.
+    printf_log((sig==10)?LOG_DEBUG:((sig==X64_SIGSEGV||sig==X64_SIGABRT||sig==X64_SIGBUS)?LOG_NONE:log_minimum), "RIMDROID SEGV Signal %d: si_addr=%p, si_code=%d, TRAPNO=%d, ERR=%d, RIP=%p(%s), RBP=%p, RSP=%p, RBX=%p, prot=%x, mmapped:%d\n", sig, (void*)info2->si_addr, info->si_code, sigcontext->uc_mcontext.gregs[X64_TRAPNO], sigcontext->uc_mcontext.gregs[X64_ERR],sigcontext->uc_mcontext.gregs[X64_RIP], getAddrFunctionName(sigcontext->uc_mcontext.gregs[X64_RIP]), (void*)sigcontext->uc_mcontext.gregs[X64_RBP], (void*)sigcontext->uc_mcontext.gregs[X64_RSP], (void*)sigcontext->uc_mcontext.gregs[X64_RBX], prot, mmapped);
     #ifdef DYNAREC
     if(sig==3)
         SerializeAllMapping();  // Signal Interupt: it's a good time to serialize the mappings if needed
@@ -1103,20 +1108,43 @@ void my_box64signalhandler(int32_t sig, siginfo_t* info, void * ucntx)
     // immediate retry and won't fault again; if an addr recurs >=2 times we bail (leave MAPERR → forward to
     // guest), so a wrongly-grabbed fault is never swallowed. NOTE: the deep "phasic" save/crash bug is
     // SEPARATE (present even in baseline; reset by reboot) — this fix only addresses the false-MAPERR class.
-    if((sig==X64_SIGSEGV) && addr && (info->si_code == SEGV_MAPERR)
-        && ((prot & (PROT_DYNAREC|PROT_DYNAREC_R)) || (getMmapped((uintptr_t)addr) && (prot & PROT_EXEC)))) {
-        static __thread uintptr_t rd_rc_addr[8]; static __thread uint8_t rd_rc_cnt[8]; static __thread int rd_rc_n;
-        uintptr_t a = (uintptr_t)addr;
-        int slot = -1;
-        for(int i=0;i<8;i++) if(rd_rc_addr[i]==a){ slot=i; break; }
-        if(slot<0){ slot = (rd_rc_n++)&7; rd_rc_addr[slot]=a; rd_rc_cnt[slot]=0; }
-        if(rd_rc_cnt[slot] < 2) {
-            rd_rc_cnt[slot]++;
+    // RimDroid 2026-07-18: split by certainty (Codex hypothesis + a710/SM6450 logs).
+    //  * PROT_DYNAREC/_R page: box64 OWNS it and write-protected it for SMC detection, and the guest
+    //    prot still carries PROT_WRITE (0x87), so a write fault here is UNAMBIGUOUSLY self-modifying
+    //    code and a MAPERR is definitely a kernel misreport — reclassify EVERY time, NO count limit.
+    //    Mono legitimately backpatches the SAME JIT address repeatedly (libmono+0x111610
+    //    `lock cmpxchg [rbx-4]` into a prot=0x87 page). The old 2-hit cap turned the 3rd backpatch of
+    //    one address into a fatal fake SIGSEGV = the RimWorld-1.6 def-load / XML-load crash on
+    //    false-MAPERR kernels (SAME fatal RIP from BOTH Parallel.ForEach AND serial XmlTextReaderImpl
+    //    => shared SMC mechanism, not the parallel path). Unprotect+retry always makes progress, so
+    //    removing the cap here cannot loop (HotPage handles pathological repeats).
+    //  * getMmapped && PROT_EXEC but NOT PROT_DYNAREC: broader heuristic where a wrongly-grabbed fault
+    //    is possible → KEEP the 2-hit-per-address cap as a safety valve, and LOG when it rejects so we
+    //    can tell whether this heuristic ever turns a crash fatal.
+    if((sig==X64_SIGSEGV) && addr && (info->si_code == SEGV_MAPERR)) {
+        int rd_is_dynarec   = (prot & (PROT_DYNAREC|PROT_DYNAREC_R)) != 0;
+        int rd_is_execmapped= getMmapped((uintptr_t)addr) && (prot & PROT_EXEC);
+        if(rd_is_dynarec) {
             static int rd_reclass_logged = 0;
             if(!rd_reclass_logged) { rd_reclass_logged = 1;
-                printf_log(LOG_NONE, "[RD] false-MAPERR fix ACTIVE (first hit %p prot=0x%x)\n", (void*)addr, prot);
+                printf_log(LOG_NONE, "[RD] false-MAPERR fix ACTIVE (dynarec page, first hit %p prot=0x%x)\n", (void*)addr, prot);
             }
-            info->si_code = SEGV_ACCERR;
+            info->si_code = SEGV_ACCERR;   // no limit — unambiguous SMC on a box64-owned page
+        } else if(rd_is_execmapped) {
+            static __thread uintptr_t rd_rc_addr[8]; static __thread uint8_t rd_rc_cnt[8]; static __thread int rd_rc_n;
+            uintptr_t a = (uintptr_t)addr;
+            int slot = -1;
+            for(int i=0;i<8;i++) if(rd_rc_addr[i]==a){ slot=i; break; }
+            if(slot<0){ slot = (rd_rc_n++)&7; rd_rc_addr[slot]=a; rd_rc_cnt[slot]=0; }
+            if(rd_rc_cnt[slot] < 2) {
+                rd_rc_cnt[slot]++;
+                info->si_code = SEGV_ACCERR;
+            } else {
+                static int rd_cap_logged = 0;
+                if(!rd_cap_logged) { rd_cap_logged = 1;
+                    printf_log(LOG_NONE, "[RD] false-MAPERR CAP hit (exec page %p prot=0x%x forwarded to guest as fatal)\n", (void*)addr, prot);
+                }
+            }
         }
     }
     if((Locks & is_dyndump_locked) && ((sig==X64_SIGSEGV) || (sig==X64_SIGBUS)) && current_helper && fillblock_active) {
