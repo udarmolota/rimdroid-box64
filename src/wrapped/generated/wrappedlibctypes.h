@@ -137,6 +137,14 @@ typedef void* (*pFpLiiil_t)(void*, uintptr_t, int32_t, int32_t, int32_t, intptr_
 typedef int32_t (*iFpippppp_t)(void*, int32_t, void*, void*, void*, void*, void*);
 typedef int32_t (*iFppipppp_t)(void*, void*, int32_t, void*, void*, void*, void*);
 
+#if defined(HAVE_LD80BITS) || defined(ANDROID)
+typedef long double (*DFpp_t)(void*, void*);
+typedef int32_t (*iFpLpD_t)(void*, uintptr_t, void*, long double);
+#else // !HAVE_LD80BITS && !ANDROID
+typedef double (*DFpp_t)(void*, void*);
+typedef int32_t (*iFpLpD_t)(void*, uintptr_t, void*, double);
+#endif
+
 #define SUPER() ADDED_FUNCTIONS() \
 	GO(_Jv_RegisterClasses, vFv_t) \
 	GO(__cxa_pure_virtual, vFv_t) \
@@ -231,6 +239,7 @@ typedef int32_t (*iFppipppp_t)(void*, void*, int32_t, void*, void*, void*, void*
 	GO(vwprintf, iFpA_t) \
 	GO(vwscanf, iFpA_t) \
 	GO(_IO_file_stat, iFSp_t) \
+	GO(strtof128, DFpp_t) \
 	GO(__sysv_signal, pFip_t) \
 	GO(bsd_signal, pFip_t) \
 	GO(signal, pFip_t) \
@@ -359,6 +368,7 @@ typedef int32_t (*iFppipppp_t)(void*, void*, int32_t, void*, void*, void*, void*
 	GO(__fprintf_chk, iFpipV_t) \
 	GO(__fwprintf_chk, iFpipV_t) \
 	GO(__vfwprintf_chk, iFpipA_t) \
+	GO(strfromf128, iFpLpD_t) \
 	GO(ppoll, iFpLpp_t) \
 	GO(__snprintf, iFpLpV_t) \
 	GO(snprintf, iFpLpV_t) \

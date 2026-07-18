@@ -5589,6 +5589,8 @@ wrappedlibc:
   - vwscanf
 - iFSp:
   - _IO_file_stat
+- DFpp:
+  - strtof128
 - pFip:
   - __sysv_signal
   - bsd_signal
@@ -5772,6 +5774,8 @@ wrappedlibc:
   - __fwprintf_chk
 - iFpipA:
   - __vfwprintf_chk
+- iFpLpD:
+  - strfromf128
 - iFpLpp:
   - ppoll
 - iFpLpV:

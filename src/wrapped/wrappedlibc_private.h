@@ -1767,7 +1767,13 @@ GOW(sched_setscheduler, iFiip)
 GO(__sched_yield, iFv)
 GOW(sched_yield, iFv)
 GO2(__secure_getenv, pFp, getenv)   // not always present
+#ifdef ANDROID
+// bionic has no secure_getenv.  Map it explicitly instead of leaving the weak
+// native lookup unresolved when an emulated glibc libstdc++ is loaded RTLD_NOW.
+GO2(secure_getenv, pFp, getenv)
+#else
 GOW(secure_getenv, pFp)
+#endif
 GO(seed48, pFp)
 GOW(seed48_r, iFpp)
 GO(seekdir, vFpl)
@@ -1996,7 +2002,12 @@ GO(strfmon, lFpLpdddddd)        // should be V, but only double are allowed...
 GOW(strfmon_l, lFpLppdddddd)    // should be V, but only double are allowed...
 GO(strfromd, iFpLpd)
 GO(strfromf, iFpLpf)
+#ifdef ANDROID
+// bionic exposes neither strfromf128 nor the glibc strfromf64 alias.
+GOM(strfromf128, iFpLpD)
+#else
 GOD(strfromf128, iFpLpD, strfromf64)
+#endif
 GO(strfromf32, iFpLpf)
 GO(strfromf32x, iFpLpd)
 GO(strfromf64, iFpLpd)
@@ -2042,7 +2053,13 @@ GO(__strtod_l, dFppp)
 GOW(strtod_l, dFppp)
 //GO(__strtod_nan, 
 GO(strtof, fFpp)
+#ifdef ANDROID
+// bionic has no strtof128/strtof64.  Keep the Android float128 ABI intact and
+// parse through the C-standard strtold entry point in our adapter.
+GOM(strtof128, DFpp)
+#else
 GOD(strtof128, DFpp, strtof64)
+#endif
 //GO(__strtof128_internal, 
 //GOW(strtof128_l, 
 //GO(__strtof128_nan, 

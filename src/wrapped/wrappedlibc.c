@@ -5341,6 +5341,23 @@ EXPORT char* secure_getenv(const char* name)
     return getenv(name);
 }
 
+#ifdef ANDROID
+EXPORT int my_strfromf128(char* dst, size_t size, const char* format,
+                          long double value)
+{
+    // strfrom* accepts the same conversion specification as printf, without a
+    // length modifier.  bionic lacks the glibc float128 entry point; formatting
+    // as double is sufficient for libstdc++'s fallback diagnostics and avoids
+    // feeding a long-double argument to a format that deliberately has no 'L'.
+    return snprintf(dst, size, format, (double)value);
+}
+
+EXPORT long double my_strtof128(const char* str, char** endptr)
+{
+    return strtold(str, endptr);
+}
+#endif
+
 #ifdef STATICBUILD
 #include "libtools/static_libc.h"
 #endif
