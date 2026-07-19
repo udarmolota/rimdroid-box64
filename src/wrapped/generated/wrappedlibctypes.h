@@ -50,6 +50,7 @@ typedef void (*vFipV_t)(int32_t, void*, ...);
 typedef void (*vFipA_t)(int32_t, void*, va_list);
 typedef void (*vFpii_t)(void*, int32_t, int32_t);
 typedef void (*vFpup_t)(void*, uint32_t, void*);
+typedef void (*vFpLL_t)(void*, uintptr_t, uintptr_t);
 typedef void (*vFppL_t)(void*, void*, uintptr_t);
 typedef void (*vFppV_t)(void*, void*, ...);
 typedef int32_t (*iFiiu_t)(int32_t, int32_t, uint32_t);
@@ -178,12 +179,14 @@ typedef int32_t (*iFpLpD_t)(void*, uintptr_t, void*, double);
 	GO(__ctype_b_loc, pFv_t) \
 	GO(__ctype_tolower_loc, pFv_t) \
 	GO(__ctype_toupper_loc, pFv_t) \
+	GO(get_current_dir_name, pFv_t) \
 	GO(_ZGTtnaX, pFL_t) \
 	GO(_ZGTtnam, pFL_t) \
 	GO(__deregister_frame_info, pFp_t) \
 	GO(__duplocale, pFp_t) \
 	GO(__strdup, pFp_t) \
 	GO(__uselocale, pFp_t) \
+	GO(canonicalize_file_name, pFp_t) \
 	GO(duplocale, pFp_t) \
 	GO(getenv, pFp_t) \
 	GO(mallinfo, pFp_t) \
@@ -261,6 +264,7 @@ typedef int32_t (*iFpLpD_t)(void*, uintptr_t, void*, double);
 	GO(vsyslog, vFipA_t) \
 	GO(backtrace_symbols_fd, vFpii_t) \
 	GO(_ITM_addUserCommitAction, vFpup_t) \
+	GO(__explicit_bzero_chk, vFpLL_t) \
 	GO(_ITM_memcpyRnWt, vFppL_t) \
 	GO(_ITM_memcpyRtWn, vFppL_t) \
 	GO(argp_error, vFppV_t) \

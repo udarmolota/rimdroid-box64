@@ -93,7 +93,13 @@ GOW(c32rtomb, LFpup)
 GOW(calloc, pFLL)
 //GOM(callrpc, iFpiiipppp)
 //GO(__call_tls_dtors, vFv)
+#ifdef ANDROID
+// bionic lacks this glibc convenience function.  Keep box64's /proc/self/exe
+// handling by routing it through the emulation-aware realpath wrapper.
+GOM(canonicalize_file_name, pFEp)
+#else
 GOW(canonicalize_file_name, pFp)
+#endif
 GO(capget, iFpp)
 GO(capset, iFpp)
 GO(catclose, iFp)
@@ -354,7 +360,12 @@ GOM(_exit, vFEi)
 GOM(exit, vFEi)
 GOW(_Exit, vFi)
 GO(explicit_bzero, vFpL)
+#ifdef ANDROID
+// bionic does not export glibc's fortified entry point.
+GOM(__explicit_bzero_chk, vFpLL)
+#else
 GO(__explicit_bzero_chk, vFpLL)
+#endif
 GO(faccessat, iFipii)
 GOW(fallocate, iFiill)
 GO(fallocate64, iFiiII)
@@ -549,7 +560,12 @@ GO(getchar_unlocked, iFv)
 GOWM(getcontext, iFEp)
 GOW(getcpu, iFpp)
 GOW(getc_unlocked, iFS)
+#ifdef ANDROID
+// GNU extension absent from bionic; the adapter returns a malloc-owned path.
+GOM(get_current_dir_name, pFv)
+#else
 GO(get_current_dir_name, pFv)
+#endif
 GO(getcwd, pFpL)
 GO(__getcwd_chk, pFpLL)
 GO(getdate, pFp)

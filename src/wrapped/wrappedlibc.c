@@ -4031,10 +4031,14 @@ EXPORT int32_t my_setjmp(x64emu_t* emu, /*struct __jmp_buf_tag __env[1]*/void *p
     return  my___sigsetjmp(emu, p, 1);
 }
 
-EXPORT void my___explicit_bzero_chk(x64emu_t* emu, void* dst, uint32_t len, uint32_t dstlen)
+EXPORT void my___explicit_bzero_chk(void* dst, size_t len, size_t dstlen)
 {
-    (void)emu; (void)dstlen;
-    memset(dst, 0, len);
+    if(len > dstlen)
+        abort();
+
+    volatile unsigned char* p = (volatile unsigned char*)dst;
+    while(len--)
+        *p++ = 0;
 }
 
 EXPORT void* my_realpath(x64emu_t* emu, void* path, void* resolved_path)
@@ -4044,6 +4048,37 @@ EXPORT void* my_realpath(x64emu_t* emu, void* path, void* resolved_path)
     }
     return realpath(path, resolved_path);
 }
+
+#ifdef ANDROID
+EXPORT void* my_canonicalize_file_name(x64emu_t* emu, void* path)
+{
+    return my_realpath(emu, path, NULL);
+}
+
+EXPORT char* my_get_current_dir_name(void)
+{
+    size_t size = 256;
+    for(;;) {
+        char* path = (char*)malloc(size);
+        if(!path)
+            return NULL;
+        if(getcwd(path, size))
+            return path;
+
+        int error = errno;
+        free(path);
+        if(error != ERANGE) {
+            errno = error;
+            return NULL;
+        }
+        if(size > SIZE_MAX / 2) {
+            errno = ENOMEM;
+            return NULL;
+        }
+        size *= 2;
+    }
+}
+#endif
 
 EXPORT int my_readlinkat(x64emu_t* emu, int fd, void* path, void* buf, size_t bufsize)
 {

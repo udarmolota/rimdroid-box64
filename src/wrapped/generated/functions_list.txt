@@ -5511,6 +5511,7 @@ wrappedlibc:
   - __ctype_b_loc
   - __ctype_tolower_loc
   - __ctype_toupper_loc
+  - get_current_dir_name
 - pFL:
   - _ZGTtnaX
   - _ZGTtnam
@@ -5519,6 +5520,7 @@ wrappedlibc:
   - __duplocale
   - __strdup
   - __uselocale
+  - canonicalize_file_name
   - duplocale
   - getenv
   - mallinfo
@@ -5621,6 +5623,8 @@ wrappedlibc:
   - backtrace_symbols_fd
 - vFpup:
   - _ITM_addUserCommitAction
+- vFpLL:
+  - __explicit_bzero_chk
 - vFppL:
   - _ITM_memcpyRnWt
   - _ITM_memcpyRtWn
