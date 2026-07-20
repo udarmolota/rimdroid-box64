@@ -1860,9 +1860,26 @@ EXPORT int my___xmknodat(x64emu_t* emu, int v, int dirfd, char* path, uint32_t m
     return mknodat(dirfd, (const char*)path, mode, *dev);
 }
 
+// RIMDROID: MonoMod.Core (bundled in Harmony 2.3+) decides the guest OS is "Android" when
+// BOTH /data and /system/build.prop exist, then throws NotImplementedException from its
+// stubbed Android-x86_64 native-detour backend — stock Harmony cannot patch anything.
+// The guest is a plain Linux x86_64 program with no legitimate use for Android's
+// build.prop, so hide that ONE exact path from the emulated world: with it gone MonoMod
+// detects "Linux x86_64" and takes its long-proven detour path. Companion to the
+// /proc/self/auxv AT_PLATFORM spoof (CreateAuxvFile) that covers the architecture half
+// of the same detection.
+static int isAndroidHiddenPath(const char* path)
+{
+    return path && !strcmp(path, "/system/build.prop");
+}
+
 EXPORT int my___xstat(x64emu_t* emu, int v, void* path, void* buf)
 {
     (void)emu; (void)v;
+    if(isAndroidHiddenPath((const char*)path)) {
+        errno = ENOENT;
+        return -1;
+    }
     struct stat64 st;
     int r = stat64((const char*)path, buf?&st:buf);
     if(buf && !r)
@@ -1874,6 +1891,10 @@ EXPORT int my___xstat64(x64emu_t* emu, int v, void* path, void* buf) __attribute
 EXPORT int my___lxstat(x64emu_t* emu, int v, void* name, void* buf)
 {
     (void)emu; (void)v;
+    if(isAndroidHiddenPath((const char*)name)) {
+        errno = ENOENT;
+        return -1;
+    }
     struct stat64 st;
     int r = lstat64((const char*)name, buf?&st:buf);
     if(buf && !r)
@@ -1885,6 +1906,10 @@ EXPORT int my___lxstat64(x64emu_t* emu, int v, void* name, void* buf) __attribut
 EXPORT int my___fxstatat(x64emu_t* emu, int v, int d, void* path, void* buf, int flags)
 {
     (void)emu; (void)v;
+    if(isAndroidHiddenPath((const char*)path)) {   // absolute path ignores dirfd anyway
+        errno = ENOENT;
+        return -1;
+    }
     struct  stat64 st;
     int r = fstatat64(d, path, &st, flags);
     if(!r)
@@ -1896,6 +1921,10 @@ EXPORT int my___fxstatat64(x64emu_t* emu, int v, int d, void* path, void* buf, i
 EXPORT int my_stat(x64emu_t *emu, void* filename, void* buf)
 {
     (void)emu;
+    if(isAndroidHiddenPath((const char*)filename)) {
+        errno = ENOENT;
+        return -1;
+    }
     struct stat st;
     int r = stat(filename, &st);
     if(!r)
@@ -1907,6 +1936,10 @@ EXPORT int my_stat64(x64emu_t *emu, void* filename, void* buf) __attribute__((al
 EXPORT int my_lstat(x64emu_t *emu, void* filename, void* buf)
 {
     (void)emu;
+    if(isAndroidHiddenPath((const char*)filename)) {
+        errno = ENOENT;
+        return -1;
+    }
     struct stat st;
     int r = lstat(filename, &st);
     if(!r)
@@ -2584,6 +2617,10 @@ static void CreateAuxvFile(int fd, uintptr_t* auxv)
 
 EXPORT int32_t my_open(x64emu_t* emu, void* pathname, int32_t flags, uint32_t mode)
 {
+    if(isAndroidHiddenPath((const char*)pathname)) {
+        errno = ENOENT;
+        return -1;
+    }
     if(isProcSelf((const char*) pathname, "cmdline")) {
         // special case for self command line...
         #if 0
@@ -2735,6 +2772,10 @@ EXPORT int32_t my___open(x64emu_t* emu, void* pathname, int32_t flags, uint32_t 
 
 EXPORT int32_t my_open64(x64emu_t* emu, void* pathname, int32_t flags, uint32_t mode)
 {
+    if(isAndroidHiddenPath((const char*)pathname)) {
+        errno = ENOENT;
+        return -1;
+    }
     if(isProcSelf((const char*)pathname, "cmdline")) {
         // special case for self command line...
         #if 0
@@ -2834,6 +2875,10 @@ EXPORT int32_t my_open64(x64emu_t* emu, void* pathname, int32_t flags, uint32_t 
 
 EXPORT FILE* my_fopen64(x64emu_t* emu, const char* path, const char* mode)
 {
+    if(isAndroidHiddenPath(path)) {
+        errno = ENOENT;
+        return NULL;
+    }
     if(isProcSelf((const char*)path, "cmdline")) {
         int tmp = shm_open(TMP_CMDLINE, O_RDWR | O_CREAT, S_IRWXU);
         if(tmp<0) return fopen64(path, mode);
