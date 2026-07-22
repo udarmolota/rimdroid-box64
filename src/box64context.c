@@ -462,13 +462,22 @@ int AddElfHeader(box64context_t* ctx, elfheader_t* head) {
             // and makes stale readers see valid memory instead of racing a free.
             elfheader_t** newelfs = (elfheader_t**)box_calloc(ctx->elfcap + 16, sizeof(elfheader_t*));
             memcpy(newelfs, ctx->elfs, sizeof(elfheader_t*) * ctx->elfcap);
+            newelfs[idx] = head;   // fill the new slot BEFORE readers can see the array
             ctx->elfcap += 16;
             __atomic_store_n(&ctx->elfs, newelfs, __ATOMIC_RELEASE);
+        } else {
+            __atomic_store_n(&ctx->elfs[idx], head, __ATOMIC_RELEASE);
         }
-        ctx->elfs[idx] = head;
-        ctx->elfsize++;
+        // Slot first, size LAST (release) — paired with the acquire loads in my___tls_get_addr.
+        // The old plain `elfs[idx]=head; elfsize++` could be observed reordered on ARM: a reader
+        // saw the grown elfsize but a still-NULL slot, and since GetTLSBase(NULL) returns 0 it
+        // was handed a wrong-but-mapped TLS address = SILENT thread-local corruption (crashes
+        // far downstream: GC_mark_from, driver, destroyed mutexes; Poco X5 __tls_get_addr SEGV).
+        __atomic_store_n(&ctx->elfsize, ctx->elfsize + 1, __ATOMIC_RELEASE);
     } else {
-        ctx->elfs[idx] = head;
+        // Refilling a NULL hole (a slot RemoveElfHeader cleared) inside the already-published
+        // range: release so a reader that sees the pointer also sees the header's contents.
+        __atomic_store_n(&ctx->elfs[idx], head, __ATOMIC_RELEASE);
     }
     printf_log(LOG_DEBUG, "Adding \"%s\" as #%d in elf collection\n", ElfName(head), idx);
     return idx;

@@ -24,13 +24,21 @@ typedef struct my_tls_s {
 EXPORT void* my___tls_get_addr(x64emu_t* emu, void* p)
 {
     my_tls_t *t = (my_tls_t*)p;
-    // RimDroid: the RimWorld 1.6 save crash is a SEGV inside this wrapper — a garbage
-    // descriptor (or module index) arrives from the guest. Validate before dereferencing
-    // and log the guest caller: a Mono-JIT caller address = the known dynarec corruption
-    // family; a libc/loader caller = a box64 TLS infra bug (the save runs on RimWorld's
-    // freshly spawned Saver thread). Capped, always-on (LOG_NONE).
+    // RimDroid: this wrapper races AddElfHeader/RemoveElfHeader — they publish elfs[]/elfsize
+    // from a dlopen'ing thread while other guest threads resolve TLS here. Acquire-load the
+    // size, the array and the slot (paired with AddElfHeader's release stores): with the old
+    // plain reads an ARM reader could see the bumped elfsize but a still-NULL slot, and since
+    // GetTLSBase(NULL)==0 the guest got a wrong-but-mapped TLS address = silent thread-local
+    // corruption (Poco X5 SEGV in this wrapper; suspected root of downstream GC/driver crashes).
+    // A garbage descriptor from the guest (the older crash family) is still guarded too.
+    // Capped, always-on (LOG_NONE).
     int p_readable = ((uintptr_t)p >= 0x10000) && !((uintptr_t)p & 0x7);
-    if (!p_readable || t->i >= (unsigned long)my_context->elfsize) {
+    elfheader_t* h = NULL;
+    if (p_readable && t->i < (unsigned long)__atomic_load_n(&my_context->elfsize, __ATOMIC_ACQUIRE)) {
+        elfheader_t** elfs = __atomic_load_n(&my_context->elfs, __ATOMIC_ACQUIRE);
+        h = __atomic_load_n(&elfs[t->i], __ATOMIC_ACQUIRE);
+    }
+    if (!p_readable || !h) {
         static int rd_tlsbad_n = 0;
         if (rd_tlsbad_n < 16) {
             rd_tlsbad_n++;
@@ -39,9 +47,10 @@ EXPORT void* my___tls_get_addr(x64emu_t* emu, void* p)
                 my_context->elfsize, (void*)R_RIP, getAddrFunctionName(R_RIP));
             fflush(NULL);
         }
-        // For a decodable-but-out-of-range index keep the process alive on a scratch slot
-        // so the save path can be observed further (the caller was doomed either way);
-        // an unreadable p still falls through to the original crash.
+        // Out-of-range index or a NULL slot (mid-add race window / dlclose'd module): keep the
+        // process alive on a zeroed scratch slot instead of handing out a wrong TLS address.
+        // An unreadable p still falls through to the original crash (nothing to salvage; the
+        // log above is the diagnostic).
         if (p_readable) {
             static __thread char rd_tls_scratch[512];
             memset(rd_tls_scratch, 0, sizeof(rd_tls_scratch));
@@ -49,11 +58,14 @@ EXPORT void* my___tls_get_addr(x64emu_t* emu, void* p)
         }
     }
     tlsdatasize_t* ptr = emu->tlsdata;
-    if (!ptr) {
+    // Refresh a STALE per-thread block, not only a missing one: after a dlopen grew the TLS
+    // area this thread's block predates the new module, so data + (its negative tlsbase) + o
+    // would land OUTSIDE the block. refreshTLSData resizes when context->tlssize changed.
+    if (!ptr || ptr->tlssize != my_context->tlssize) {
         refreshTLSData(emu);
         ptr = emu->tlsdata;
     }
-    return ptr->data+GetTLSBase(my_context->elfs[t->i])+t->o;
+    return ptr->data+GetTLSBase(h)+t->o;
 }
 
 EXPORT void* my___libc_stack_end;
