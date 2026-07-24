@@ -2913,6 +2913,28 @@ uintptr_t dynarec64_00(dynarec_arm_t* dyn, uintptr_t addr, uintptr_t ip, int nin
                     STRw_U12(x1, xEmu, offsetof(x64emu_t, quit));
                     *ok = 0;
                     *need_epilog = 1;
+                } else if(!BridgeFncSettled(addr+8)) {
+                    // RimDroid: w!=0 but the slot's fnc is still 0 even after resyncing on
+                    // mutex_bridge => a genuinely broken slot. NEVER fall through to the
+                    // emission below: call_n dereferences fnc here, at COMPILE time, and would
+                    // bake `BLR 0` into this block permanently (SIGSEGV, native pc=0, guest RIP
+                    // at slot+0x13). The generic int3 path is no better — it calls w(emu, 0).
+                    // DEFAULT ends the block BEFORE this instruction (with the per-pass size
+                    // bookkeeping) and emits nothing. At a block start that yields an empty
+                    // cached block, so this address is served by the interpreter from then on —
+                    // which is the point: x64Int3 re-reads w and f at RUN time, on every
+                    // execution, instead of baking either. An interpreted bridge dispatches
+                    // correctly (and picks the target up if the slot settles later); a baked
+                    // `BLR 0` never can. The cost is one permanently interpreted 32-byte slot.
+                    // Since AddBridge2 builds slots before publishing them, this is dead code
+                    // unless something regresses — hence the always-on, capped log.
+                    static int rd_bridge0_n = 0;
+                    if(rd_bridge0_n < 16) {
+                        rd_bridge0_n++;
+                        printf_log(LOG_NONE, "RIMDROID BRIDGE0 slot=%p w=%p fnc=0 ip=%p (%s) — block ended, no BLR 0 emitted\n",
+                            (void*)(addr-3), *(void**)addr, (void*)ip, GetBridgeName((void*)ip)?:"???");
+                    }
+                    DEFAULT;
                 } else {
                     MESSAGE(LOG_DUMP, "Native Call to %s\n", GetBridgeName((void*)ip) ?: GetNativeName(GetNativeFnc(ip), 1));
                     x87_stackcount(dyn, ninst, x1);

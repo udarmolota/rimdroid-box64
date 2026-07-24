@@ -116,20 +116,30 @@ uintptr_t AddBridge2(bridge_t* bridge, wrapper_t w, void* fnc, void* fnc2, int N
     }
     sz = b->sz;
     b->sz++;
-    // add bridge to map, for fast recovery
-    khint128_t key = (uintptr_t)fnc | (khint128_t)((uintptr_t)fnc2)<<64;
-    khint_t k = kh_put(bridgemap, bridge->bridgemap, key, &ret);
-    kh_value(bridge->bridgemap, k) = (uintptr_t)&b->b[sz].CC;
-    mutex_unlock(&my_context->mutex_bridge);
-
-    b->b[sz].CC = 0xCC;
-    b->b[sz].S = 'S'; b->b[sz].C='C';
+    // Build the slot COMPLETELY before anything can find it, and publish it only afterwards.
+    // The old order (publish into bridgemap, unlock, THEN fill) left a window where another
+    // thread could reach a half-built slot: brick memory is fresh MAP_ANONYMOUS, so every
+    // not-yet-written field reads as 0. The dangerous state is w!=0 with f still 0 — the
+    // dynarec accepts that as a valid bridge, DEREFERENCES f at COMPILE time and bakes the
+    // value into the generated block (call_n -> TABLE64_/BLR), so a transient 0 was baked as
+    // a PERMANENT `BLR 0`: SIGSEGV with native pc=0, guest RIP parked at slot+0x13 (the C3).
+    // Payload first, signature next, and the CC entry byte LAST behind a release fence, so a
+    // direct reader cannot recognise a slot that is not fully built either.
     b->b[sz].w = w;
     b->b[sz].f = (uintptr_t)fnc;
     b->b[sz].C3 = N?0xC2:0xC3;
     b->b[sz].N = N;
     b->b[sz].func = fnc2?1:0;
     b->b[sz].name_or_func = fnc2?fnc2:(void*)name;
+    b->b[sz].S = 'S'; b->b[sz].C='C';
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    b->b[sz].CC = 0xCC;
+    // add bridge to map, for fast recovery — still under the lock: kh_put can rehash the
+    // table, and CheckBridged/CheckBridged2 read it under this same mutex.
+    khint128_t key = (uintptr_t)fnc | (khint128_t)((uintptr_t)fnc2)<<64;
+    khint_t k = kh_put(bridgemap, bridge->bridgemap, key, &ret);
+    kh_value(bridge->bridgemap, k) = (uintptr_t)&b->b[sz].CC;
+    mutex_unlock(&my_context->mutex_bridge);
 
     return (uintptr_t)&b->b[sz].CC;
 }
@@ -139,23 +149,47 @@ uintptr_t AddBridge(bridge_t* bridge, wrapper_t w, void* fnc, int N, const char*
     return AddBridge2(bridge, w, fnc, NULL, N, name);
 }
 
+// The bridgemap lookups run under mutex_bridge, the same lock AddBridge2 holds: kh_put can
+// rehash/resize the table, so an unlocked kh_get could walk a map that is being rebuilt. It
+// also pairs with AddBridge2 publishing a slot address only once the slot is fully built.
+// Deadlock-safe: no holder of mutex_bridge (AddBridge2 / AddAltJump / AddVSyscall) calls
+// these, and AddCheckBridge* call check-then-add sequentially, never nested — which matters
+// because the mutex is PTHREAD_MUTEX_ERRORCHECK, i.e. NOT recursive.
 uintptr_t CheckBridged(bridge_t* bridge, void* fnc)
 {
     // check if function alread have a bridge (the function wrapper will not be tested)
+    mutex_lock(&my_context->mutex_bridge);
     khint_t k = kh_get(bridgemap, bridge->bridgemap, (uintptr_t)fnc);
-    if(k==kh_end(bridge->bridgemap))
-        return 0;
-    return kh_value(bridge->bridgemap, k);
+    uintptr_t ret = (k==kh_end(bridge->bridgemap))?0:kh_value(bridge->bridgemap, k);
+    mutex_unlock(&my_context->mutex_bridge);
+    return ret;
 }
 
 uintptr_t CheckBridged2(bridge_t* bridge, void* fnc, void* fnc2)
 {
     // check if function alread have a bridge (the function wrapper will not be tested)
     khint128_t key = (uintptr_t)fnc | (khint128_t)((uintptr_t)fnc2)<<64;
+    mutex_lock(&my_context->mutex_bridge);
     khint_t k = kh_get(bridgemap, bridge->bridgemap, key);
-    if(k==kh_end(bridge->bridgemap))
-        return 0;
-    return kh_value(bridge->bridgemap, k);
+    uintptr_t ret = (k==kh_end(bridge->bridgemap))?0:kh_value(bridge->bridgemap, k);
+    mutex_unlock(&my_context->mutex_bridge);
+    return ret;
+}
+
+// Belt-and-braces for the dynarec, which dereferences a bridge slot's `f` at COMPILE time and
+// bakes the value into the generated block: a transient 0 would become a permanent `BLR 0`
+// (SIGSEGV, native pc=0). AddBridge2 now builds slots under mutex_bridge before publishing
+// them, so this cannot happen through the bridgemap any more; blocking on the same mutex here
+// additionally guarantees that any in-flight fill has finished before we re-read. Returns the
+// function address, or 0 if the slot really is broken — w!=0 together with f==0 is never
+// legitimate (AddCheckBridge rejects `!fnc && w` up front), so 0 here means "do not emit".
+uintptr_t BridgeFncSettled(uintptr_t pfnc)
+{
+    uintptr_t f = *(uintptr_t*)pfnc;
+    if(f) return f;
+    mutex_lock(&my_context->mutex_bridge);
+    mutex_unlock(&my_context->mutex_bridge);
+    return *(uintptr_t*)pfnc;
 }
 
 uintptr_t AddCheckBridge(bridge_t* bridge, wrapper_t w, void* fnc, int N, const char* name)
