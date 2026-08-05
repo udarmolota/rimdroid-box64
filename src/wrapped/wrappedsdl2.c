@@ -278,6 +278,21 @@ static int rd_gl_oplog_on(void) {
     return 1;
 }
 #define RD_OPLOG(...) do { if (rd_gl_oplog_on()) { printf_log(LOG_NONE, __VA_ARGS__); fflush(NULL); } } while(0)
+// GL diagnostics gate (2026-08-05): the draw/dispatch/mipmap/program wrappers exist ONLY for the
+// device-lost op-log hunts, and the periodic "cumulative" prints (+fflush) fired every ~2s of
+// normal gameplay through the per-frame present blit. Release runs with all of that OFF —
+// RIMDROID_GL_DIAG=1 (extra env) brings the full instrumentation back for a hunt. Functional
+// shims (upload/copy pacing, BC shader transforms, sync coalescing, texture shrink) are NOT
+// behind this gate — they are fixes, not diagnostics.
+static int rd_gl_diag_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("RIMDROID_GL_DIAG");
+        on = (e && e[0] == '1') ? 1 : 0;
+        if (on) { printf_log(LOG_NONE, "RIMDROID GL_DIAG enabled: draw wrappers + cumulative prints on\n"); fflush(NULL); }
+    }
+    return on;
+}
 static void (*p_rd_real_glBufferStorage)(uint32_t,int64_t,const void*,uint32_t) = NULL;
 static void (*p_rd_real_glBufferData)(uint32_t,int64_t,const void*,uint32_t) = NULL;
 static void (*p_rd_real_glBufferSubData)(uint32_t,int64_t,int64_t,const void*) = NULL;
@@ -376,12 +391,213 @@ static void rd_tex_account(uint32_t ifmt, int32_t levels, int32_t w, int32_t h) 
     if (levels > 1) sz = sz * 4 / 3;
     uint64_t before = rd_tex_total / (256ull*1024*1024);
     rd_tex_total += sz;
-    if (rd_tex_total / (256ull*1024*1024) != before)
+    if (rd_gl_diag_on() && rd_tex_total / (256ull*1024*1024) != before)
         { printf_log(LOG_NONE, "RIMDROID GLSANITY cumulative tex=%lluMB calls=%llu buf=%lluMB bufcalls=%llu rb=%lluMB\n", (unsigned long long)(rd_tex_total/1048576), (unsigned long long)rd_tex_calls, (unsigned long long)(rd_buf_total/1048576), (unsigned long long)rd_buf_calls, (unsigned long long)(rd_rb_total/1048576)); fflush(NULL); }
     rd_upload_pace(sz);
 }
+// ---- RimDroid texture shrink (our LIBGL_SHRINK, 2026-07-29) -----------------------------------
+// RimWorld ships PC-sized textures with FULL mip chains (GLSANITY on devices: glTexStorage2D
+// levels=12 ifmt=DXT1/DXT5 2048x2048 during the 1.6 atlas bake, >1GB uploaded in one frame).
+// On a phone screen the top level is wasted sharpness, and on 6GB devices with DLC it is the
+// difference between loading and the OOM-killer. Halving every mipped 2D texture cuts texture
+// memory AND upload volume x4 — with NO recompression: the game already supplies every smaller
+// mip, so we allocate (w/2, h/2, levels-1), DROP the level-0 upload and forward level N as N-1.
+// Only immutable-storage GL_TEXTURE_2D with levels>=2 and a side >=1024 is touched: render
+// targets and Unity's dynamic font/UI atlases are levels==1 and stay bit-exact (UI text safe).
+// Gated by RIMDROID_TEX_SHRINK=1 (launcher: per-instance "Texture quality: Half").
+// RimDroid-fork-only shim — never send upstream (box64's AGENTS.md forbids AI-authored PRs).
+#define RD_GL_TEXTURE_2D 0x0DE1u
+#define RD_SHRINK_MAX_ID 65536u   /* map covers GL names < 64K; bigger ids just never shrink */
+/* Per-texture MIP SHIFT (0 = untouched, 1 = top level dropped, 2 = two levels dropped). A value,
+ * not a bool, so a deeper low-memory tier is one env change away; today only 0/1 ship (shift 2 is
+ * dormant until RIMDROID_TEX_SHRINK=2 is set explicitly). 64KB of .bss. */
+static uint8_t rd_shrink_shift[RD_SHRINK_MAX_ID];
+/* GL texture bindings are PER TEXTURE UNIT (glActiveTexture selects the unit; glBindTexture binds
+ * into it). A single "last bound" scalar goes stale the moment Unity binds sampling textures on
+ * other units between an upload's bind and its glTexSubImage2D — and a stale id here means
+ * shrinking the WRONG texture (review find #1, 2026-08-04). So track the active unit + a binding
+ * per unit. Single GL thread like all rd_ state; contexts share the table (approximation: both
+ * Unity contexts funnel through this shim, uploads bind on the same context they upload on). */
+#define RD_TEX_UNITS 256u
+static uint32_t rd_tex2d_bound[RD_TEX_UNITS];
+static uint32_t rd_active_unit = 0;
+static uint32_t rd_cur_tex2d(void) { return rd_tex2d_bound[rd_active_unit]; }
+static uint64_t rd_shrink_marked = 0, rd_shrink_dropped = 0;
+static uint64_t rd_shrink_n[3] = {0,0,0};   /* how many textures got each shift */
+static uint64_t rd_shrink_saved = 0;        /* estimated bytes not allocated (RGBA8-equivalent) */
+/* Minimum texture side for the DEEP shift (shift=2). Tier knob, 2026-08-05: at 2048 (default) the
+ * persistent 2048² item/plant atlases quarter too — max FPS/bandwidth win, slightly soft things
+ * ("Ultra low"). At 4096 only the transient bake giants quarter and items keep Half quality
+ * ("Low") — her A/B decides where the FPS actually lives. */
+static int rd_tex_deep_min(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("RIMDROID_TEX_DEEP_MIN");
+        v = (e && e[0]) ? atoi(e) : 2048;
+        if (v < 1024) v = 1024;   /* below the base >=1024 gate a deep threshold is meaningless */
+    }
+    return v;
+}
+static int rd_tex_shrink_on(void) {   /* requested shift: 0 (off) / 1 (halve) / 2 (quarter) */
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("RIMDROID_TEX_SHRINK");
+        on = (e && e[0]) ? atoi(e) : 0;
+        if (on < 0) on = 0;
+        if (on > 2) on = 2;
+        if (on) { printf_log(LOG_NONE, "RIMDROID TEXSHRINK enabled: mip shift=%d (deep-min=%d) on mipped 2D textures\n", on, rd_tex_deep_min()); fflush(NULL); }
+    }
+    return on;
+}
+static int rd_shrink_get(uint32_t id) {   /* the texture's mip shift, 0 if untouched */
+    return (id && id < RD_SHRINK_MAX_ID) ? (int)rd_shrink_shift[id] : 0;
+}
+static void rd_shrink_set(uint32_t id, int v) {
+    if (!id || id >= RD_SHRINK_MAX_ID) return;
+    rd_shrink_shift[id] = (uint8_t)v;
+}
+// ---- RimDroid T16 telemetry (step 1 of the 16-bit staging experiment, 2026-08-03) -------------
+// Before converting any big uncompressed texture to 16-bit (the future RIMDROID_T16), we must know
+// each one's ROLE: sampled-only staging (safe to quantize), FBO/render target (conversion risks
+// FRAMEBUFFER_INCOMPLETE — the pawn-atlas class), imageStore target (CompressBC's working surface —
+// quantizing the compressor's INPUT would bake banding into every final atlas), or transient
+// (deleted right after load = the bake peak we actually want to shave). LOG-ONLY, always on: tracks
+// big uncompressed 2D allocations and stamps each role the FIRST time it appears. Classification
+// comes straight out of a tester log: grep T16TELEM.
+#define RD_T16_MAX 192            /* raised from 64 for the 5-DLC survey (review find #3) */
+#define RD_T16_F_FBO   1u
+#define RD_T16_F_IMAGE 2u
+#define RD_T16_F_SUB   4u
+#define RD_T16_F_COPY  8u
+#define RD_T16_F_CSRC 16u         /* used as a copy SOURCE (review find #2: mark both sides) */
+typedef struct { uint32_t id; uint32_t ifmt; int32_t w, h, levels; uint32_t flags; uint64_t born; uint64_t bytes; } rd_t16_rec;
+static rd_t16_rec rd_t16_tab[RD_T16_MAX];
+static int rd_t16_hi = 0;   // high-water slot count (slots with id==0 are free for reuse)
+// The real loading peak is the SUM of simultaneously-live textures, not any single one (review
+// find #4): overlapping bake pairs stack. Tracked-format estimate only, but that IS the question.
+static uint64_t rd_t16_live = 0, rd_t16_peak = 0, rd_t16_peak_logged = 0;
+static uint64_t rd_t16_bytes_of(uint32_t ifmt, int32_t levels, int32_t w, int32_t h) {
+    uint64_t px = (uint64_t)w * h;
+    uint64_t base;
+    switch (ifmt) {
+        case 0x8058u: case 0x8051u: case 0x8C43u: base = px * 4; break;      /* RGBA8/RGB8/sRGB8_A8 */
+        case 0x83F0u: case 0x83F1u: case 0x8C4Cu: case 0x8C4Du: base = px / 2; break;  /* DXT1 */
+        case 0x83F2u: case 0x83F3u: case 0x8C4Eu: case 0x8C4Fu:                        /* DXT3/5 */
+        case 0x8E8Cu: case 0x8E8Du: case 0x8E8Eu: case 0x8E8Fu: base = px; break;      /* BPTC/BC6-7 */
+        default: return 0;   /* untracked format */
+    }
+    return (levels > 1) ? base * 4 / 3 : base;
+}
+static void rd_t16_alloc(uint32_t id, uint32_t ifmt, int32_t levels, int32_t w, int32_t h) {
+    if (!id || w <= 0 || h <= 0) return;
+    uint64_t bytes = rd_t16_bytes_of(ifmt, levels, w, h);
+    if (bytes < (1u << 20)) return;   // only the big ones matter for the memory question
+    int slot = -1;
+    for (int i = 0; i < rd_t16_hi; i++) if (!rd_t16_tab[i].id) { slot = i; break; }
+    if (slot < 0) {
+        if (rd_t16_hi >= RD_T16_MAX) {   // review find #5: never overflow SILENTLY — a full table
+            static int warned = 0;       // must be visible, or "all classified" becomes a lie
+            if (!warned) { warned = 1; printf_log(LOG_NONE, "RIMDROID T16TELEM OVERFLOW: table full (%d), further big allocs untracked\n", RD_T16_MAX); fflush(NULL); }
+            return;
+        }
+        slot = rd_t16_hi++;
+    }
+    rd_t16_tab[slot].id = id; rd_t16_tab[slot].ifmt = ifmt; rd_t16_tab[slot].w = w;
+    rd_t16_tab[slot].h = h; rd_t16_tab[slot].levels = levels; rd_t16_tab[slot].flags = 0;
+    rd_t16_tab[slot].born = rd_tex_calls; rd_t16_tab[slot].bytes = bytes;
+    rd_t16_live += bytes;
+    if (rd_t16_live > rd_t16_peak) {
+        rd_t16_peak = rd_t16_live;
+        if (rd_t16_peak - rd_t16_peak_logged >= (32ull << 20)) {   // log every +32MB of new peak
+            rd_t16_peak_logged = rd_t16_peak;
+            printf_log(LOG_NONE, "RIMDROID T16TELEM tracked-live=%lluMB PEAK=%lluMB\n",
+                       (unsigned long long)(rd_t16_live >> 20), (unsigned long long)(rd_t16_peak >> 20));
+            fflush(NULL);
+        }
+    }
+    printf_log(LOG_NONE, "RIMDROID T16TELEM alloc tex=%u ifmt=0x%x %dx%d lvls=%d (~%uMB) slot=%d live=%lluMB\n",
+               id, ifmt, w, h, levels, (unsigned)(bytes >> 20), slot, (unsigned long long)(rd_t16_live >> 20));
+    fflush(NULL);
+}
+static rd_t16_rec* rd_t16_find(uint32_t id) {
+    if (!id) return NULL;
+    for (int i = 0; i < rd_t16_hi; i++) if (rd_t16_tab[i].id == id) return &rd_t16_tab[i];
+    return NULL;
+}
+static void rd_t16_mark(uint32_t id, uint32_t flag, const char* what) {
+    rd_t16_rec* r = rd_t16_find(id);
+    if (!r || (r->flags & flag)) return;   // log each role once per texture
+    r->flags |= flag;
+    printf_log(LOG_NONE, "RIMDROID T16TELEM %s tex=%u (ifmt=0x%x %dx%d)\n", what, id, r->ifmt, r->w, r->h);
+    fflush(NULL);
+}
+static void rd_t16_on_delete(uint32_t id) {
+    rd_t16_rec* r = rd_t16_find(id);
+    if (!r) return;
+    rd_t16_live = (rd_t16_live >= r->bytes) ? rd_t16_live - r->bytes : 0;
+    printf_log(LOG_NONE, "RIMDROID T16TELEM delete tex=%u ifmt=0x%x %dx%d ~%uMB flags=%s%s%s%s%s%s lived=alloc#%llu..#%llu live=%lluMB\n",
+               id, r->ifmt, r->w, r->h, (unsigned)(r->bytes >> 20),
+               r->flags ? "" : "sampled-only ",
+               (r->flags & RD_T16_F_FBO)   ? "FBO "  : "",
+               (r->flags & RD_T16_F_IMAGE) ? "IMG "  : "",
+               (r->flags & RD_T16_F_SUB)   ? "SUB "  : "",
+               (r->flags & RD_T16_F_COPY)  ? "COPY " : "",
+               (r->flags & RD_T16_F_CSRC)  ? "CSRC " : "",
+               (unsigned long long)r->born, (unsigned long long)rd_tex_calls,
+               (unsigned long long)(rd_t16_live >> 20));
+    fflush(NULL);
+    r->id = 0;
+}
+static void (*p_rd_real_glActiveTexture)(uint32_t) = NULL;
+static void rd_glActiveTexture(uint32_t texture) {
+    uint32_t u = texture - 0x84C0u;   /* GL_TEXTURE0 */
+    if (u < RD_TEX_UNITS) rd_active_unit = u;
+    if (!p_rd_real_glActiveTexture)
+        p_rd_real_glActiveTexture = (void(*)(uint32_t))rd_zfa_gl("glActiveTexture");
+    if (p_rd_real_glActiveTexture) p_rd_real_glActiveTexture(texture);
+}
+static void (*p_rd_real_glBindTexture)(uint32_t,uint32_t) = NULL;
+static void rd_glBindTexture(uint32_t target, uint32_t id) {
+    if (target == RD_GL_TEXTURE_2D) rd_tex2d_bound[rd_active_unit] = id;
+    if (!p_rd_real_glBindTexture)
+        p_rd_real_glBindTexture = (void(*)(uint32_t,uint32_t))rd_zfa_gl("glBindTexture");
+    if (p_rd_real_glBindTexture) p_rd_real_glBindTexture(target, id);
+}
+static void (*p_rd_real_glDeleteTextures)(int32_t,const uint32_t*) = NULL;
+static void rd_glDeleteTextures(int32_t n, const uint32_t* ids) {
+    if (ids && n > 0) for (int32_t i = 0; i < n; i++) { rd_t16_on_delete(ids[i]); rd_shrink_set(ids[i], 0); }  /* names get reused */
+    if (!p_rd_real_glDeleteTextures)
+        p_rd_real_glDeleteTextures = (void(*)(int32_t,const uint32_t*))rd_zfa_gl("glDeleteTextures");
+    if (p_rd_real_glDeleteTextures) p_rd_real_glDeleteTextures(n, ids);
+}
 static void rd_glTexStorage2D(uint32_t target, int32_t levels, uint32_t ifmt, int32_t w, int32_t h) {
     RD_OPLOG("RIMDROID OP#%llu TexStorage2D lvls=%d ifmt=0x%x %dx%d\n", (unsigned long long)rd_gl_op_seq, levels, ifmt, w, h);
+    // T16 telemetry: record big uncompressed allocations with ORIGINAL dims (before any shrink).
+    if (target == RD_GL_TEXTURE_2D) rd_t16_alloc(rd_cur_tex2d(), ifmt, levels, w, h);
+    // Texture shrink: a mipped 2D allocation loses its top level (see block comment above).
+    // Done BEFORE accounting so pacing/memory logs reflect what is really allocated.
+    int rd_sh = rd_tex_shrink_on();
+    const int32_t ow = w, oh = h;   /* original dims, for the shrink log/accounting below */
+    if (rd_sh && target == RD_GL_TEXTURE_2D && levels >= 2 && (w >= 1024 || h >= 1024)
+            && rd_cur_tex2d() && rd_cur_tex2d() < RD_SHRINK_MAX_ID) {
+        if (rd_sh > levels - 1) rd_sh = levels - 1;              /* keep at least one level */
+        if (rd_sh >= 2 && !(w >= rd_tex_deep_min() || h >= rd_tex_deep_min())) rd_sh = 1;  /* deep shift only above the tier threshold */
+        rd_shrink_set(rd_cur_tex2d(), rd_sh);
+        rd_shrink_marked++;
+        levels -= rd_sh;
+        w = (w >> rd_sh) > 0 ? (w >> rd_sh) : 1;
+        h = (h >> rd_sh) > 0 ? (h >> rd_sh) : 1;
+        // Per-shift tallies + bytes saved, so a tier A/B doesn't depend on which lines the sampler
+        // happened to print (the first-16/every-64th sample was missing exactly the interesting
+        // big textures). Deep shifts are rare — log every one of them.
+        rd_shrink_n[rd_sh]++;
+        rd_shrink_saved += (uint64_t)((int64_t)ow * oh - (int64_t)w * h) * 4 / 3;
+        if (rd_sh >= 2 || rd_shrink_marked <= 16 || (rd_shrink_marked & 63) == 0)
+            { printf_log(LOG_NONE, "RIMDROID TEXSHRINK tex=%u %dx%d -> %dx%d lvls=%d shift=%d (marked=%llu shift1=%llu shift2=%llu ~saved=%lluMB)\n",
+                         rd_cur_tex2d(), ow, oh, w, h, levels, rd_sh, (unsigned long long)rd_shrink_marked,
+                         (unsigned long long)rd_shrink_n[1], (unsigned long long)rd_shrink_n[2],
+                         (unsigned long long)(rd_shrink_saved >> 20)); fflush(NULL); }
+    }
     rd_tex_account(ifmt, levels, w, h);
     if ((w >= 2048 || h >= 2048 || w < 0 || h < 0 || levels > 16) && rd_texlog_n < 48)
         { rd_texlog_n++; printf_log(LOG_NONE, "RIMDROID GLSANITY glTexStorage2D target=0x%x levels=%d ifmt=0x%x %dx%d\n", target, levels, ifmt, w, h); fflush(NULL); }
@@ -439,7 +655,7 @@ static void rd_copy_account(int64_t w, int64_t h, int64_t d) {
     rd_copy_calls++;
     uint64_t before = rd_copy_total >> 28;
     rd_copy_total += sz;
-    if ((rd_copy_total >> 28) != before)
+    if (rd_gl_diag_on() && (rd_copy_total >> 28) != before)
         { printf_log(LOG_NONE, "RIMDROID GLSANITY cumulative copy=%lluMB copycalls=%llu\n", (unsigned long long)(rd_copy_total>>20), (unsigned long long)rd_copy_calls); fflush(NULL); }
     rd_upload_pace(sz);
 }
@@ -456,11 +672,17 @@ static void rd_sub_account(uint64_t sz) {
     rd_sub_calls++;
     uint64_t before = rd_sub_total >> 28;
     rd_sub_total += sz;
-    if ((rd_sub_total >> 28) != before)
+    if (rd_gl_diag_on() && (rd_sub_total >> 28) != before)
         { printf_log(LOG_NONE, "RIMDROID GLSANITY cumulative sub=%lluMB subcalls=%llu copy=%lluMB copycalls=%llu\n", (unsigned long long)(rd_sub_total>>20), (unsigned long long)rd_sub_calls, (unsigned long long)(rd_copy_total>>20), (unsigned long long)rd_copy_calls); fflush(NULL); }
     rd_upload_pace(sz);
 }
 static void rd_glTexSubImage2D(uint32_t target, int32_t level, int32_t xo, int32_t yo, int32_t w, int32_t h, uint32_t fmt, uint32_t type, const void* px) {
+    // Texture shrink: on a shrunk texture the game's level-N data belongs in our level N-shift;
+    // data for the dropped top level(s) has nowhere to go (the smaller mips carry the image) and
+    // is discarded BEFORE accounting — a dropped upload must not advance the pacing counters.
+    { int sh = (target == RD_GL_TEXTURE_2D) ? rd_shrink_get(rd_cur_tex2d()) : 0;
+      if (sh) { if (level < sh) { rd_shrink_dropped++; return; } level -= sh; } }
+    if (rd_t16_hi && target == RD_GL_TEXTURE_2D) rd_t16_mark(rd_cur_tex2d(), RD_T16_F_SUB, "SUB-UPLOAD");
     if (w > 0 && h > 0) {
         if (rd_sublog_n < 4) { rd_sublog_n++; printf_log(LOG_NONE, "RIMDROID GLSANITY glTexSubImage2D level=%d %dx%d fmt=0x%x\n", level, w, h, fmt); fflush(NULL); }
         RD_OPLOG("RIMDROID OP#%llu TexSubImage2D lvl=%d %d,%d %dx%d fmt=0x%x\n", (unsigned long long)rd_gl_op_seq, level, xo, yo, w, h, fmt);
@@ -473,6 +695,20 @@ static void rd_glTexSubImage2D(uint32_t target, int32_t level, int32_t xo, int32
     if (p_rd_real_glTexSubImage2D) p_rd_real_glTexSubImage2D(target, level, xo, yo, w, h, fmt, type, px);
 }
 static void rd_glCompressedTexSubImage2D(uint32_t target, int32_t level, int32_t xo, int32_t yo, int32_t w, int32_t h, uint32_t fmt, int32_t imageSize, const void* data) {
+    // Texture shrink: same level shift/drop as rd_glTexSubImage2D (this is the path the 1.6
+    // atlas bake actually uses — CPU-compressed DXT pages via glCompressedTexSubImage2D).
+    { int sh = (target == RD_GL_TEXTURE_2D) ? rd_shrink_get(rd_cur_tex2d()) : 0;
+      if (sh) {
+        if (level < sh) {
+            rd_shrink_dropped++;
+            if (rd_shrink_dropped == 1 || (rd_shrink_dropped & 4095) == 0)
+                { printf_log(LOG_NONE, "RIMDROID TEXSHRINK dropped=%llu top-level uploads (marked=%llu)\n",
+                             (unsigned long long)rd_shrink_dropped, (unsigned long long)rd_shrink_marked); fflush(NULL); }
+            return;
+        }
+        level -= sh;
+      } }
+    if (rd_t16_hi && target == RD_GL_TEXTURE_2D) rd_t16_mark(rd_cur_tex2d(), RD_T16_F_SUB, "SUB-UPLOAD");
     if (imageSize > 0) {
         if (rd_sublog_n < 4) { rd_sublog_n++; printf_log(LOG_NONE, "RIMDROID GLSANITY glCompressedTexSubImage2D level=%d %dx%d fmt=0x%x size=%d\n", level, w, h, fmt, imageSize); fflush(NULL); }
         RD_OPLOG("RIMDROID OP#%llu CompressedTexSubImage2D lvl=%d %d,%d %dx%d fmt=0x%x sz=%d\n", (unsigned long long)rd_gl_op_seq, level, xo, yo, w, h, fmt, imageSize);
@@ -486,12 +722,66 @@ static void rd_glTexSubImage3D(uint32_t target, int32_t level, int32_t xo, int32
 }
 static void rd_glCopyImageSubData(uint32_t sn, uint32_t st, int32_t sl, int32_t sx, int32_t sy, int32_t sz_, uint32_t dn, uint32_t dt, int32_t dl, int32_t dx, int32_t dy, int32_t dz, int32_t w, int32_t h, int32_t d) {
     RD_OPLOG("RIMDROID OP#%llu CopyImageSubData src=%u lvl=%d %d,%d,%d dst=%u lvl=%d %d,%d,%d %dx%dx%d\n", (unsigned long long)rd_gl_op_seq, sn, sl, sx, sy, sz_, dn, dl, dx, dy, dz, w, h, d);
+    rd_t16_mark(dn, RD_T16_F_COPY, "COPY-INTO(byname)");   // dst is a texture NAME here — direct
+    rd_t16_mark(sn, RD_T16_F_CSRC, "COPY-FROM(byname)");   // review find #2: mark the source too
+    // Texture shrink: a copy touching a shrunk texture shifts down one level — per-level texel
+    // coords are IDENTICAL (original level L == shrunk level L-1, same dims), so offsets/sizes
+    // pass through untouched. A copy referencing the dropped level 0 cannot be satisfied: skip
+    // it, loudly (review find #2 — RimWorld uses this call in bulk; watch tester logs).
+    { int ssh = (st == RD_GL_TEXTURE_2D) ? rd_shrink_get(sn) : 0;
+      if (ssh) {
+        if (sl < ssh) { static int n0 = 0; if (n0 < 8) { n0++; printf_log(LOG_NONE, "RIMDROID TEXSHRINK CopyImageSubData DROP src-top tex=%u lvl=%d %dx%d\n", sn, sl, w, h); fflush(NULL); } return; }
+        sl -= ssh;
+      } }
+    { int dsh = (dt == RD_GL_TEXTURE_2D) ? rd_shrink_get(dn) : 0;
+      if (dsh) {
+        if (dl < dsh) { static int n1 = 0; if (n1 < 8) { n1++; printf_log(LOG_NONE, "RIMDROID TEXSHRINK CopyImageSubData DROP dst-top tex=%u lvl=%d %dx%d\n", dn, dl, w, h); fflush(NULL); } return; }
+        dl -= dsh;
+      } }
     rd_copy_account(w, h, d);
     if (p_rd_real_glCopyImageSubData) p_rd_real_glCopyImageSubData(sn, st, sl, sx, sy, sz_, dn, dt, dl, dx, dy, dz, w, h, d);
 }
 static void rd_glCopyTexSubImage2D(uint32_t target, int32_t level, int32_t xo, int32_t yo, int32_t x, int32_t y, int32_t w, int32_t h) {
+    // Texture shrink: framebuffer->texture copies into a shrunk texture shift down one level
+    // like the uploads. A level-0 copy is dropped — content-generating copies into MIPPED
+    // textures are not a RimWorld pattern (its copy targets are levels==1, never shrunk), so
+    // log the first few in case some mod/driver path proves that assumption wrong.
+    if (target == RD_GL_TEXTURE_2D) rd_t16_mark(rd_cur_tex2d(), RD_T16_F_COPY, "COPY-INTO");
+    { int sh = (target == RD_GL_TEXTURE_2D) ? rd_shrink_get(rd_cur_tex2d()) : 0;
+      if (sh) {
+        static int logged = 0;
+        if (logged < 8) { logged++; printf_log(LOG_NONE, "RIMDROID TEXSHRINK CopyTexSubImage2D on shrunk tex=%u lvl=%d %dx%d\n", rd_cur_tex2d(), level, w, h); fflush(NULL); }
+        if (level < sh) return;
+        level -= sh;
+      } }
     rd_copy_account(w, h, 1);
     if (p_rd_real_glCopyTexSubImage2D) p_rd_real_glCopyTexSubImage2D(target, level, xo, yo, x, y, w, h);
+}
+// T16 telemetry probes: log-only shims that stamp a tracked texture's role the first time it is
+// attached to a framebuffer (render target) or bound as an image (CompressBC's imageStore surface).
+static void (*p_rd_real_glFramebufferTexture2D)(uint32_t,uint32_t,uint32_t,uint32_t,int32_t) = NULL;
+static void rd_glFramebufferTexture2D(uint32_t target, uint32_t attachment, uint32_t textarget, uint32_t texture, int32_t level) {
+    if (texture) rd_t16_mark(texture, RD_T16_F_FBO, "FBO-ATTACH");
+    // Tripwire (review find #3): shrinking assumes mipped-storage textures never become render
+    // targets (all observed RTs are levels==1). If the field ever violates that, say so loudly.
+    if (texture && rd_shrink_get(texture)) {
+        static int n = 0;
+        if (n < 8) { n++; printf_log(LOG_NONE, "RIMDROID TEXSHRINK WARNING: shrunk tex=%u attached to FBO (level=%d)\n", texture, level); fflush(NULL); }
+    }
+    if (!p_rd_real_glFramebufferTexture2D)
+        p_rd_real_glFramebufferTexture2D = (void(*)(uint32_t,uint32_t,uint32_t,uint32_t,int32_t))rd_zfa_gl("glFramebufferTexture2D");
+    if (p_rd_real_glFramebufferTexture2D) p_rd_real_glFramebufferTexture2D(target, attachment, textarget, texture, level);
+}
+static void (*p_rd_real_glBindImageTexture)(uint32_t,uint32_t,int32_t,uint8_t,int32_t,uint32_t,uint32_t) = NULL;
+static void rd_glBindImageTexture(uint32_t unit, uint32_t texture, int32_t level, uint8_t layered, int32_t layer, uint32_t access, uint32_t format) {
+    if (texture) rd_t16_mark(texture, RD_T16_F_IMAGE, "IMAGE-BIND");
+    if (texture && rd_shrink_get(texture)) {   // same tripwire as the FBO attach
+        static int n = 0;
+        if (n < 8) { n++; printf_log(LOG_NONE, "RIMDROID TEXSHRINK WARNING: shrunk tex=%u bound as image (level=%d)\n", texture, level); fflush(NULL); }
+    }
+    if (!p_rd_real_glBindImageTexture)
+        p_rd_real_glBindImageTexture = (void(*)(uint32_t,uint32_t,int32_t,uint8_t,int32_t,uint32_t,uint32_t))rd_zfa_gl("glBindImageTexture");
+    if (p_rd_real_glBindImageTexture) p_rd_real_glBindImageTexture(unit, texture, level, layered, layer, access, format);
 }
 static void rd_glBlitFramebuffer(int32_t sx0, int32_t sy0, int32_t sx1, int32_t sy1, int32_t dx0, int32_t dy0, int32_t dx1, int32_t dy1, uint32_t mask, uint32_t filter) {
     RD_OPLOG("RIMDROID OP#%llu BlitFramebuffer %d,%d-%d,%d -> %d,%d-%d,%d mask=0x%x\n", (unsigned long long)rd_gl_op_seq, sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1, mask);
@@ -1610,17 +1900,24 @@ void* rimdroid_gl_getprocaddr(x64emu_t* emu, bridge_t* bridge, glprocaddress_t p
         else if (!strcmp(rname, "glTexSubImage2D"))     { p_rd_real_glTexSubImage2D     = rimdroid_gl_proc_resolver(rname); w = vFuiiiiiuup; fn = (void*)rd_glTexSubImage2D; }
         else if (!strcmp(rname, "glCompressedTexSubImage2D")) { p_rd_real_glCompressedTexSubImage2D = rimdroid_gl_proc_resolver(rname); w = vFuiiiiiuip; fn = (void*)rd_glCompressedTexSubImage2D; }
         else if (!strcmp(rname, "glTexSubImage3D"))     { p_rd_real_glTexSubImage3D     = rimdroid_gl_proc_resolver(rname); w = vFuiiiiiiiuup; fn = (void*)rd_glTexSubImage3D; }
-        else if (!strcmp(rname, "glDrawArrays"))        { p_rd_real_glDrawArrays        = rimdroid_gl_proc_resolver(rname); w = vFuii;  fn = (void*)rd_glDrawArrays; }
-        else if (!strcmp(rname, "glDrawElements"))      { p_rd_real_glDrawElements      = rimdroid_gl_proc_resolver(rname); w = vFuiup; fn = (void*)rd_glDrawElements; }
-        else if (!strcmp(rname, "glDrawElementsBaseVertex")) { p_rd_real_glDrawElementsBaseVertex = rimdroid_gl_proc_resolver(rname); w = vFuiupi; fn = (void*)rd_glDrawElementsBaseVertex; }
-        else if (!strcmp(rname, "glDrawArraysInstanced")) { p_rd_real_glDrawArraysInstanced = rimdroid_gl_proc_resolver(rname); w = vFuiii; fn = (void*)rd_glDrawArraysInstanced; }
-        else if (!strcmp(rname, "glDrawElementsInstanced")) { p_rd_real_glDrawElementsInstanced = rimdroid_gl_proc_resolver(rname); w = vFuiupi; fn = (void*)rd_glDrawElementsInstanced; }
-        else if (!strcmp(rname, "glDrawElementsInstancedBaseVertex")) { p_rd_real_glDrawElementsInstancedBaseVertex = rimdroid_gl_proc_resolver(rname); w = vFuiupii; fn = (void*)rd_glDrawElementsInstancedBaseVertex; }
-        else if (!strcmp(rname, "glDispatchCompute"))   { p_rd_real_glDispatchCompute   = rimdroid_gl_proc_resolver(rname); w = vFuuu; fn = (void*)rd_glDispatchCompute; }
-        else if (!strcmp(rname, "glGenerateMipmap"))    { p_rd_real_glGenerateMipmap    = rimdroid_gl_proc_resolver(rname); w = vFu;   fn = (void*)rd_glGenerateMipmap; }
-        else if (!strcmp(rname, "glUseProgram"))        { p_rd_real_glUseProgram        = rimdroid_gl_proc_resolver(rname); w = vFu;    fn = (void*)rd_glUseProgram; }
+        // Diagnostic-only wrappers (op-log hunts): install ONLY under RIMDROID_GL_DIAG=1 — without
+        // it the game gets the REAL entry points and pays zero extra per draw call.
+        else if (rd_gl_diag_on() && !strcmp(rname, "glDrawArrays"))        { p_rd_real_glDrawArrays        = rimdroid_gl_proc_resolver(rname); w = vFuii;  fn = (void*)rd_glDrawArrays; }
+        else if (rd_gl_diag_on() && !strcmp(rname, "glDrawElements"))      { p_rd_real_glDrawElements      = rimdroid_gl_proc_resolver(rname); w = vFuiup; fn = (void*)rd_glDrawElements; }
+        else if (rd_gl_diag_on() && !strcmp(rname, "glDrawElementsBaseVertex")) { p_rd_real_glDrawElementsBaseVertex = rimdroid_gl_proc_resolver(rname); w = vFuiupi; fn = (void*)rd_glDrawElementsBaseVertex; }
+        else if (rd_gl_diag_on() && !strcmp(rname, "glDrawArraysInstanced")) { p_rd_real_glDrawArraysInstanced = rimdroid_gl_proc_resolver(rname); w = vFuiii; fn = (void*)rd_glDrawArraysInstanced; }
+        else if (rd_gl_diag_on() && !strcmp(rname, "glDrawElementsInstanced")) { p_rd_real_glDrawElementsInstanced = rimdroid_gl_proc_resolver(rname); w = vFuiupi; fn = (void*)rd_glDrawElementsInstanced; }
+        else if (rd_gl_diag_on() && !strcmp(rname, "glDrawElementsInstancedBaseVertex")) { p_rd_real_glDrawElementsInstancedBaseVertex = rimdroid_gl_proc_resolver(rname); w = vFuiupii; fn = (void*)rd_glDrawElementsInstancedBaseVertex; }
+        else if (rd_gl_diag_on() && !strcmp(rname, "glDispatchCompute"))   { p_rd_real_glDispatchCompute   = rimdroid_gl_proc_resolver(rname); w = vFuuu; fn = (void*)rd_glDispatchCompute; }
+        else if (rd_gl_diag_on() && !strcmp(rname, "glGenerateMipmap"))    { p_rd_real_glGenerateMipmap    = rimdroid_gl_proc_resolver(rname); w = vFu;   fn = (void*)rd_glGenerateMipmap; }
+        else if (!strcmp(rname, "glActiveTexture"))  { p_rd_real_glActiveTexture  = (void(*)(uint32_t))rimdroid_gl_proc_resolver(rname); w = vFu; fn = (void*)rd_glActiveTexture; }
+        else if (!strcmp(rname, "glBindTexture"))    { p_rd_real_glBindTexture    = (void(*)(uint32_t,uint32_t))rimdroid_gl_proc_resolver(rname); w = vFuu; fn = (void*)rd_glBindTexture; }
+        else if (!strcmp(rname, "glDeleteTextures")) { p_rd_real_glDeleteTextures = (void(*)(int32_t,const uint32_t*))rimdroid_gl_proc_resolver(rname); w = vFip; fn = (void*)rd_glDeleteTextures; }
+        else if (!strcmp(rname, "glFramebufferTexture2D")) { p_rd_real_glFramebufferTexture2D = (void(*)(uint32_t,uint32_t,uint32_t,uint32_t,int32_t))rimdroid_gl_proc_resolver(rname); w = vFuuuui; fn = (void*)rd_glFramebufferTexture2D; }
+        else if (!strcmp(rname, "glBindImageTexture"))     { p_rd_real_glBindImageTexture = (void(*)(uint32_t,uint32_t,int32_t,uint8_t,int32_t,uint32_t,uint32_t))rimdroid_gl_proc_resolver(rname); w = vFuuiCiuu; fn = (void*)rd_glBindImageTexture; }
+        else if (rd_gl_diag_on() && !strcmp(rname, "glUseProgram")) { p_rd_real_glUseProgram = rimdroid_gl_proc_resolver(rname); w = vFu; fn = (void*)rd_glUseProgram; }
         else if (!strcmp(rname, "glShaderSource"))      { p_rd_real_glShaderSource      = rimdroid_gl_proc_resolver(rname); w = vFuipp; fn = (void*)rd_glShaderSource; }
-        else if (!strcmp(rname, "glAttachShader"))      { p_rd_real_glAttachShader      = rimdroid_gl_proc_resolver(rname); w = vFuu;   fn = (void*)rd_glAttachShader; }
+        else if (rd_gl_diag_on() && !strcmp(rname, "glAttachShader")) { p_rd_real_glAttachShader = rimdroid_gl_proc_resolver(rname); w = vFuu; fn = (void*)rd_glAttachShader; }
 
         if (fn && bridge) {
             void* b = (void*)AddBridge(bridge, w, fn, 0, rname);
