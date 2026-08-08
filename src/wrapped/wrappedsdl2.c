@@ -557,6 +557,11 @@ static uint64_t rd_t16_bytes_of(uint32_t ifmt, int32_t levels, int32_t w, int32_
     return (levels > 1) ? base * 4 / 3 : base;
 }
 static void rd_t16_alloc(uint32_t id, uint32_t ifmt, int32_t levels, int32_t w, int32_t h) {
+    // Release-gated since 0.2.5 (was always-on through the shrink survey): the classification
+    // work is done, so ship silent. RIMDROID_GL_DIAG=1 brings the whole survey back when a
+    // device needs diagnosing. Gate ALL THREE entry points, not just the logs, so the table
+    // stays empty and every rd_t16_hi fast-path check elsewhere short-circuits too.
+    if (!rd_gl_diag_on()) return;
     if (!id || w <= 0 || h <= 0) return;
     uint64_t bytes = rd_t16_bytes_of(ifmt, levels, w, h);
     if (bytes < (1u << 20)) return;   // only the big ones matter for the memory question
@@ -593,6 +598,7 @@ static rd_t16_rec* rd_t16_find(uint32_t id) {
     return NULL;
 }
 static void rd_t16_mark(uint32_t id, uint32_t flag, const char* what) {
+    if (!rd_gl_diag_on()) return;   // see rd_t16_alloc — telemetry is diag-only since 0.2.5
     rd_t16_rec* r = rd_t16_find(id);
     if (!r || (r->flags & flag)) return;   // log each role once per texture
     r->flags |= flag;
@@ -600,6 +606,7 @@ static void rd_t16_mark(uint32_t id, uint32_t flag, const char* what) {
     fflush(NULL);
 }
 static void rd_t16_on_delete(uint32_t id) {
+    if (!rd_gl_diag_on()) return;   // see rd_t16_alloc — telemetry is diag-only since 0.2.5
     rd_t16_rec* r = rd_t16_find(id);
     if (!r) return;
     rd_t16_live = (rd_t16_live >= r->bytes) ? rd_t16_live - r->bytes : 0;
