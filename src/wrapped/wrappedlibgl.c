@@ -54,6 +54,36 @@ extern void* rimdroid_gl_getprocaddr(x64emu_t* emu, bridge_t* bridge, glprocaddr
 
 static int rd_zfa_active(void) { return (&g_zfa_context) && g_zfa_context; }
 
+// ---- EGL-translator variant of the same bridge (2026-08-09) ------------------
+// RimWorld 1.6 on a GL->GLES translator (MobileGlues / NG-GL4ES): same glX intercepts,
+// but the real context is the EGL one rimdroid.c created for the GL4ES plumbing
+// (BOX64_LIBGL=libmobileglues.so etc.). The translators have no glX of their own
+// (MobileGlues exports ONLY glXGetProcAddress), so the ZFA-shaped bridge carries them:
+// create/MakeCurrent alias the single EGL context, present = eglSwapBuffers.
+// Single-threaded only for now: EGL contexts don't migrate threads without a release
+// protocol (the 1.5 threaded A/B black-screened on exactly that), so getArgs forces
+// -force-gfx-direct whenever a translator is active.
+extern __attribute__((weak)) void* g_egl_context;
+extern __attribute__((weak)) int   rimdroid_eglt_make_current(void);
+extern __attribute__((weak)) int   rimdroid_eglt_release_current(void);
+extern __attribute__((weak)) void  rimdroid_eglt_swap(void);
+static int rd_eglt_active(void) { return !((&g_zfa_context) && g_zfa_context) && (&g_egl_context) && g_egl_context; }
+// One dispatch layer so every glX intercept below stays backend-agnostic.
+static int rd_bridge_active(void) { return rd_zfa_active() || rd_eglt_active(); }
+static void* rd_bridge_ctx(void) { return rd_zfa_active() ? g_zfa_context : g_egl_context; }
+static int rd_bridge_make_current(void) {
+    if (rd_zfa_active()) return rimdroid_zfa_make_current ? rimdroid_zfa_make_current() : 0;
+    return rimdroid_eglt_make_current ? rimdroid_eglt_make_current() : 0;
+}
+static int rd_bridge_release_current(void) {
+    if (rd_zfa_active()) return rimdroid_zfa_release_current ? rimdroid_zfa_release_current() : -1;
+    return rimdroid_eglt_release_current ? rimdroid_eglt_release_current() : -1;
+}
+static void rd_bridge_swap(void) {
+    if (rd_zfa_active()) { if (rimdroid_zfa_swap) rimdroid_zfa_swap(); }
+    else if (rimdroid_eglt_swap) rimdroid_eglt_swap();
+}
+
 // GLX bridge state. g_glx_ctx_current = the opaque handle Unity currently holds
 // (a distinct alias per glXCreateContext, all aliasing the one ZFA context — Unity
 // creates a 2nd shared context and returning the same pointer twice confuses its
@@ -83,7 +113,7 @@ EXPORT void* my_glXChooseVisual(x64emu_t* emu, void* dpy, int screen, void* attr
 {
     (void)attribList;
     printf_log(LOG_NONE, "RIMDROID glXChooseVisual ENTER screen=%d\n", screen); fflush(NULL);
-    if (!rd_zfa_active()) return my->glXChooseVisual ? my->glXChooseVisual(dpy, screen, attribList) : NULL;
+    if (!rd_bridge_active()) return my->glXChooseVisual ? my->glXChooseVisual(dpy, screen, attribList) : NULL;
     g_glx_display = dpy;
     rd_XVisualInfo* v = (rd_XVisualInfo*)calloc(1, sizeof(rd_XVisualInfo));
     if (v) { v->visualid = 0x21; v->screen = screen; v->depth = 24; v->c_class = 4 /*TrueColor*/;
@@ -98,28 +128,29 @@ static void* rd_glx_make_context(void* dpy, void* win_unused)
     (void)win_unused;
     printf_log(LOG_NONE, "RIMDROID glXCreateContext ENTER\n"); fflush(NULL);
     g_glx_display = dpy;
-    if (rimdroid_zfa_make_current) rimdroid_zfa_make_current();
-    // Distinct opaque handle per call (all alias the one ZFA context).
-    void* fake = (void*)((uintptr_t)g_zfa_context + (uintptr_t)(++g_glx_create_n * 0x10000UL));
+    rd_bridge_make_current();
+    // Distinct opaque handle per call (all alias the one real context, ZFA or EGL).
+    void* fake = (void*)((uintptr_t)rd_bridge_ctx() + (uintptr_t)(++g_glx_create_n * 0x10000UL));
     g_glx_ctx_current = fake;
-    printf_log(LOG_NONE, "RIMDROID glXCreateContext #%lu -> handle %p (ZFA %p) — MILESTONE\n", g_glx_create_n, fake, g_zfa_context);
+    printf_log(LOG_NONE, "RIMDROID glXCreateContext #%lu -> handle %p (%s %p) — MILESTONE\n", g_glx_create_n, fake,
+               rd_zfa_active() ? "ZFA" : "EGL-translator", rd_bridge_ctx());
     return fake;
 }
 EXPORT void* my_glXCreateContext(x64emu_t* emu, void* dpy, void* vis, void* share, int direct)
 {
-    if (!rd_zfa_active()) return my->glXCreateContext ? my->glXCreateContext(dpy, vis, share, direct) : NULL;
+    if (!rd_bridge_active()) return my->glXCreateContext ? my->glXCreateContext(dpy, vis, share, direct) : NULL;
     (void)vis; (void)share; (void)direct;
     return rd_glx_make_context(dpy, NULL);
 }
 EXPORT void* my_glXCreateContextAttribsARB(x64emu_t* emu, void* dpy, void* config, void* share, int direct, void* attribs)
 {
-    if (!rd_zfa_active()) return my->glXCreateContextAttribsARB ? my->glXCreateContextAttribsARB(dpy, config, share, direct, attribs) : NULL;
+    if (!rd_bridge_active()) return my->glXCreateContextAttribsARB ? my->glXCreateContextAttribsARB(dpy, config, share, direct, attribs) : NULL;
     (void)config; (void)share; (void)direct; (void)attribs;
     return rd_glx_make_context(dpy, NULL);
 }
 EXPORT void my_glXDestroyContext(x64emu_t* emu, void* dpy, void* ctx)
 {
-    if (!rd_zfa_active()) { if (my->glXDestroyContext) my->glXDestroyContext(dpy, ctx); return; }
+    if (!rd_bridge_active()) { if (my->glXDestroyContext) my->glXDestroyContext(dpy, ctx); return; }
     // Never destroy the shared ZFA context; just forget the alias.
     if (ctx == g_glx_ctx_current) g_glx_ctx_current = NULL;
     printf_log(LOG_NONE, "RIMDROID glXDestroyContext(%p) -> no-op (ZFA)\n", ctx);
@@ -127,12 +158,12 @@ EXPORT void my_glXDestroyContext(x64emu_t* emu, void* dpy, void* ctx)
 EXPORT int my_glXMakeCurrent(x64emu_t* emu, void* dpy, uintptr_t drawable, void* ctx)
 {
     printf_log(LOG_NONE, "RIMDROID glXMakeCurrent ENTER dpy=%p drawable=0x%lx ctx=%p tid=%ld\n", dpy, (unsigned long)drawable, ctx, (long)syscall(SYS_gettid)); fflush(NULL);
-    if (!rd_zfa_active()) return my->glXMakeCurrent ? my->glXMakeCurrent(dpy, drawable, ctx) : 0;
+    if (!rd_bridge_active()) return my->glXMakeCurrent ? my->glXMakeCurrent(dpy, drawable, ctx) : 0;
     g_glx_display = dpy; g_glx_drawable = drawable;
     if (!ctx) {
-        // Unbind: release the ZFA st_context from THIS thread so a legal single-context
+        // Unbind: release the real context from THIS thread so a legal single-context
         // migration between threads doesn't leave it current on two threads.
-        int rel = (rimdroid_zfa_release_current) ? rimdroid_zfa_release_current() : -1;
+        int rel = rd_bridge_release_current();
         g_glx_ctx_current = NULL;
         g_glx_have_current = 0;
         printf_log(LOG_NONE, "RIMDROID glXMakeCurrent(unbind) release=%d\n", rel);
@@ -147,14 +178,14 @@ EXPORT int my_glXMakeCurrent(x64emu_t* emu, void* dpy, uintptr_t drawable, void*
         static int n=0; if(n<6){n++; printf_log(LOG_NONE, "RIMDROID glXMakeCurrent: alias switch, rebind skipped\n");}
         return 1;
     }
-    int ok = (rimdroid_zfa_make_current && rimdroid_zfa_make_current());
+    int ok = rd_bridge_make_current();
     if (ok) { g_glx_current_tid = pthread_self(); g_glx_have_current = 1; }
-    static int n=0; if(n<4){n++; printf_log(LOG_NONE, "RIMDROID glXMakeCurrent(drawable=0x%lx ctx=%p) -> ZFA %s\n", (unsigned long)drawable, ctx, ok?"OK":"FAIL");}
+    static int n=0; if(n<4){n++; printf_log(LOG_NONE, "RIMDROID glXMakeCurrent(drawable=0x%lx ctx=%p) -> %s %s\n", (unsigned long)drawable, ctx, rd_zfa_active()?"ZFA":"EGL-translator", ok?"OK":"FAIL");}
     return ok ? 1 : 0;
 }
 EXPORT void my_glXSwapBuffers(x64emu_t* emu, void* dpy, uintptr_t drawable)
 {
-    if (!rd_zfa_active()) { if (my->glXSwapBuffers) my->glXSwapBuffers(dpy, drawable); return; }
+    if (!rd_bridge_active()) { if (my->glXSwapBuffers) my->glXSwapBuffers(dpy, drawable); return; }
     // Log swaps only when something CHANGES (drawable/dpy/thread) — captures the transition
     // into the crashing call without per-frame spam. The deterministic NULL+0xbc crash sits
     // in this bridge right after RimWorld's startup resize (DestroyNotify/ConfigureNotify).
@@ -169,7 +200,7 @@ EXPORT void my_glXSwapBuffers(x64emu_t* emu, void* dpy, uintptr_t drawable)
     // Mesa flushes the THREAD-CURRENT context; a swap from a thread that never bound (or
     // after an unbind) crashes inside zfaFlushFront (NULL+0xbc). Rebind on this thread first.
     if (!g_glx_have_current || !pthread_equal(g_glx_current_tid, pthread_self())) {
-        int ok = (rimdroid_zfa_make_current && rimdroid_zfa_make_current());
+        int ok = rd_bridge_make_current();
         if (ok) { g_glx_current_tid = pthread_self(); g_glx_have_current = 1; }
         static int n = 0;
         if (n < 8) { n++; printf_log(LOG_NONE, "RIMDROID glXSwapBuffers: rebind on tid=%ld -> %s\n", tid, ok?"OK":"FAIL"); }
@@ -185,31 +216,29 @@ EXPORT void my_glXSwapBuffers(x64emu_t* emu, void* dpy, uintptr_t drawable)
     // a FULL GPU drain before every present, live since 2026-07-09, stalling every frame
     // (prime suspect for the "flicker + slow-mo UI" reported at the menus). Present path
     // is now: flush-in-swap (Mesa) → zfa swap, nothing else.
-    if (rimdroid_zfa_swap) {
-        rd_glx_swap_phase = 2;
-        rimdroid_zfa_swap();
-    }
+    rd_glx_swap_phase = 2;
+    rd_bridge_swap();
     rd_glx_swap_phase = 0;
 }
 EXPORT void* my_glXGetCurrentContext(x64emu_t* emu)
 {
-    if (!rd_zfa_active()) return my->glXGetCurrentContext ? my->glXGetCurrentContext() : NULL;
-    return g_glx_ctx_current ? g_glx_ctx_current : g_zfa_context;
+    if (!rd_bridge_active()) return my->glXGetCurrentContext ? my->glXGetCurrentContext() : NULL;
+    return g_glx_ctx_current ? g_glx_ctx_current : rd_bridge_ctx();
 }
 EXPORT void* my_glXGetCurrentDisplay(x64emu_t* emu)
 {
-    if (!rd_zfa_active()) return my->glXGetCurrentDisplay ? my->glXGetCurrentDisplay() : NULL;
+    if (!rd_bridge_active()) return my->glXGetCurrentDisplay ? my->glXGetCurrentDisplay() : NULL;
     return g_glx_display;
 }
 EXPORT uintptr_t my_glXGetCurrentDrawable(x64emu_t* emu)
 {
-    if (!rd_zfa_active()) return my->glXGetCurrentDrawable ? (uintptr_t)my->glXGetCurrentDrawable() : 0;
+    if (!rd_bridge_active()) return my->glXGetCurrentDrawable ? (uintptr_t)my->glXGetCurrentDrawable() : 0;
     return g_glx_drawable ? g_glx_drawable : 1;
 }
 EXPORT int my_glXQueryVersion(x64emu_t* emu, void* dpy, void* major, void* minor)
 {
     printf_log(LOG_NONE, "RIMDROID glXQueryVersion ENTER\n"); fflush(NULL);
-    if (!rd_zfa_active()) return my->glXQueryVersion ? my->glXQueryVersion(dpy, major, minor) : 0;
+    if (!rd_bridge_active()) return my->glXQueryVersion ? my->glXQueryVersion(dpy, major, minor) : 0;
     if (major) *(int*)major = 1;
     if (minor) *(int*)minor = 4;
     return 1;
@@ -217,7 +246,7 @@ EXPORT int my_glXQueryVersion(x64emu_t* emu, void* dpy, void* major, void* minor
 EXPORT int my_glXQueryExtension(x64emu_t* emu, void* dpy, void* errorBase, void* eventBase)
 {
     printf_log(LOG_NONE, "RIMDROID glXQueryExtension ENTER dpy=%p errBase=%p evtBase=%p\n", dpy, errorBase, eventBase); fflush(NULL);
-    if (!rd_zfa_active()) return my->glXQueryExtension ? my->glXQueryExtension(dpy, errorBase, eventBase) : 0;
+    if (!rd_bridge_active()) return my->glXQueryExtension ? my->glXQueryExtension(dpy, errorBase, eventBase) : 0;
     // NOTE (root cause of the 2026-07-09 corruption saga): these GOM bridges were first declared
     // WITHOUT the E in their wrapper signatures (vFpL instead of vFEpL etc.), so the guest args
     // arrived shifted by one (emu<-display, dpy<-errorBase, ...) and this write went through
@@ -230,7 +259,7 @@ EXPORT int my_glXQueryExtension(x64emu_t* emu, void* dpy, void* errorBase, void*
 EXPORT void* my_glXQueryExtensionsString(x64emu_t* emu, void* dpy, int screen)
 {
     printf_log(LOG_NONE, "RIMDROID glXQueryExtensionsString ENTER\n"); fflush(NULL);
-    if (!rd_zfa_active()) return my->glXQueryExtensionsString ? my->glXQueryExtensionsString(dpy, screen) : (void*)"";
+    if (!rd_bridge_active()) return my->glXQueryExtensionsString ? my->glXQueryExtensionsString(dpy, screen) : (void*)"";
     (void)dpy; (void)screen;
     return (void*)"";
 }
@@ -238,7 +267,7 @@ EXPORT void* my_glXQueryExtensionsString(x64emu_t* emu, void* dpy, int screen)
 EXPORT void* my_glXGetClientString(x64emu_t* emu, void* dpy, int name)
 {
     printf_log(LOG_NONE, "RIMDROID glXGetClientString ENTER name=%d\n", name); fflush(NULL);
-    if (!rd_zfa_active()) return my->glXGetClientString ? my->glXGetClientString(dpy, name) : (void*)"";
+    if (!rd_bridge_active()) return my->glXGetClientString ? my->glXGetClientString(dpy, name) : (void*)"";
     (void)dpy;
     if (name == 2) return (void*)"1.4";        // GLX_VERSION
     if (name == 1) return (void*)"RimDroid";   // GLX_VENDOR
@@ -247,7 +276,7 @@ EXPORT void* my_glXGetClientString(x64emu_t* emu, void* dpy, int name)
 EXPORT void* my_glXQueryServerString(x64emu_t* emu, void* dpy, int screen, int name)
 {
     printf_log(LOG_NONE, "RIMDROID glXQueryServerString ENTER name=%d\n", name); fflush(NULL);
-    if (!rd_zfa_active()) return my->glXQueryServerString ? my->glXQueryServerString(dpy, screen, name) : (void*)"";
+    if (!rd_bridge_active()) return my->glXQueryServerString ? my->glXQueryServerString(dpy, screen, name) : (void*)"";
     (void)dpy; (void)screen;
     if (name == 2) return (void*)"1.4";        // GLX_VERSION
     if (name == 1) return (void*)"RimDroid";   // GLX_VENDOR
@@ -255,14 +284,14 @@ EXPORT void* my_glXQueryServerString(x64emu_t* emu, void* dpy, int screen, int n
 }
 EXPORT void my_glXQueryDrawable(x64emu_t* emu, void* dpy, uintptr_t drawable, int attribute, void* value)
 {
-    if (!rd_zfa_active()) { if (my->glXQueryDrawable) my->glXQueryDrawable(dpy, drawable, attribute, value); return; }
+    if (!rd_bridge_active()) { if (my->glXQueryDrawable) my->glXQueryDrawable(dpy, drawable, attribute, value); return; }
     (void)dpy; (void)drawable; (void)attribute;
     if (value) *(unsigned int*)value = 0;
 }
 EXPORT int my_glXGetConfig(x64emu_t* emu, void* dpy, void* vis, int attrib, void* value)
 {
     printf_log(LOG_NONE, "RIMDROID glXGetConfig ENTER attrib=%d\n", attrib); fflush(NULL);
-    if (!rd_zfa_active()) return my->glXGetConfig ? my->glXGetConfig(dpy, vis, attrib, value) : 0;
+    if (!rd_bridge_active()) return my->glXGetConfig ? my->glXGetConfig(dpy, vis, attrib, value) : 0;
     (void)dpy; (void)vis;
     if (!value) return 0;
     int* v = (int*)value;
@@ -280,7 +309,7 @@ EXPORT int my_glXGetConfig(x64emu_t* emu, void* dpy, void* vis, int attrib, void
 EXPORT void* my_glXGetProcAddress(x64emu_t* emu, void* name)
 {
     const char* rname = (const char*)name;
-    if (rd_zfa_active())
+    if (rd_bridge_active())
         return rimdroid_gl_getprocaddr(emu, my_lib->w.bridge, NULL, rname);
     pFp_t fnc = getBridgeFnc2((void*)R_RIP);
     if(!fnc) fnc=my->glXGetProcAddress;
@@ -289,7 +318,7 @@ EXPORT void* my_glXGetProcAddress(x64emu_t* emu, void* name)
 EXPORT void* my_glXGetProcAddressARB(x64emu_t* emu, void* name)
 {
     const char* rname = (const char*)name;
-    if (rd_zfa_active()) {
+    if (rd_bridge_active()) {
         printf_log(LOG_NONE, "RIMDROID glXGetProcAddressARB('%s')\n", rname?rname:"(null)"); fflush(NULL);
         return rimdroid_gl_getprocaddr(emu, my_lib->w.bridge, NULL, rname);
     }

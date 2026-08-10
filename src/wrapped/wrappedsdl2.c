@@ -705,10 +705,129 @@ static void rd_glTexStorage2D(uint32_t target, int32_t levels, uint32_t ifmt, in
         { rd_texlog_n++; printf_log(LOG_NONE, "RIMDROID GLSANITY glTexStorage2D target=0x%x levels=%d ifmt=0x%x %dx%d\n", target, levels, ifmt, w, h); fflush(NULL); }
     if (p_rd_real_glTexStorage2D) p_rd_real_glTexStorage2D(target, levels, ifmt, w, h);
 }
+#include <fcntl.h>    // the bounce fault-proof copy below
+#include <errno.h>
+#include <unistd.h>
+#include <sys/uio.h>      // struct iovec
+#include <sys/syscall.h>  // SYS_process_vm_readv
+
+// ---- UNPACK sanitizer for the GL-translator path (2026-08-10) ---------------------------------
+// RimWorld 1.6 on MobileGlues died with a SEGV INSIDE libGLESv2_adreno.so while reading source
+// pixels of a plain glTexImage2D(level=1, RGBA8 2048x1024) during the atlas bake: the driver's
+// UNPACK_ROW_LENGTH described wider rows than the buffer Unity passed (read past the end into
+// box64's PROT_NONE reservation). Root shape: our glX bridge aliases ALL of Unity's logical GL
+// contexts onto ONE real context, so per-context unpack state Unity sets on one logical context
+// leaks into uploads made on another (where Unity assumes pristine defaults). ZFA never tripped
+// this because Unity uploads BC7-compressed there (compressed uploads ignore unpack state); MG
+// advertises no BC7, so Unity falls back to uncompressed mip uploads — the unpack-sensitive path.
+// MobileGlues itself sanitizes unpack ONLY when it has to convert the pixels; RGBA8/UNSIGNED_BYTE
+// passes straight through to the driver with whatever state accumulated.
+// Fix: on the translator path, force tight packing (ROW_LENGTH/SKIP_* = 0) before every
+// uncompressed TexImage/TexSubImage upload. Unity always hands tight per-level buffers, so tight
+// is both crash-proof and correct. Going through the translator's own glPixelStorei keeps its
+// internal unpack shadow coherent too. Compressed uploads don't use unpack state — untouched.
+static void (*p_rd_real_glPixelStorei)(uint32_t, int32_t) = NULL;
+static int rd_glt_on(void) {   /* a GL translator is active this launch (env set by GameLauncher) */
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("RIMDROID_GLT"); on = (e && e[0]) ? 1 : 0; }
+    return on;
+}
+static void rd_unpack_tighten(void) {
+    if (!rd_glt_on()) return;
+    if (!p_rd_real_glPixelStorei)
+        p_rd_real_glPixelStorei = (void(*)(uint32_t, int32_t))rimdroid_gl_proc_resolver("glPixelStorei");
+    if (!p_rd_real_glPixelStorei) return;
+    p_rd_real_glPixelStorei(0x0CF2 /*GL_UNPACK_ROW_LENGTH*/, 0);
+    p_rd_real_glPixelStorei(0x0CF3 /*GL_UNPACK_SKIP_ROWS*/, 0);
+    p_rd_real_glPixelStorei(0x0CF4 /*GL_UNPACK_SKIP_PIXELS*/, 0);
+}
+// Driver-overread bounce (2026-08-10, the second half of the same crash): with unpack state
+// PROVEN tight (sanitizer above active), the Adreno GLES driver still SEGVed at the identical
+// page-aligned address reading glTexImage2D(level=1, RGBA8 2048x1024) source pixels. The level-1
+// buffer is exactly 8MB (page-multiple) and Unity's allocation ends flush against box64's
+// PROT_NONE address reservation — the driver's vectorized row copy reads a little past the end
+// of the client buffer (harmless everywhere else: heap slack absorbs it; fatal here). Relocate
+// the pixels into our own buffer with a page of slack and feed the driver the copy. Interpretation
+// is unchanged — bytes only move — and we only do it when the tight size is unambiguous
+// (computable bpp, 8-aligned rows) and no unpack PBO is bound (then 'pixels' is an offset).
+// Static buffer reuse is safe: the translator path forces single-threaded rendering.
+static int rd_upload_bpp(uint32_t fmt, uint32_t type) {
+    int ch;
+    switch (fmt) {
+        case 0x1908: case 0x80E1: ch = 4; break;   /* RGBA, BGRA */
+        case 0x1907: ch = 3; break;                /* RGB */
+        case 0x8227: ch = 2; break;                /* RG */
+        case 0x1903: case 0x1906: case 0x1909: ch = 1; break;  /* RED, ALPHA, LUMINANCE */
+        default: return 0;
+    }
+    switch (type) {
+        case 0x1401: case 0x1400: return ch;       /* UNSIGNED_BYTE, BYTE */
+        case 0x140B: return 2 * ch;                /* HALF_FLOAT */
+        case 0x1406: return 4 * ch;                /* FLOAT */
+        case 0x8363: case 0x8033: case 0x8034: return 2;   /* packed 565 / 4444 / 5551 */
+        case 0x8367: case 0x8368: return 4;        /* UNSIGNED_INT_8_8_8_8_REV, 2_10_10_10_REV */
+        default: return 0;
+    }
+}
+// Fault-proof relocation core, shared by the uncompressed and compressed upload paths.
+// The source can be SHORT or HOLEY: Unity legitimately hands out freshly-allocated guest
+// buffers it never wrote (a real Linux kernel serves transparent zero pages there), but box64
+// commits guest anonymous memory lazily and only its GUEST-fault handler commits pages — a
+// NATIVE reader (the GLES driver, or a plain memcpy here) SEGVs instead. process_vm_readv on
+// our own pid reads as much as is committed and STOPS at any unreadable page instead of
+// faulting; unreadable stretches are zero-filled — byte-exact Linux semantics. Loud log keeps
+// the numbers visible. Static buffer reuse is safe: the translator path is single-threaded.
+static const void* rd_glt_bounce_bytes(const void* px, size_t sz, int32_t w, int32_t h, uint32_t fmt, uint32_t type) {
+    if (!rd_glt_on() || !px || !sz || sz > (64u << 20)) return px;
+    // 'pixels' is a PBO offset when an unpack buffer is bound — reading it here would fault on US.
+    static void (*p_getiv)(uint32_t, int32_t*) = NULL;
+    if (!p_getiv) p_getiv = (void(*)(uint32_t, int32_t*))rimdroid_gl_proc_resolver("glGetIntegerv");
+    if (p_getiv) { int32_t pbo = 0; p_getiv(0x88EF /*PIXEL_UNPACK_BUFFER_BINDING*/, &pbo); if (pbo) return px; }
+    static void* buf = NULL; static size_t cap = 0;
+    if (cap < sz + 4096) {
+        void* nb = realloc(buf, sz + 4096);
+        if (!nb) return px;
+        buf = nb; cap = sz + 4096;
+    }
+    size_t done = 0, zeroed = 0;
+    const char* base = (const char*)px;
+    char* dst = (char*)buf;
+    while (done < sz) {
+        struct iovec lio = { dst + done, sz - done };
+        struct iovec rio = { (void*)(base + done), sz - done };
+        // Direct syscall: bionic hides the process_vm_readv prototype behind _GNU_SOURCE.
+        ssize_t r = syscall(SYS_process_vm_readv, getpid(), &lio, 1UL, &rio, 1UL, 0UL);
+        if (r > 0) { done += (size_t)r; continue; }
+        // Unreadable at 'done': zero to the next page boundary and step over it.
+        size_t next = ((((uintptr_t)base + done) >> 12) + 1 << 12) - (uintptr_t)base;
+        if (next > sz) next = sz;
+        memset(dst + done, 0, next - done);
+        zeroed += next - done;
+        done = next;
+    }
+    if (zeroed) {
+        static int n = 0;
+        if (n < 24) { n++; printf_log(LOG_NONE, "RIMDROID GLT-BOUNCE HOLEY SOURCE: %dx%d fmt=0x%x type=0x%x size=%zu, %zu bytes unreadable and zero-filled (px=%p)\n",
+                                      w, h, fmt, type, sz, zeroed, px); fflush(NULL); }
+    }
+    return buf;
+}
+static const void* rd_upload_bounce(int32_t w, int32_t h, uint32_t fmt, uint32_t type, const void* px) {
+    if (!px || w <= 0 || h <= 0) return px;
+    int bpp = rd_upload_bpp(fmt, type);
+    if (!bpp) return px;
+    size_t row = (size_t)w * (size_t)bpp;
+    /* Padded-row ambiguity only exists with MULTIPLE rows — a single row has no stride, so the
+     * tail mips (1x1, and any Nx1) are safe to bounce despite odd row sizes. Skipping them was
+     * exactly the last crash: the whole zero-filled mip chain passed and the raw 1x1 faulted. */
+    if ((row & 7) && h > 1) return px;
+    return rd_glt_bounce_bytes(px, row * (size_t)h, w, h, fmt, type);
+}
 static void rd_glTexImage2D(uint32_t target, int32_t level, int32_t ifmt, int32_t w, int32_t h, int32_t border, uint32_t fmt, uint32_t type, const void* px) {
+    if (px) { rd_unpack_tighten(); px = rd_upload_bounce(w, h, fmt, type, px); }
     if (level == 0) rd_tex_account((uint32_t)ifmt, 1, w, h);
     if ((w >= 2048 || h >= 2048 || w < 0 || h < 0) && rd_texlog_n < 48)
-        { rd_texlog_n++; printf_log(LOG_NONE, "RIMDROID GLSANITY glTexImage2D target=0x%x level=%d ifmt=0x%x %dx%d\n", target, level, ifmt, w, h); fflush(NULL); }
+        { rd_texlog_n++; printf_log(LOG_NONE, "RIMDROID GLSANITY glTexImage2D target=0x%x level=%d ifmt=0x%x %dx%d fmt=0x%x type=0x%x px=%p\n", target, level, ifmt, w, h, fmt, type, px); fflush(NULL); }
     if (p_rd_real_glTexImage2D) p_rd_real_glTexImage2D(target, level, ifmt, w, h, border, fmt, type, px);
 }
 static void (*p_rd_real_glTexStorage3D)(uint32_t,int32_t,uint32_t,int32_t,int32_t,int32_t) = NULL;
@@ -725,6 +844,9 @@ static void rd_glTexImage3D(uint32_t target, int32_t level, int32_t ifmt, int32_
 }
 static void (*p_rd_real_glCompressedTexImage2D)(uint32_t,int32_t,uint32_t,int32_t,int32_t,int32_t,int32_t,const void*) = NULL;
 static void rd_glCompressedTexImage2D(uint32_t target, int32_t level, uint32_t ifmt, int32_t w, int32_t h, int32_t border, int32_t imageSize, const void* data) {
+    // Translator path: same lazy-commit hole as the uncompressed uploads (Texture2D:Compress
+    // faulted the driver here) — compressed data carries its exact size, bounce is trivial.
+    if (data && imageSize > 0) data = rd_glt_bounce_bytes(data, (size_t)imageSize, w, h, ifmt, 0);
     if (level == 0 && imageSize > 0) { rd_tex_total += (uint64_t)imageSize; rd_upload_pace((uint64_t)imageSize); }
     if (p_rd_real_glCompressedTexImage2D) p_rd_real_glCompressedTexImage2D(target, level, ifmt, w, h, border, imageSize, data);
 }
@@ -779,6 +901,7 @@ static void rd_sub_account(uint64_t sz) {
     rd_upload_pace(sz);
 }
 static void rd_glTexSubImage2D(uint32_t target, int32_t level, int32_t xo, int32_t yo, int32_t w, int32_t h, uint32_t fmt, uint32_t type, const void* px) {
+    if (px) { rd_unpack_tighten(); px = rd_upload_bounce(w, h, fmt, type, px); }   // translator path: see notes above
     // Texture shrink: on a shrunk texture the game's level-N data belongs in our level N-shift;
     // data for the dropped top level(s) has nowhere to go (the smaller mips carry the image) and
     // is discarded BEFORE accounting — a dropped upload must not advance the pacing counters.
@@ -812,6 +935,7 @@ static void rd_glCompressedTexSubImage2D(uint32_t target, int32_t level, int32_t
         rd_shrink_feed(rd_cur_tex2d());
       } }
     if (rd_t16_hi && target == RD_GL_TEXTURE_2D) rd_t16_mark(rd_cur_tex2d(), RD_T16_F_SUB, "SUB-UPLOAD");
+    if (data && imageSize > 0) data = rd_glt_bounce_bytes(data, (size_t)imageSize, w, h, fmt, 0);  // translator path
     if (imageSize > 0) {
         if (rd_sublog_n < 4) { rd_sublog_n++; printf_log(LOG_NONE, "RIMDROID GLSANITY glCompressedTexSubImage2D level=%d %dx%d fmt=0x%x size=%d\n", level, w, h, fmt, imageSize); fflush(NULL); }
         RD_OPLOG("RIMDROID OP#%llu CompressedTexSubImage2D lvl=%d %d,%d %dx%d fmt=0x%x sz=%d\n", (unsigned long long)rd_gl_op_seq, level, xo, yo, w, h, fmt, imageSize);
