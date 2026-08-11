@@ -660,8 +660,17 @@ static void rd_glDeleteTextures(int32_t n, const uint32_t* ids) {
         p_rd_real_glDeleteTextures = (void(*)(int32_t,const uint32_t*))rd_zfa_gl("glDeleteTextures");
     if (p_rd_real_glDeleteTextures) p_rd_real_glDeleteTextures(n, ids);
 }
+// S3TC-decode helpers live further down (with the translator upload machinery); TexStorage2D
+// needs them first for the allocation-format conversion.
+static int rd_s3tc_decode_on(void);
+static int rd_s3tc_fmt(uint32_t f);
+static uint32_t rd_s3tc_rgba_ifmt(uint32_t f);
 static void rd_glTexStorage2D(uint32_t target, int32_t levels, uint32_t ifmt, int32_t w, int32_t h) {
     RD_OPLOG("RIMDROID OP#%llu TexStorage2D lvls=%d ifmt=0x%x %dx%d\n", (unsigned long long)rd_gl_op_seq, levels, ifmt, w, h);
+    // S3TC decode mode: compressed allocations become RGBA8/SRGB8A8 so the decoded RGBA
+    // sub-uploads below are legal against the storage (see the S3TC-DECODE block above).
+    // Placed before telemetry/shrink so both account what is REALLY allocated.
+    if (rd_s3tc_decode_on() && rd_s3tc_fmt(ifmt)) ifmt = rd_s3tc_rgba_ifmt(ifmt);
     // T16 telemetry: record big uncompressed allocations with ORIGINAL dims (before any shrink).
     if (target == RD_GL_TEXTURE_2D) rd_t16_alloc(rd_cur_tex2d(), ifmt, levels, w, h);
     // Texture shrink: a mipped 2D allocation loses its top level (see block comment above).
@@ -812,6 +821,95 @@ static const void* rd_glt_bounce_bytes(const void* px, size_t sz, int32_t w, int
     }
     return buf;
 }
+// ---- S3TC/DXT software decode for translator + non-Adreno GPUs (2026-08-11) -------------------
+// Field: Mali-G615 (Infinix Note 50s) on MobileGlues = pitch-black WORLD with a live UI. Unity's
+// GLCore backend never PROBES for DXT support — desktop GL always has it, so it uploads DXT1/5
+// unconditionally (zero "DXT not supported" lines in Player.log on either device, vs 8 BC7 ones).
+// Adreno's GLES driver happens to accept S3TC (EXT_texture_compression_s3tc) → her S25 renders;
+// Mali has no S3TC in hardware → every world-atlas upload silently dies → black map, working
+// (uncompressed) UI. Hiding the extension can't help someone who never asks — so the shim decodes
+// DXT to RGBA8 itself at upload time. Gated by RIMDROID_GLT_DECODE_S3TC=1, which GameLauncher
+// sets when a translator is active on a non-Adreno GPU (extra-env applies later, so =0 there is
+// the escape hatch and =1 forces it on Adreno for A/B). Allocations convert alongside uploads
+// (glTexStorage2D with an S3TC internalformat becomes RGBA8/SRGB8A8 — RGBA sub-uploads into
+// compressed storage would be GL errors otherwise).
+static int rd_s3tc_decode_on(void) {
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("RIMDROID_GLT_DECODE_S3TC"); on = (e && e[0] == '1') ? 1 : 0;
+        if (on) { printf_log(LOG_NONE, "RIMDROID GLT S3TC-DECODE enabled (translator on a GPU without S3TC)\n"); fflush(NULL); } }
+    return on;
+}
+static int rd_s3tc_fmt(uint32_t f)  { return (f >= 0x83F0u && f <= 0x83F3u) || (f >= 0x8C4Cu && f <= 0x8C4Fu); }
+static int rd_s3tc_srgb(uint32_t f) { return f >= 0x8C4Cu && f <= 0x8C4Fu; }
+static int rd_s3tc_blocksize(uint32_t f) { return (f == 0x83F0u || f == 0x83F1u || f == 0x8C4Cu || f == 0x8C4Du) ? 8 : 16; }
+static uint32_t rd_s3tc_rgba_ifmt(uint32_t f) { return rd_s3tc_srgb(f) ? 0x8C43u : 0x8058u; }  /* SRGB8_ALPHA8 : RGBA8 */
+static void rd_bc1_colors(const uint8_t* b, uint8_t c[4][4], int dxt1_mode) {
+    uint16_t c0 = (uint16_t)(b[0] | (b[1] << 8)), c1 = (uint16_t)(b[2] | (b[3] << 8));
+    for (int i = 0; i < 2; i++) {
+        uint16_t cc = i ? c1 : c0;
+        c[i][0] = (uint8_t)(((cc >> 11) & 31) * 255 / 31);
+        c[i][1] = (uint8_t)(((cc >> 5) & 63) * 255 / 63);
+        c[i][2] = (uint8_t)((cc & 31) * 255 / 31);
+        c[i][3] = 255;
+    }
+    if (!dxt1_mode || c0 > c1) {   /* 4-color mode (always, for DXT3/5 color blocks) */
+        for (int k = 0; k < 3; k++) {
+            c[2][k] = (uint8_t)((2 * c[0][k] + c[1][k]) / 3);
+            c[3][k] = (uint8_t)((c[0][k] + 2 * c[1][k]) / 3);
+        }
+        c[2][3] = 255; c[3][3] = 255;
+    } else {                       /* 3-color + punch-through transparent */
+        for (int k = 0; k < 3; k++) c[2][k] = (uint8_t)((c[0][k] + c[1][k]) / 2);
+        c[2][3] = 255;
+        c[3][0] = c[3][1] = c[3][2] = c[3][3] = 0;
+    }
+}
+/* Decode one S3TC image into tight RGBA8. dst must hold w*h*4. Block edges clamp to w/h. */
+static void rd_s3tc_decode(uint32_t fmt, int32_t w, int32_t h, const uint8_t* src, size_t srcsz, uint8_t* dst) {
+    const int bs = rd_s3tc_blocksize(fmt);
+    const int dxt1 = (bs == 8);
+    const int dxt3 = (fmt == 0x83F2u || fmt == 0x8C4Eu);
+    const int bw = (w + 3) / 4, bh = (h + 3) / 4;
+    for (int by = 0; by < bh; by++) for (int bx = 0; bx < bw; bx++) {
+        size_t off = ((size_t)by * bw + bx) * bs;
+        if (off + bs > srcsz) return;                   /* short source (bounced+zeroed) — stop */
+        const uint8_t* blk = src + off;
+        const uint8_t* cb = dxt1 ? blk : blk + 8;       /* color half of DXT3/5 sits after alpha */
+        uint8_t cols[4][4];
+        rd_bc1_colors(cb, cols, dxt1);
+        uint32_t cidx = (uint32_t)(cb[4] | (cb[5] << 8) | (cb[6] << 16) | ((uint32_t)cb[7] << 24));
+        uint8_t a5[8];
+        if (!dxt1 && !dxt3) {                           /* DXT5 interpolated alpha table */
+            a5[0] = blk[0]; a5[1] = blk[1];
+            if (a5[0] > a5[1]) for (int i = 0; i < 6; i++) a5[2 + i] = (uint8_t)(((6 - i) * a5[0] + (1 + i) * a5[1]) / 7);
+            else { for (int i = 0; i < 4; i++) a5[2 + i] = (uint8_t)(((4 - i) * a5[0] + (1 + i) * a5[1]) / 5); a5[6] = 0; a5[7] = 255; }
+        }
+        for (int py = 0; py < 4; py++) for (int px2 = 0; px2 < 4; px2++) {
+            int x = bx * 4 + px2, y = by * 4 + py;
+            if (x >= w || y >= h) continue;
+            int ti = py * 4 + px2;
+            const uint8_t* c = cols[(cidx >> (2 * ti)) & 3];
+            uint8_t* o = dst + ((size_t)y * w + x) * 4;
+            o[0] = c[0]; o[1] = c[1]; o[2] = c[2];
+            if (dxt1) o[3] = c[3];
+            else if (dxt3) { uint8_t a = (uint8_t)((blk[ti >> 1] >> ((ti & 1) * 4)) & 0xF); o[3] = (uint8_t)(a * 17); }
+            else { uint64_t abits = 0; for (int i = 0; i < 6; i++) abits |= (uint64_t)blk[2 + i] << (8 * i);
+                   o[3] = a5[(abits >> (3 * ti)) & 7]; }
+        }
+    }
+}
+/* Decode into a reusable buffer; returns NULL on OOM/oversize. Single-threaded path. */
+static uint8_t* rd_s3tc_decode_buf(uint32_t fmt, int32_t w, int32_t h, const void* src, size_t srcsz) {
+    static uint8_t* dbuf = NULL; static size_t dcap = 0;
+    size_t need = (size_t)w * (size_t)h * 4;
+    if (!need || need > (256u << 20)) return NULL;
+    if (dcap < need) { void* nb = realloc(dbuf, need); if (!nb) return NULL; dbuf = (uint8_t*)nb; dcap = need; }
+    memset(dbuf, 0, need);
+    rd_s3tc_decode(fmt, w, h, (const uint8_t*)src, srcsz, dbuf);
+    return dbuf;
+}
+static uint64_t rd_s3tc_decoded_n = 0;
+
 static const void* rd_upload_bounce(int32_t w, int32_t h, uint32_t fmt, uint32_t type, const void* px) {
     if (!px || w <= 0 || h <= 0) return px;
     int bpp = rd_upload_bpp(fmt, type);
@@ -848,6 +946,19 @@ static void rd_glCompressedTexImage2D(uint32_t target, int32_t level, uint32_t i
     // faulted the driver here) — compressed data carries its exact size, bounce is trivial.
     if (data && imageSize > 0) data = rd_glt_bounce_bytes(data, (size_t)imageSize, w, h, ifmt, 0);
     if (level == 0 && imageSize > 0) { rd_tex_total += (uint64_t)imageSize; rd_upload_pace((uint64_t)imageSize); }
+    // S3TC decode mode: hand the driver plain RGBA8 instead of DXT it cannot eat (Mali).
+    if (rd_s3tc_decode_on() && rd_s3tc_fmt(ifmt) && data && imageSize > 0 && w > 0 && h > 0) {
+        uint8_t* dec = rd_s3tc_decode_buf(ifmt, w, h, data, (size_t)imageSize);
+        if (dec) {
+            rd_s3tc_decoded_n++;
+            if (rd_s3tc_decoded_n <= 8 || (rd_s3tc_decoded_n & 255) == 0)
+                { printf_log(LOG_NONE, "RIMDROID GLT S3TC-DECODE TexImage lvl=%d %dx%d ifmt=0x%x (n=%llu)\n",
+                             level, w, h, ifmt, (unsigned long long)rd_s3tc_decoded_n); fflush(NULL); }
+            if (p_rd_real_glTexImage2D)
+                p_rd_real_glTexImage2D(target, level, (int32_t)rd_s3tc_rgba_ifmt(ifmt), w, h, border, 0x1908u /*RGBA*/, 0x1401u /*UNSIGNED_BYTE*/, dec);
+            return;
+        }
+    }
     if (p_rd_real_glCompressedTexImage2D) p_rd_real_glCompressedTexImage2D(target, level, ifmt, w, h, border, imageSize, data);
 }
 static void (*p_rd_real_glRenderbufferStorage)(uint32_t,uint32_t,int32_t,int32_t) = NULL;
@@ -940,6 +1051,24 @@ static void rd_glCompressedTexSubImage2D(uint32_t target, int32_t level, int32_t
         if (rd_sublog_n < 4) { rd_sublog_n++; printf_log(LOG_NONE, "RIMDROID GLSANITY glCompressedTexSubImage2D level=%d %dx%d fmt=0x%x size=%d\n", level, w, h, fmt, imageSize); fflush(NULL); }
         RD_OPLOG("RIMDROID OP#%llu CompressedTexSubImage2D lvl=%d %d,%d %dx%d fmt=0x%x sz=%d\n", (unsigned long long)rd_gl_op_seq, level, xo, yo, w, h, fmt, imageSize);
         rd_sub_account((uint64_t)imageSize);
+    }
+    // S3TC decode mode: the storage was converted to RGBA8 at TexStorage time (see above), so the
+    // decoded pixels go in as a plain RGBA sub-upload. xo/yo/level are already shrink-remapped.
+    if (rd_s3tc_decode_on() && rd_s3tc_fmt(fmt) && data && imageSize > 0 && w > 0 && h > 0) {
+        uint8_t* dec = rd_s3tc_decode_buf(fmt, w, h, data, (size_t)imageSize);
+        if (dec) {
+            rd_s3tc_decoded_n++;
+            if (rd_s3tc_decoded_n <= 8 || (rd_s3tc_decoded_n & 255) == 0)
+                { printf_log(LOG_NONE, "RIMDROID GLT S3TC-DECODE TexSubImage lvl=%d %d,%d %dx%d fmt=0x%x (n=%llu)\n",
+                             level, xo, yo, w, h, fmt, (unsigned long long)rd_s3tc_decoded_n); fflush(NULL); }
+            if (!p_rd_real_glTexSubImage2D && &g_zfa_handle && g_zfa_handle)
+                p_rd_real_glTexSubImage2D = (void(*)(uint32_t,int32_t,int32_t,int32_t,int32_t,int32_t,uint32_t,uint32_t,const void*))dlsym(g_zfa_handle, "glTexSubImage2D");
+            if (!p_rd_real_glTexSubImage2D)
+                p_rd_real_glTexSubImage2D = (void(*)(uint32_t,int32_t,int32_t,int32_t,int32_t,int32_t,uint32_t,uint32_t,const void*))rimdroid_gl_proc_resolver("glTexSubImage2D");
+            if (p_rd_real_glTexSubImage2D)
+                p_rd_real_glTexSubImage2D(target, level, xo, yo, w, h, 0x1908u /*RGBA*/, 0x1401u /*UNSIGNED_BYTE*/, dec);
+            return;
+        }
     }
     if (p_rd_real_glCompressedTexSubImage2D) p_rd_real_glCompressedTexSubImage2D(target, level, xo, yo, w, h, fmt, imageSize, data);
 }
