@@ -439,6 +439,11 @@ set(ELFLOADER_SRC
     "${BOX64_ROOT}/src/main.c"
     "${BOX64_ROOT}/src/test.c"
     "${BOX64_ROOT}/src/core.c"
+    # RimDroid: S3TC->ETC2 encoder. Deliberately NOT in the WRAPPEDS list (that list feeds the
+    # wrapper generator, which demands a *_private.h per entry) — it is a plain helper TU that
+    # only wrappedsdl2.c calls. Gets per-file -O2 (set right below the ELFLOADER_SRC list — it
+    # must come AFTER BOX64_ROOT is defined; keyed on the path, an early empty prefix won't match).
+    "${BOX64_ROOT}/src/wrapped/rd_etc2.c"
     "${BOX64_ROOT}/src/box64context.c"
     "${BOX64_ROOT}/src/build_info.c"
     "${BOX64_ROOT}/src/custommem.c"
@@ -489,6 +494,11 @@ set(ELFLOADER_SRC
     "${BOX64_ROOT}/src/tools/pe_tools.c"
     "${BOX64_ROOT}/src/wrapped/generated/wrapper.c"
 )
+# [RD 2026-08-12] The S3TC->ETC2 encoder is pure arithmetic (no dynarec/emulation interplay), so it
+# always gets fast codegen — even in DEBUG builds, whose global -O0 turned the RimWorld 1.6 atlas
+# bake into a 10-minute load that Android SIGKILLed as unresponsive. Must live below the
+# BOX64_ROOT definition: the property is keyed on the full path.
+set_source_files_properties("${BOX64_ROOT}/src/wrapped/rd_etc2.c" PROPERTIES COMPILE_FLAGS "-O2")
 if(NOT STATICBUILD)
     list(APPEND ELFLOADER_SRC
         "${BOX64_ROOT}/src/mallochook.c"

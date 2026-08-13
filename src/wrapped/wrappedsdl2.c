@@ -665,12 +665,15 @@ static void rd_glDeleteTextures(int32_t n, const uint32_t* ids) {
 static int rd_s3tc_decode_on(void);
 static int rd_s3tc_fmt(uint32_t f);
 static uint32_t rd_s3tc_rgba_ifmt(uint32_t f);
+static int rd_etc2_on(void);
+static uint32_t rd_s3tc_etc2_ifmt(uint32_t f);
 static void rd_glTexStorage2D(uint32_t target, int32_t levels, uint32_t ifmt, int32_t w, int32_t h) {
     RD_OPLOG("RIMDROID OP#%llu TexStorage2D lvls=%d ifmt=0x%x %dx%d\n", (unsigned long long)rd_gl_op_seq, levels, ifmt, w, h);
-    // S3TC decode mode: compressed allocations become RGBA8/SRGB8A8 so the decoded RGBA
-    // sub-uploads below are legal against the storage (see the S3TC-DECODE block above).
-    // Placed before telemetry/shrink so both account what is REALLY allocated.
-    if (rd_s3tc_decode_on() && rd_s3tc_fmt(ifmt)) ifmt = rd_s3tc_rgba_ifmt(ifmt);
+    // S3TC decode mode: compressed allocations must match what the converted uploads will carry —
+    // ETC2 when the transcode is on (same bytes-per-block as DXT, hardware on every GLES3 GPU),
+    // else RGBA8/SRGB8A8. Placed before telemetry/shrink so both account the real allocation.
+    if (rd_s3tc_decode_on() && rd_s3tc_fmt(ifmt))
+        ifmt = rd_etc2_on() ? rd_s3tc_etc2_ifmt(ifmt) : rd_s3tc_rgba_ifmt(ifmt);
     // T16 telemetry: record big uncompressed allocations with ORIGINAL dims (before any shrink).
     if (target == RD_GL_TEXTURE_2D) rd_t16_alloc(rd_cur_tex2d(), ifmt, levels, w, h);
     // Texture shrink: a mipped 2D allocation loses its top level (see block comment above).
@@ -792,7 +795,12 @@ static const void* rd_glt_bounce_bytes(const void* px, size_t sz, int32_t w, int
     static void (*p_getiv)(uint32_t, int32_t*) = NULL;
     if (!p_getiv) p_getiv = (void(*)(uint32_t, int32_t*))rimdroid_gl_proc_resolver("glGetIntegerv");
     if (p_getiv) { int32_t pbo = 0; p_getiv(0x88EF /*PIXEL_UNPACK_BUFFER_BINDING*/, &pbo); if (pbo) return px; }
-    static void* buf = NULL; static size_t cap = 0;
+    // _Thread_local since the threaded-texture-race brief (2026-08-12): with RIMDROID_GLT_THREADED
+    // two threads can be inside upload wrappers at once, and a SHARED scratch here meant thread B
+    // could realloc/overwrite the pixels thread A was still handing to the driver — the prime
+    // suspect for the random solid-color texture on the Tecno. Per-thread scratch costs one extra
+    // allocation in threaded mode and nothing in single-threaded mode.
+    static _Thread_local void* buf = NULL; static _Thread_local size_t cap = 0;
     if (cap < sz + 4096) {
         void* nb = realloc(buf, sz + 4096);
         if (!nb) return px;
@@ -900,7 +908,7 @@ static void rd_s3tc_decode(uint32_t fmt, int32_t w, int32_t h, const uint8_t* sr
 }
 /* Decode into a reusable buffer; returns NULL on OOM/oversize. Single-threaded path. */
 static uint8_t* rd_s3tc_decode_buf(uint32_t fmt, int32_t w, int32_t h, const void* src, size_t srcsz) {
-    static uint8_t* dbuf = NULL; static size_t dcap = 0;
+    static _Thread_local uint8_t* dbuf = NULL; static _Thread_local size_t dcap = 0;   // see bounce note
     size_t need = (size_t)w * (size_t)h * 4;
     if (!need || need > (256u << 20)) return NULL;
     if (dcap < need) { void* nb = realloc(dbuf, need); if (!nb) return NULL; dbuf = (uint8_t*)nb; dcap = need; }
@@ -909,6 +917,58 @@ static uint8_t* rd_s3tc_decode_buf(uint32_t fmt, int32_t w, int32_t h, const voi
     return dbuf;
 }
 static uint64_t rd_s3tc_decoded_n = 0;
+
+// ---- Upload-collision detector (Test B of the threaded-texture-race brief, 2026-08-12) --------
+// Proves or clears the scratch-buffer race in ONE run: every texture-upload wrapper marks itself
+// the owner for its whole body (native call included); a second thread entering while the mark is
+// held is a COLLISION — logged loudly with both tids. Zero collisions across a corrupted session
+// = the race is elsewhere (context aliasing / MobileGlues itself). Probe, not a lock: detection
+// only, nothing is serialized. Negligible cost (one atomic exchange per upload).
+static volatile int rd_upload_owner = 0;
+static uint64_t rd_upload_collisions = 0;
+static inline int rd_upload_enter(const char* what, uint32_t tex, int level, int32_t w, int32_t h) {
+    int me = (int)syscall(SYS_gettid);
+    int prev = __atomic_exchange_n(&rd_upload_owner, me, __ATOMIC_ACQ_REL);
+    if (prev != 0 && prev != me) {
+        rd_upload_collisions++;
+        if (rd_upload_collisions <= 16 || (rd_upload_collisions & 63) == 0)
+            { printf_log(LOG_NONE, "RIMDROID GLT UPLOAD-COLLISION #%llu: %s tex=%u lvl=%d %dx%d tid=%d entered while tid=%d was uploading\n",
+                         (unsigned long long)rd_upload_collisions, what, tex, level, w, h, me, prev); fflush(NULL); }
+    }
+    return me;
+}
+static inline void rd_upload_exit(int me) {
+    int expected = me;
+    __atomic_compare_exchange_n(&rd_upload_owner, &expected, 0, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+}
+
+// ---- S3TC -> ETC2 transcode (2026-08-12) ------------------------------------------------------
+// The RGBA8 decode above fixed the black world on Mali but made every world texture 4-8x fatter —
+// and bandwidth is exactly what budget SoCs starve on (the Tecno datapoint: tiers maxed, threading
+// +1-4 fps, still slow). ETC2 is the hardware-compressed format EVERY GLES3 GPU must support, with
+// the same bytes-per-block as DXT — so instead of decode-and-inflate we decode-and-recompress:
+// DXT1 -> RGB8_ETC2 (8B/block), DXT3/5 -> RGBA8_ETC2_EAC (16B/block), sRGB variants likewise.
+// Encoder = the classic fast subset (ETC1 individual/differential modes + bounded-search EAC),
+// etcpak-style: good sprite quality, ~µs/block scalar. Opt-in while field-testing:
+// RIMDROID_GLT_ETC2=1 in extra env, on top of the decode gate.
+static int rd_etc2_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("RIMDROID_GLT_ETC2");
+        on = (e && e[0] == '1' && rd_s3tc_decode_on()) ? 1 : 0;
+        if (on) { printf_log(LOG_NONE, "RIMDROID GLT S3TC->ETC2 transcode enabled\n"); fflush(NULL); }
+    }
+    return on;
+}
+static uint32_t rd_s3tc_etc2_ifmt(uint32_t f) {
+    int srgb = rd_s3tc_srgb(f);
+    if (f == 0x83F0u || f == 0x8C4Cu) return srgb ? 0x9275u : 0x9274u;   /* DXT1-RGB -> (S)RGB8_ETC2 */
+    return srgb ? 0x9279u : 0x9278u;                                     /* alpha'd -> (S)RGBA8_ETC2_EAC */
+}
+// The encoder itself lives in rd_etc2.c — its OWN translation unit, compiled -O2 (see CMakeLists):
+// at this file's safe -O0 the full-search encode was a 10-minute load Android SIGKILLed.
+#include "rd_etc2.h"
+static uint64_t rd_etc2_encoded_n = 0;
 
 static const void* rd_upload_bounce(int32_t w, int32_t h, uint32_t fmt, uint32_t type, const void* px) {
     if (!px || w <= 0 || h <= 0) return px;
@@ -922,11 +982,13 @@ static const void* rd_upload_bounce(int32_t w, int32_t h, uint32_t fmt, uint32_t
     return rd_glt_bounce_bytes(px, row * (size_t)h, w, h, fmt, type);
 }
 static void rd_glTexImage2D(uint32_t target, int32_t level, int32_t ifmt, int32_t w, int32_t h, int32_t border, uint32_t fmt, uint32_t type, const void* px) {
+    int rd_up_tid = rd_upload_enter("TexImage2D", rd_cur_tex2d(), level, w, h);
     if (px) { rd_unpack_tighten(); px = rd_upload_bounce(w, h, fmt, type, px); }
     if (level == 0) rd_tex_account((uint32_t)ifmt, 1, w, h);
     if ((w >= 2048 || h >= 2048 || w < 0 || h < 0) && rd_texlog_n < 48)
         { rd_texlog_n++; printf_log(LOG_NONE, "RIMDROID GLSANITY glTexImage2D target=0x%x level=%d ifmt=0x%x %dx%d fmt=0x%x type=0x%x px=%p\n", target, level, ifmt, w, h, fmt, type, px); fflush(NULL); }
     if (p_rd_real_glTexImage2D) p_rd_real_glTexImage2D(target, level, ifmt, w, h, border, fmt, type, px);
+    rd_upload_exit(rd_up_tid);
 }
 static void (*p_rd_real_glTexStorage3D)(uint32_t,int32_t,uint32_t,int32_t,int32_t,int32_t) = NULL;
 static void rd_glTexStorage3D(uint32_t target, int32_t levels, uint32_t ifmt, int32_t w, int32_t h, int32_t d) {
@@ -942,11 +1004,14 @@ static void rd_glTexImage3D(uint32_t target, int32_t level, int32_t ifmt, int32_
 }
 static void (*p_rd_real_glCompressedTexImage2D)(uint32_t,int32_t,uint32_t,int32_t,int32_t,int32_t,int32_t,const void*) = NULL;
 static void rd_glCompressedTexImage2D(uint32_t target, int32_t level, uint32_t ifmt, int32_t w, int32_t h, int32_t border, int32_t imageSize, const void* data) {
+    int rd_up_tid = rd_upload_enter("CompressedTexImage2D", rd_cur_tex2d(), level, w, h);
     // Translator path: same lazy-commit hole as the uncompressed uploads (Texture2D:Compress
     // faulted the driver here) — compressed data carries its exact size, bounce is trivial.
     if (data && imageSize > 0) data = rd_glt_bounce_bytes(data, (size_t)imageSize, w, h, ifmt, 0);
     if (level == 0 && imageSize > 0) { rd_tex_total += (uint64_t)imageSize; rd_upload_pace((uint64_t)imageSize); }
-    // S3TC decode mode: hand the driver plain RGBA8 instead of DXT it cannot eat (Mali).
+    // S3TC decode mode: hand the driver plain RGBA8 instead of DXT it cannot eat (Mali) — or,
+    // with RIMDROID_GLT_ETC2=1, recompress to the GLES-native ETC2 (same bytes-per-block as DXT:
+    // the decode-to-RGBA fix cost 4-8x memory/bandwidth, which is exactly what budget SoCs lack).
     if (rd_s3tc_decode_on() && rd_s3tc_fmt(ifmt) && data && imageSize > 0 && w > 0 && h > 0) {
         uint8_t* dec = rd_s3tc_decode_buf(ifmt, w, h, data, (size_t)imageSize);
         if (dec) {
@@ -954,12 +1019,29 @@ static void rd_glCompressedTexImage2D(uint32_t target, int32_t level, uint32_t i
             if (rd_s3tc_decoded_n <= 8 || (rd_s3tc_decoded_n & 255) == 0)
                 { printf_log(LOG_NONE, "RIMDROID GLT S3TC-DECODE TexImage lvl=%d %dx%d ifmt=0x%x (n=%llu)\n",
                              level, w, h, ifmt, (unsigned long long)rd_s3tc_decoded_n); fflush(NULL); }
+            if (rd_etc2_on()) {
+                size_t esz = 0;
+                uint32_t efmt = rd_s3tc_etc2_ifmt(ifmt);
+                const void* enc = rd_etc2_encode(efmt, w, h, dec, &esz);
+                if (enc) {
+                    rd_etc2_encoded_n++;
+                    if (rd_etc2_encoded_n <= 8 || (rd_etc2_encoded_n & 255) == 0)
+                        { printf_log(LOG_NONE, "RIMDROID GLT ETC2 TexImage lvl=%d %dx%d 0x%x->0x%x sz=%zu (n=%llu)\n",
+                                     level, w, h, ifmt, efmt, esz, (unsigned long long)rd_etc2_encoded_n); fflush(NULL); }
+                    if (p_rd_real_glCompressedTexImage2D)
+                        p_rd_real_glCompressedTexImage2D(target, level, efmt, w, h, border, (int32_t)esz, enc);
+                    rd_upload_exit(rd_up_tid);
+                    return;
+                }
+            }
             if (p_rd_real_glTexImage2D)
                 p_rd_real_glTexImage2D(target, level, (int32_t)rd_s3tc_rgba_ifmt(ifmt), w, h, border, 0x1908u /*RGBA*/, 0x1401u /*UNSIGNED_BYTE*/, dec);
+            rd_upload_exit(rd_up_tid);
             return;
         }
     }
     if (p_rd_real_glCompressedTexImage2D) p_rd_real_glCompressedTexImage2D(target, level, ifmt, w, h, border, imageSize, data);
+    rd_upload_exit(rd_up_tid);
 }
 static void (*p_rd_real_glRenderbufferStorage)(uint32_t,uint32_t,int32_t,int32_t) = NULL;
 static void rd_glRenderbufferStorage(uint32_t target, uint32_t ifmt, int32_t w, int32_t h) {
@@ -1012,12 +1094,13 @@ static void rd_sub_account(uint64_t sz) {
     rd_upload_pace(sz);
 }
 static void rd_glTexSubImage2D(uint32_t target, int32_t level, int32_t xo, int32_t yo, int32_t w, int32_t h, uint32_t fmt, uint32_t type, const void* px) {
+    int rd_up_tid = rd_upload_enter("TexSubImage2D", rd_cur_tex2d(), level, w, h);
     if (px) { rd_unpack_tighten(); px = rd_upload_bounce(w, h, fmt, type, px); }   // translator path: see notes above
     // Texture shrink: on a shrunk texture the game's level-N data belongs in our level N-shift;
     // data for the dropped top level(s) has nowhere to go (the smaller mips carry the image) and
     // is discarded BEFORE accounting — a dropped upload must not advance the pacing counters.
     { int sh = (target == RD_GL_TEXTURE_2D) ? rd_shrink_get(rd_cur_tex2d()) : 0;
-      if (sh) { if (level < sh) { rd_shrink_dropped++; return; } level -= sh; rd_shrink_feed(rd_cur_tex2d()); } }
+      if (sh) { if (level < sh) { rd_shrink_dropped++; rd_upload_exit(rd_up_tid); return; } level -= sh; rd_shrink_feed(rd_cur_tex2d()); } }
     if (rd_t16_hi && target == RD_GL_TEXTURE_2D) rd_t16_mark(rd_cur_tex2d(), RD_T16_F_SUB, "SUB-UPLOAD");
     if (w > 0 && h > 0) {
         if (rd_sublog_n < 4) { rd_sublog_n++; printf_log(LOG_NONE, "RIMDROID GLSANITY glTexSubImage2D level=%d %dx%d fmt=0x%x\n", level, w, h, fmt); fflush(NULL); }
@@ -1029,10 +1112,12 @@ static void rd_glTexSubImage2D(uint32_t target, int32_t level, int32_t xo, int32
     if (!p_rd_real_glTexSubImage2D && &g_zfa_handle && g_zfa_handle)
         p_rd_real_glTexSubImage2D = (void(*)(uint32_t,int32_t,int32_t,int32_t,int32_t,int32_t,uint32_t,uint32_t,const void*))dlsym(g_zfa_handle, "glTexSubImage2D");
     if (p_rd_real_glTexSubImage2D) p_rd_real_glTexSubImage2D(target, level, xo, yo, w, h, fmt, type, px);
+    rd_upload_exit(rd_up_tid);
 }
 static void rd_glCompressedTexSubImage2D(uint32_t target, int32_t level, int32_t xo, int32_t yo, int32_t w, int32_t h, uint32_t fmt, int32_t imageSize, const void* data) {
     // Texture shrink: same level shift/drop as rd_glTexSubImage2D (this is the path the 1.6
     // atlas bake actually uses — CPU-compressed DXT pages via glCompressedTexSubImage2D).
+    int rd_up_tid = rd_upload_enter("CompressedTexSubImage2D", rd_cur_tex2d(), level, w, h);
     { int sh = (target == RD_GL_TEXTURE_2D) ? rd_shrink_get(rd_cur_tex2d()) : 0;
       if (sh) {
         if (level < sh) {
@@ -1040,6 +1125,7 @@ static void rd_glCompressedTexSubImage2D(uint32_t target, int32_t level, int32_t
             if (rd_shrink_dropped == 1 || (rd_shrink_dropped & 4095) == 0)
                 { printf_log(LOG_NONE, "RIMDROID TEXSHRINK dropped=%llu top-level uploads (marked=%llu)\n",
                              (unsigned long long)rd_shrink_dropped, (unsigned long long)rd_shrink_marked); fflush(NULL); }
+            rd_upload_exit(rd_up_tid);
             return;
         }
         level -= sh;
@@ -1052,8 +1138,9 @@ static void rd_glCompressedTexSubImage2D(uint32_t target, int32_t level, int32_t
         RD_OPLOG("RIMDROID OP#%llu CompressedTexSubImage2D lvl=%d %d,%d %dx%d fmt=0x%x sz=%d\n", (unsigned long long)rd_gl_op_seq, level, xo, yo, w, h, fmt, imageSize);
         rd_sub_account((uint64_t)imageSize);
     }
-    // S3TC decode mode: the storage was converted to RGBA8 at TexStorage time (see above), so the
-    // decoded pixels go in as a plain RGBA sub-upload. xo/yo/level are already shrink-remapped.
+    // S3TC decode mode: the storage was converted at TexStorage time (see above) — to ETC2 when
+    // the transcode is on (sub-uploads must then be ETC2 blocks; DXT sub-rects are inherently
+    // 4-aligned, so block geometry carries over 1:1), else to RGBA8 (plain sub-upload).
     if (rd_s3tc_decode_on() && rd_s3tc_fmt(fmt) && data && imageSize > 0 && w > 0 && h > 0) {
         uint8_t* dec = rd_s3tc_decode_buf(fmt, w, h, data, (size_t)imageSize);
         if (dec) {
@@ -1061,16 +1148,33 @@ static void rd_glCompressedTexSubImage2D(uint32_t target, int32_t level, int32_t
             if (rd_s3tc_decoded_n <= 8 || (rd_s3tc_decoded_n & 255) == 0)
                 { printf_log(LOG_NONE, "RIMDROID GLT S3TC-DECODE TexSubImage lvl=%d %d,%d %dx%d fmt=0x%x (n=%llu)\n",
                              level, xo, yo, w, h, fmt, (unsigned long long)rd_s3tc_decoded_n); fflush(NULL); }
+            if (rd_etc2_on()) {
+                size_t esz = 0;
+                uint32_t efmt = rd_s3tc_etc2_ifmt(fmt);
+                const void* enc = rd_etc2_encode(efmt, w, h, dec, &esz);
+                if (enc) {
+                    rd_etc2_encoded_n++;
+                    if (rd_etc2_encoded_n <= 8 || (rd_etc2_encoded_n & 255) == 0)
+                        { printf_log(LOG_NONE, "RIMDROID GLT ETC2 TexSubImage lvl=%d %d,%d %dx%d 0x%x->0x%x sz=%zu (n=%llu)\n",
+                                     level, xo, yo, w, h, fmt, efmt, esz, (unsigned long long)rd_etc2_encoded_n); fflush(NULL); }
+                    if (p_rd_real_glCompressedTexSubImage2D)
+                        p_rd_real_glCompressedTexSubImage2D(target, level, xo, yo, w, h, efmt, (int32_t)esz, enc);
+                    rd_upload_exit(rd_up_tid);
+                    return;
+                }
+            }
             if (!p_rd_real_glTexSubImage2D && &g_zfa_handle && g_zfa_handle)
                 p_rd_real_glTexSubImage2D = (void(*)(uint32_t,int32_t,int32_t,int32_t,int32_t,int32_t,uint32_t,uint32_t,const void*))dlsym(g_zfa_handle, "glTexSubImage2D");
             if (!p_rd_real_glTexSubImage2D)
                 p_rd_real_glTexSubImage2D = (void(*)(uint32_t,int32_t,int32_t,int32_t,int32_t,int32_t,uint32_t,uint32_t,const void*))rimdroid_gl_proc_resolver("glTexSubImage2D");
             if (p_rd_real_glTexSubImage2D)
                 p_rd_real_glTexSubImage2D(target, level, xo, yo, w, h, 0x1908u /*RGBA*/, 0x1401u /*UNSIGNED_BYTE*/, dec);
+            rd_upload_exit(rd_up_tid);
             return;
         }
     }
     if (p_rd_real_glCompressedTexSubImage2D) p_rd_real_glCompressedTexSubImage2D(target, level, xo, yo, w, h, fmt, imageSize, data);
+    rd_upload_exit(rd_up_tid);
 }
 static void rd_glTexSubImage3D(uint32_t target, int32_t level, int32_t xo, int32_t yo, int32_t zo, int32_t w, int32_t h, int32_t d, uint32_t fmt, uint32_t type, const void* px) {
     if (w > 0 && h > 0 && d > 0) rd_sub_account((uint64_t)w * h * d * 4);
