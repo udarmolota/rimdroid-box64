@@ -419,9 +419,19 @@ static uint8_t rd_shrink_shift[RD_SHRINK_MAX_ID];
  * per unit. Single GL thread like all rd_ state; contexts share the table (approximation: both
  * Unity contexts funnel through this shim, uploads bind on the same context they upload on). */
 #define RD_TEX_UNITS 256u
-static uint32_t rd_tex2d_bound[RD_TEX_UNITS];
-static uint32_t rd_active_unit = 0;
-static uint32_t rd_cur_tex2d(void) { return rd_tex2d_bound[rd_active_unit]; }
+// Per-LOGICAL-CONTEXT shadow since the Level-3 multi-context bridge (2026-08-13): with one real
+// EGL context per Unity GLX context, binding state is genuinely per-context in the driver — a
+// single global table would misattribute uploads/shrink decisions the moment two contexts
+// interleave. wrappedlibgl.c publishes the current logical slot; the aliasing mode and the whole
+// SDL/1.5 path stay on slot 0 (bit-identical to the old behavior).
+#define RD_CTX_SLOTS 8u
+static uint32_t rd_tex2d_bound[RD_CTX_SLOTS][RD_TEX_UNITS];
+static uint32_t rd_active_unit_tab[RD_CTX_SLOTS];
+// Thread-local since 2026-08-13 (see wrappedlibgl.c): the weak-symbol guard is gone with it —
+// both files always compile into box64 itself, and a weak TLS reference is not portable.
+extern __thread int rd_glx_ctx_slot;
+static inline unsigned rd_ctx_slot(void) { return (unsigned)rd_glx_ctx_slot & (RD_CTX_SLOTS - 1u); }
+static uint32_t rd_cur_tex2d(void) { unsigned s = rd_ctx_slot(); return rd_tex2d_bound[s][rd_active_unit_tab[s]]; }
 static uint64_t rd_shrink_marked = 0, rd_shrink_dropped = 0;
 static uint64_t rd_shrink_n[3] = {0,0,0};   /* how many textures got each shift */
 static uint64_t rd_shrink_saved = 0;        /* estimated bytes not allocated (RGBA8-equivalent) */
@@ -626,17 +636,79 @@ static void rd_t16_on_delete(uint32_t id) {
 static void (*p_rd_real_glActiveTexture)(uint32_t) = NULL;
 static void rd_glActiveTexture(uint32_t texture) {
     uint32_t u = texture - 0x84C0u;   /* GL_TEXTURE0 */
-    if (u < RD_TEX_UNITS) rd_active_unit = u;
+    if (u < RD_TEX_UNITS) rd_active_unit_tab[rd_ctx_slot()] = u;
     if (!p_rd_real_glActiveTexture)
         p_rd_real_glActiveTexture = (void(*)(uint32_t))rd_zfa_gl("glActiveTexture");
     if (p_rd_real_glActiveTexture) p_rd_real_glActiveTexture(texture);
 }
 static void (*p_rd_real_glBindTexture)(uint32_t,uint32_t) = NULL;
 static void rd_glBindTexture(uint32_t target, uint32_t id) {
-    if (target == RD_GL_TEXTURE_2D) rd_tex2d_bound[rd_active_unit] = id;
+    if (target == RD_GL_TEXTURE_2D) { unsigned s = rd_ctx_slot(); rd_tex2d_bound[s][rd_active_unit_tab[s]] = id; }
     if (!p_rd_real_glBindTexture)
         p_rd_real_glBindTexture = (void(*)(uint32_t,uint32_t))rd_zfa_gl("glBindTexture");
     if (p_rd_real_glBindTexture) p_rd_real_glBindTexture(target, id);
+}
+// NOMIP: answer, mechanically, the question that has shaped every theory today — the red patches
+// vanish when zoomed IN, which we have only ever EXPLAINED as "the minified levels are the broken
+// ones". Forcing every minification filter to a non-mipmapped one makes the GPU sample level 0 at
+// any zoom. Red gone = the damage really is in the mip levels; red unchanged = zoom is a red
+// herring and the whole mip line closes. Costs image quality (aliasing when zoomed out) — a
+// diagnostic, never a shipping mode.
+// Three modes, because the one knob was quietly testing two different subsystems at once (review,
+// 2026-08-15): filters live BOTH on the texture object (glTexParameteri) and on sampler objects
+// (glSamplerParameteri), and whichever the game uses for a given draw is the one that decides.
+//   RIMDROID_GLT_NOMIP=1 | both  — clamp both (what the first run did)
+//   RIMDROID_GLT_NOMIP=tex       — texture-object parameters only
+//   RIMDROID_GLT_NOMIP=smp       — sampler-object parameters only
+// Whichever mode alone removes the red names the subsystem to open up; if only "both" is clean, the
+// screen mixes draws that go through each.
+#define RD_NOMIP_OFF  0
+#define RD_NOMIP_BOTH 1
+#define RD_NOMIP_TEX  2
+#define RD_NOMIP_SMP  3
+static int rd_glt_on(void);   // defined below with the other translator gates
+static int rd_nomip_mode(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char* e = getenv("RIMDROID_GLT_NOMIP");
+        mode = RD_NOMIP_OFF;
+        if (e && e[0] && rd_glt_on()) {
+            if (!strcmp(e, "tex")) mode = RD_NOMIP_TEX;
+            else if (!strcmp(e, "smp")) mode = RD_NOMIP_SMP;
+            else if (e[0] == '1' || !strcmp(e, "both")) mode = RD_NOMIP_BOTH;
+        }
+        if (mode) { printf_log(LOG_NONE, "RIMDROID GLT NOMIP on (%s): minification clamped to level 0\n",
+                               mode == RD_NOMIP_BOTH ? "texture + sampler" : mode == RD_NOMIP_TEX ? "texture objects only" : "sampler objects only");
+                    fflush(NULL); }
+    }
+    return mode;
+}
+static int rd_nomip_on(void) { return rd_nomip_mode() != RD_NOMIP_OFF; }
+static inline int32_t rd_nomip_filter_mode(uint32_t pname, int32_t param, int want) {
+    if (pname != 0x2801 /*TEXTURE_MIN_FILTER*/) return param;
+    int m = rd_nomip_mode();
+    if (m != RD_NOMIP_BOTH && m != want) return param;
+    switch ((uint32_t)param) {
+        case 0x2700: /*NEAREST_MIPMAP_NEAREST*/
+        case 0x2702: /*NEAREST_MIPMAP_LINEAR*/  return 0x2600; /*NEAREST*/
+        case 0x2701: /*LINEAR_MIPMAP_NEAREST*/
+        case 0x2703: /*LINEAR_MIPMAP_LINEAR*/   return 0x2601; /*LINEAR*/
+        default: return param;
+    }
+}
+static void (*p_rd_real_glTexParameteri)(uint32_t,uint32_t,int32_t) = NULL;
+static void rd_glTexParameteri(uint32_t target, uint32_t pname, int32_t param) {
+    param = rd_nomip_filter_mode(pname, param, RD_NOMIP_TEX);
+    if (!p_rd_real_glTexParameteri)
+        p_rd_real_glTexParameteri = (void(*)(uint32_t,uint32_t,int32_t))rd_zfa_gl("glTexParameteri");
+    if (p_rd_real_glTexParameteri) p_rd_real_glTexParameteri(target, pname, param);
+}
+static void (*p_rd_real_glSamplerParameteri)(uint32_t,uint32_t,int32_t) = NULL;
+static void rd_glSamplerParameteri(uint32_t sampler, uint32_t pname, int32_t param) {
+    param = rd_nomip_filter_mode(pname, param, RD_NOMIP_SMP);
+    if (!p_rd_real_glSamplerParameteri)
+        p_rd_real_glSamplerParameteri = (void(*)(uint32_t,uint32_t,int32_t))rd_zfa_gl("glSamplerParameteri");
+    if (p_rd_real_glSamplerParameteri) p_rd_real_glSamplerParameteri(sampler, pname, param);
 }
 static void (*p_rd_real_glDeleteTextures)(int32_t,const uint32_t*) = NULL;
 static void rd_glDeleteTextures(int32_t n, const uint32_t* ids) {
@@ -716,6 +788,7 @@ static void rd_glTexStorage2D(uint32_t target, int32_t levels, uint32_t ifmt, in
     if ((w >= 2048 || h >= 2048 || w < 0 || h < 0 || levels > 16) && rd_texlog_n < 48)
         { rd_texlog_n++; printf_log(LOG_NONE, "RIMDROID GLSANITY glTexStorage2D target=0x%x levels=%d ifmt=0x%x %dx%d\n", target, levels, ifmt, w, h); fflush(NULL); }
     if (p_rd_real_glTexStorage2D) p_rd_real_glTexStorage2D(target, levels, ifmt, w, h);
+    // Immutable allocation: storage only, no content — but the dimensions are what later sub-uploads
 }
 #include <fcntl.h>    // the bounce fault-proof copy below
 #include <errno.h>
@@ -1000,7 +1073,9 @@ static void rd_glTexStorage3D(uint32_t target, int32_t levels, uint32_t ifmt, in
 static void (*p_rd_real_glTexImage3D)(uint32_t,int32_t,int32_t,int32_t,int32_t,int32_t,int32_t,uint32_t,uint32_t,const void*) = NULL;
 static void rd_glTexImage3D(uint32_t target, int32_t level, int32_t ifmt, int32_t w, int32_t h, int32_t d, int32_t border, uint32_t fmt, uint32_t type, const void* px) {
     if (level == 0 && d > 0) { for (int i = 0; i < d; i++) rd_tex_account((uint32_t)ifmt, 1, w, h); }
-    if (p_rd_real_glTexImage3D) p_rd_real_glTexImage3D(target, level, ifmt, w, h, d, border, fmt, type, px);
+    if (p_rd_real_glTexImage3D) {
+        p_rd_real_glTexImage3D(target, level, ifmt, w, h, d, border, fmt, type, px);
+    }
 }
 static void (*p_rd_real_glCompressedTexImage2D)(uint32_t,int32_t,uint32_t,int32_t,int32_t,int32_t,int32_t,const void*) = NULL;
 static void rd_glCompressedTexImage2D(uint32_t target, int32_t level, uint32_t ifmt, int32_t w, int32_t h, int32_t border, int32_t imageSize, const void* data) {
@@ -1026,16 +1101,19 @@ static void rd_glCompressedTexImage2D(uint32_t target, int32_t level, uint32_t i
                 if (enc) {
                     rd_etc2_encoded_n++;
                     if (rd_etc2_encoded_n <= 8 || (rd_etc2_encoded_n & 255) == 0)
-                        { printf_log(LOG_NONE, "RIMDROID GLT ETC2 TexImage lvl=%d %dx%d 0x%x->0x%x sz=%zu (n=%llu)\n",
-                                     level, w, h, ifmt, efmt, esz, (unsigned long long)rd_etc2_encoded_n); fflush(NULL); }
-                    if (p_rd_real_glCompressedTexImage2D)
+                        { printf_log(LOG_NONE, "RIMDROID GLT ETC2 TexImage lvl=%d %dx%d 0x%x->0x%x sz=%zu (n=%llu, encode total=%llums)\n",
+                                     level, w, h, ifmt, efmt, esz, (unsigned long long)rd_etc2_encoded_n,
+                                     (unsigned long long)rd_etc2_total_ms()); fflush(NULL); }
+                    if (p_rd_real_glCompressedTexImage2D) {
                         p_rd_real_glCompressedTexImage2D(target, level, efmt, w, h, border, (int32_t)esz, enc);
+                    }
                     rd_upload_exit(rd_up_tid);
                     return;
                 }
             }
-            if (p_rd_real_glTexImage2D)
+            if (p_rd_real_glTexImage2D) {
                 p_rd_real_glTexImage2D(target, level, (int32_t)rd_s3tc_rgba_ifmt(ifmt), w, h, border, 0x1908u /*RGBA*/, 0x1401u /*UNSIGNED_BYTE*/, dec);
+            }
             rd_upload_exit(rd_up_tid);
             return;
         }
@@ -1155,10 +1233,12 @@ static void rd_glCompressedTexSubImage2D(uint32_t target, int32_t level, int32_t
                 if (enc) {
                     rd_etc2_encoded_n++;
                     if (rd_etc2_encoded_n <= 8 || (rd_etc2_encoded_n & 255) == 0)
-                        { printf_log(LOG_NONE, "RIMDROID GLT ETC2 TexSubImage lvl=%d %d,%d %dx%d 0x%x->0x%x sz=%zu (n=%llu)\n",
-                                     level, xo, yo, w, h, fmt, efmt, esz, (unsigned long long)rd_etc2_encoded_n); fflush(NULL); }
-                    if (p_rd_real_glCompressedTexSubImage2D)
+                        { printf_log(LOG_NONE, "RIMDROID GLT ETC2 TexSubImage lvl=%d %d,%d %dx%d 0x%x->0x%x sz=%zu (n=%llu, encode total=%llums)\n",
+                                     level, xo, yo, w, h, fmt, efmt, esz, (unsigned long long)rd_etc2_encoded_n,
+                                     (unsigned long long)rd_etc2_total_ms()); fflush(NULL); }
+                    if (p_rd_real_glCompressedTexSubImage2D) {
                         p_rd_real_glCompressedTexSubImage2D(target, level, xo, yo, w, h, efmt, (int32_t)esz, enc);
+                    }
                     rd_upload_exit(rd_up_tid);
                     return;
                 }
@@ -1167,8 +1247,9 @@ static void rd_glCompressedTexSubImage2D(uint32_t target, int32_t level, int32_t
                 p_rd_real_glTexSubImage2D = (void(*)(uint32_t,int32_t,int32_t,int32_t,int32_t,int32_t,uint32_t,uint32_t,const void*))dlsym(g_zfa_handle, "glTexSubImage2D");
             if (!p_rd_real_glTexSubImage2D)
                 p_rd_real_glTexSubImage2D = (void(*)(uint32_t,int32_t,int32_t,int32_t,int32_t,int32_t,uint32_t,uint32_t,const void*))rimdroid_gl_proc_resolver("glTexSubImage2D");
-            if (p_rd_real_glTexSubImage2D)
+            if (p_rd_real_glTexSubImage2D) {
                 p_rd_real_glTexSubImage2D(target, level, xo, yo, w, h, 0x1908u /*RGBA*/, 0x1401u /*UNSIGNED_BYTE*/, dec);
+            }
             rd_upload_exit(rd_up_tid);
             return;
         }
@@ -1178,7 +1259,9 @@ static void rd_glCompressedTexSubImage2D(uint32_t target, int32_t level, int32_t
 }
 static void rd_glTexSubImage3D(uint32_t target, int32_t level, int32_t xo, int32_t yo, int32_t zo, int32_t w, int32_t h, int32_t d, uint32_t fmt, uint32_t type, const void* px) {
     if (w > 0 && h > 0 && d > 0) rd_sub_account((uint64_t)w * h * d * 4);
-    if (p_rd_real_glTexSubImage3D) p_rd_real_glTexSubImage3D(target, level, xo, yo, zo, w, h, d, fmt, type, px);
+    if (p_rd_real_glTexSubImage3D) {
+        p_rd_real_glTexSubImage3D(target, level, xo, yo, zo, w, h, d, fmt, type, px);
+    }
 }
 static void rd_glCopyImageSubData(uint32_t sn, uint32_t st, int32_t sl, int32_t sx, int32_t sy, int32_t sz_, uint32_t dn, uint32_t dt, int32_t dl, int32_t dx, int32_t dy, int32_t dz, int32_t w, int32_t h, int32_t d) {
     RD_OPLOG("RIMDROID OP#%llu CopyImageSubData src=%u lvl=%d %d,%d,%d dst=%u lvl=%d %d,%d,%d %dx%dx%d\n", (unsigned long long)rd_gl_op_seq, sn, sl, sx, sy, sz_, dn, dl, dx, dy, dz, w, h, d);
@@ -1200,7 +1283,9 @@ static void rd_glCopyImageSubData(uint32_t sn, uint32_t st, int32_t sl, int32_t 
         rd_shrink_feed(dn);
       } }
     rd_copy_account(w, h, d);
-    if (p_rd_real_glCopyImageSubData) p_rd_real_glCopyImageSubData(sn, st, sl, sx, sy, sz_, dn, dt, dl, dx, dy, dz, w, h, d);
+    if (p_rd_real_glCopyImageSubData) {
+        p_rd_real_glCopyImageSubData(sn, st, sl, sx, sy, sz_, dn, dt, dl, dx, dy, dz, w, h, d);
+    }
 }
 static void rd_glCopyTexSubImage2D(uint32_t target, int32_t level, int32_t xo, int32_t yo, int32_t x, int32_t y, int32_t w, int32_t h) {
     // Texture shrink: framebuffer->texture copies into a shrunk texture shift down one level
@@ -1217,7 +1302,9 @@ static void rd_glCopyTexSubImage2D(uint32_t target, int32_t level, int32_t xo, i
         rd_shrink_feed(rd_cur_tex2d());
       } }
     rd_copy_account(w, h, 1);
-    if (p_rd_real_glCopyTexSubImage2D) p_rd_real_glCopyTexSubImage2D(target, level, xo, yo, x, y, w, h);
+    if (p_rd_real_glCopyTexSubImage2D) {
+        p_rd_real_glCopyTexSubImage2D(target, level, xo, yo, x, y, w, h);
+    }
 }
 // T16 telemetry probes: log-only shims that stamp a tracked texture's role the first time it is
 // attached to a framebuffer (render target) or bound as an image (CompressBC's imageStore surface).
@@ -1306,7 +1393,9 @@ static void rd_glGenerateMipmap(uint32_t target) {
     }
     if (!p_rd_real_glGenerateMipmap)
         p_rd_real_glGenerateMipmap = (void(*)(uint32_t))rd_zfa_gl("glGenerateMipmap");
-    if (p_rd_real_glGenerateMipmap) p_rd_real_glGenerateMipmap(target);
+    if (p_rd_real_glGenerateMipmap) {
+        p_rd_real_glGenerateMipmap(target);
+    }
 }
 // Shader identification (culprit = a draw hanging the GPU): the last UseProgram before the
 // loss names the guilty program; ShaderSource dumps every shader's text (keyed by shader id)
@@ -2391,6 +2480,12 @@ void* rimdroid_gl_getprocaddr(x64emu_t* emu, bridge_t* bridge, glprocaddress_t p
         else if (!strcmp(rname, "glActiveTexture"))  { p_rd_real_glActiveTexture  = (void(*)(uint32_t))rimdroid_gl_proc_resolver(rname); w = vFu; fn = (void*)rd_glActiveTexture; }
         else if (!strcmp(rname, "glBindTexture"))    { p_rd_real_glBindTexture    = (void(*)(uint32_t,uint32_t))rimdroid_gl_proc_resolver(rname); w = vFuu; fn = (void*)rd_glBindTexture; }
         else if (!strcmp(rname, "glDeleteTextures")) { p_rd_real_glDeleteTextures = (void(*)(int32_t,const uint32_t*))rimdroid_gl_proc_resolver(rname); w = vFip; fn = (void*)rd_glDeleteTextures; }
+        // Installed only while the NOMIP probe is armed: outside it these are pure pass-throughs,
+        // and every shim we hand Unity is one more thing between it and the driver.
+        // Installed only while the readback probe is armed: it restores the game's own render
+        // target and viewport from these, because a query cannot be trusted (see rd_glViewport).
+        else if (rd_nomip_on() && !strcmp(rname, "glTexParameteri")) { p_rd_real_glTexParameteri = (void(*)(uint32_t,uint32_t,int32_t))rimdroid_gl_proc_resolver(rname); w = vFuui; fn = (void*)rd_glTexParameteri; }
+        else if (rd_nomip_on() && !strcmp(rname, "glSamplerParameteri")) { p_rd_real_glSamplerParameteri = (void(*)(uint32_t,uint32_t,int32_t))rimdroid_gl_proc_resolver(rname); w = vFuui; fn = (void*)rd_glSamplerParameteri; }
         else if (!strcmp(rname, "glFramebufferTexture2D")) { p_rd_real_glFramebufferTexture2D = (void(*)(uint32_t,uint32_t,uint32_t,uint32_t,int32_t))rimdroid_gl_proc_resolver(rname); w = vFuuuui; fn = (void*)rd_glFramebufferTexture2D; }
         else if (!strcmp(rname, "glBindImageTexture"))     { p_rd_real_glBindImageTexture = (void(*)(uint32_t,uint32_t,int32_t,uint8_t,int32_t,uint32_t,uint32_t))rimdroid_gl_proc_resolver(rname); w = vFuuiCiuu; fn = (void*)rd_glBindImageTexture; }
         else if (rd_gl_diag_on() && !strcmp(rname, "glUseProgram")) { p_rd_real_glUseProgram = rimdroid_gl_proc_resolver(rname); w = vFu; fn = (void*)rd_glUseProgram; }

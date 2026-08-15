@@ -12,4 +12,8 @@
 // until the next call on the same thread) and writes the byte size to out_sz; NULL on OOM/oversize.
 const void* rd_etc2_encode(uint32_t etc2fmt, int32_t w, int32_t h, const uint8_t* rgba, size_t* out_sz);
 
+// Cumulative wall time spent encoding, ms — the field-log price tag for "is the encoder eating
+// the fps": the caller prints it alongside the throttled ETC2 upload log lines.
+uint64_t rd_etc2_total_ms(void);
+
 #endif

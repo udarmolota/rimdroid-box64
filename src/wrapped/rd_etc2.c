@@ -17,8 +17,16 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "rd_etc2.h"
+
+// Cumulative wall time spent inside rd_etc2_encode, in milliseconds. The Tecno report ("fps
+// halved with ETC2") needs a NUMBER, not a theory: the caller logs this every N textures, so a
+// field log states the price outright — and doubles as the build fingerprint (version strings
+// don't change between test builds; the watchdog taught us that lesson).
+static uint64_t rd_etc2_total_ns = 0;
+uint64_t rd_etc2_total_ms(void) { return rd_etc2_total_ns / 1000000u; }
 
 static const int rd_etc1_mod[8][2] = {{2,8},{5,17},{9,29},{13,42},{18,60},{24,80},{33,106},{47,183}};
 static const int8_t rd_eac_mod[16][8] = {
@@ -186,6 +194,8 @@ static void rd_eac_encode_block(const uint8_t a[16], uint8_t out[8]) {
 }
 
 const void* rd_etc2_encode(uint32_t etc2fmt, int32_t w, int32_t h, const uint8_t* rgba, size_t* out_sz) {
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
     static _Thread_local uint8_t* ebuf = NULL; static _Thread_local size_t ecap = 0;
     const int alpha = (etc2fmt == 0x9278u || etc2fmt == 0x9279u);
     const int bs = alpha ? 16 : 8;
@@ -207,5 +217,7 @@ const void* rd_etc2_encode(uint32_t etc2fmt, int32_t w, int32_t h, const uint8_t
         else rd_etc1_encode_block(px, o);
     }
     *out_sz = need;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    rd_etc2_total_ns += (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000000000u + (uint64_t)(t1.tv_nsec - t0.tv_nsec);
     return ebuf;
 }

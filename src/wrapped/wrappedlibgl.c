@@ -67,7 +67,46 @@ extern __attribute__((weak)) void* g_egl_context;
 extern __attribute__((weak)) int   rimdroid_eglt_make_current(void);
 extern __attribute__((weak)) int   rimdroid_eglt_release_current(void);
 extern __attribute__((weak)) void  rimdroid_eglt_swap(void);
+// Level-3 multi-context factory (rimdroid.c) — real EGL contexts per Unity logical context.
+extern __attribute__((weak)) void* rimdroid_eglt_create_shared(void);
+extern __attribute__((weak)) int   rimdroid_eglt_make_current_on(void* ctx, int with_window);
+extern __attribute__((weak)) void  rimdroid_eglt_destroy_ctx(void* ctx);
 static int rd_eglt_active(void) { return !((&g_zfa_context) && g_zfa_context) && (&g_egl_context) && g_egl_context; }
+// RIMDROID_GLT_MULTICTX=1 (experimental, 2026-08-13): give every Unity GLX context its OWN real
+// EGL context (share group with the primary) instead of aliasing them all onto one. This is the
+// fix for the threaded-mode texture corruption (brief Level 3: zero upload collisions with TLS
+// scratch, red patches persist ⇒ the corruption is context-state bleed). Objects are shared by
+// EGL itself; per-context state is the driver's job; only the PRESENTER holds the window surface
+// (workers are surfaceless/pbuffer). Presenter = whichever context swaps first; a presenter
+// change does the deferred-steal dance (skip one present, converge next frame).
+static int rd_eglt_multictx(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("RIMDROID_GLT_MULTICTX");
+        on = (e && e[0] == '1' && rimdroid_eglt_create_shared) ? 1 : 0;
+        if (on) printf_log(LOG_NONE, "RIMDROID GLT MULTICTX enabled: real EGL context per GLX context\n");
+    }
+    return on;
+}
+#define RD_GLX_MAX_CTX 8
+static struct { void* fake; void* real; } g_glx_ctx_map[RD_GLX_MAX_CTX];
+static void* g_glx_presenter = NULL;    // the real ctx currently holding the window surface
+static void* rd_glx_real_of(void* fake) {
+    for (int i = 0; i < RD_GLX_MAX_CTX; i++)
+        if (g_glx_ctx_map[i].fake == fake) return g_glx_ctx_map[i].real;
+    return g_egl_context;   // unknown alias: fall back to the primary
+}
+// Which logical context the calling code is on, as a small slot index — wrappedsdl2.c keys its
+// per-context texture-binding shadow on this (with one real context per logical context, the
+// driver keeps real state per context; our upload/shrink bookkeeping must match).
+// Per-thread since 2026-08-13: "which context am I on" is a property of the CALLING THREAD, and a
+// process-wide answer made one thread's uploads consult the other thread's bindings.
+__thread int rd_glx_ctx_slot = 0;
+static int rd_glx_slot_of(void* fake) {
+    for (int i = 0; i < RD_GLX_MAX_CTX; i++)
+        if (g_glx_ctx_map[i].fake == fake) return i;
+    return 0;
+}
 // One dispatch layer so every glX intercept below stays backend-agnostic.
 static int rd_bridge_active(void) { return rd_zfa_active() || rd_eglt_active(); }
 static void* rd_bridge_ctx(void) { return rd_zfa_active() ? g_zfa_context : g_egl_context; }
@@ -88,16 +127,29 @@ static void rd_bridge_swap(void) {
 // (a distinct alias per glXCreateContext, all aliasing the one ZFA context — Unity
 // creates a 2nd shared context and returning the same pointer twice confuses its
 // bookkeeping). g_glx_display/drawable cached for GetCurrent*.
-static void*         g_glx_ctx_current = NULL;
-static void*         g_glx_display     = NULL;
-static uintptr_t     g_glx_drawable    = 0;
-static unsigned long g_glx_create_n    = 0;
-// Thread that last made the ZFA context current. Mesa's st_api context is per-thread;
+//
+// PER-THREAD (2026-08-13, the threaded red-texture hunt). GLX defines the current context as
+// thread state, and Unity's threaded renderer migrates contexts between its main and render
+// threads. Holding this process-wide broke that in two ways: one thread's glXMakeCurrent(NULL)
+// wiped the record for BOTH, and the "already current on this thread" fast path below answered
+// from whichever thread wrote last — so a bind could be skipped for a thread that had nothing
+// current, or attempted for a context still current elsewhere (EGL rejects that: the thread is
+// then left with NO context and every GL call it makes is silently discarded — including texture
+// mip uploads, which is what leaves undefined levels behind).
+// g_glx_display/g_glx_drawable stay process-wide on purpose: our bridge fakes exactly ONE X
+// display and ONE drawable, so a shared answer is always the right one, while a per-thread copy
+// would hand NULL to any thread that queries before it ever binds.
+static __thread void*     g_glx_ctx_current = NULL;
+static void*              g_glx_display     = NULL;
+static uintptr_t          g_glx_drawable    = 0;
+static unsigned long      g_glx_create_n    = 0;
+// Whether THIS thread has the context bound, and which thread that is (kept for the ZFA path's
+// logging/assertions; with TLS it is always self). Mesa's st_api context is per-thread;
 // zfaFlushFront on a thread with NO current context derefs NULL (+0xbc) — seen on-device
 // when Unity's loading phase swaps from a different thread than the one that bound the
 // context (and glXMakeCurrent(NULL) unbinds don't release: libzfa lacks zfaReleaseCurrent).
-static pthread_t     g_glx_current_tid;
-static int           g_glx_have_current = 0;
+static __thread pthread_t g_glx_current_tid;
+static __thread int       g_glx_have_current = 0;
 // Swap-phase marker for the SEGV logger (signals.c): 0=outside swap, 1=inside pre-flush
 // glFinish (batch already dead), 2=inside zfaFlushFront (present path is the killer).
 volatile int rd_glx_swap_phase = 0;
@@ -128,12 +180,21 @@ static void* rd_glx_make_context(void* dpy, void* win_unused)
     (void)win_unused;
     printf_log(LOG_NONE, "RIMDROID glXCreateContext ENTER\n"); fflush(NULL);
     g_glx_display = dpy;
-    rd_bridge_make_current();
-    // Distinct opaque handle per call (all alias the one real context, ZFA or EGL).
+    // Multi-context mode: the FIRST logical context takes the primary EGL context; every later
+    // one gets its own real shared context. Aliasing mode: everything maps onto one (historic).
+    void* real = rd_bridge_ctx();
+    if (rd_eglt_active() && rd_eglt_multictx() && g_glx_create_n > 0) {
+        void* fresh = rimdroid_eglt_create_shared ? rimdroid_eglt_create_shared() : NULL;
+        if (fresh) real = fresh;   // creation failure falls back to aliasing the primary
+    }
+    if (!(rd_eglt_active() && rd_eglt_multictx()))
+        rd_bridge_make_current();
     void* fake = (void*)((uintptr_t)rd_bridge_ctx() + (uintptr_t)(++g_glx_create_n * 0x10000UL));
+    for (int i = 0; i < RD_GLX_MAX_CTX; i++)
+        if (!g_glx_ctx_map[i].fake) { g_glx_ctx_map[i].fake = fake; g_glx_ctx_map[i].real = real; break; }
     g_glx_ctx_current = fake;
-    printf_log(LOG_NONE, "RIMDROID glXCreateContext #%lu -> handle %p (%s %p) — MILESTONE\n", g_glx_create_n, fake,
-               rd_zfa_active() ? "ZFA" : "EGL-translator", rd_bridge_ctx());
+    printf_log(LOG_NONE, "RIMDROID glXCreateContext #%lu -> handle %p (%s real=%p) — MILESTONE\n", g_glx_create_n, fake,
+               rd_zfa_active() ? "ZFA" : "EGL-translator", real);
     return fake;
 }
 EXPORT void* my_glXCreateContext(x64emu_t* emu, void* dpy, void* vis, void* share, int direct)
@@ -151,9 +212,21 @@ EXPORT void* my_glXCreateContextAttribsARB(x64emu_t* emu, void* dpy, void* confi
 EXPORT void my_glXDestroyContext(x64emu_t* emu, void* dpy, void* ctx)
 {
     if (!rd_bridge_active()) { if (my->glXDestroyContext) my->glXDestroyContext(dpy, ctx); return; }
-    // Never destroy the shared ZFA context; just forget the alias.
     if (ctx == g_glx_ctx_current) g_glx_ctx_current = NULL;
-    printf_log(LOG_NONE, "RIMDROID glXDestroyContext(%p) -> no-op (ZFA)\n", ctx);
+    // Multi-context: destroy the REAL worker context (never the primary — the factory refuses).
+    if (rd_eglt_active() && rd_eglt_multictx()) {
+        for (int i = 0; i < RD_GLX_MAX_CTX; i++)
+            if (g_glx_ctx_map[i].fake == ctx) {
+                void* real = g_glx_ctx_map[i].real;
+                g_glx_ctx_map[i].fake = NULL; g_glx_ctx_map[i].real = NULL;
+                if (real == g_glx_presenter) g_glx_presenter = NULL;
+                if (real != g_egl_context && rimdroid_eglt_destroy_ctx) rimdroid_eglt_destroy_ctx(real);
+                printf_log(LOG_NONE, "RIMDROID glXDestroyContext(%p) -> real %p destroyed\n", ctx, real);
+                return;
+            }
+    }
+    // Aliasing mode: never destroy the one shared context; just forget the alias.
+    printf_log(LOG_NONE, "RIMDROID glXDestroyContext(%p) -> no-op (aliased)\n", ctx);
 }
 EXPORT int my_glXMakeCurrent(x64emu_t* emu, void* dpy, uintptr_t drawable, void* ctx)
 {
@@ -163,13 +236,38 @@ EXPORT int my_glXMakeCurrent(x64emu_t* emu, void* dpy, uintptr_t drawable, void*
     if (!ctx) {
         // Unbind: release the real context from THIS thread so a legal single-context
         // migration between threads doesn't leave it current on two threads.
+        //
         int rel = rd_bridge_release_current();
         g_glx_ctx_current = NULL;
         g_glx_have_current = 0;
         printf_log(LOG_NONE, "RIMDROID glXMakeCurrent(unbind) release=%d\n", rel);
         return 1;
     }
+    void* prev_fake = g_glx_ctx_current;
     g_glx_ctx_current = ctx;
+    // Multi-context mode: bind the REAL context of this logical one. No alias-skip here — a
+    // logical switch is a real switch now. Presenter keeps the window surface, others go
+    // surfaceless. The per-context binding shadow follows via rd_glx_ctx_slot.
+    if (rd_eglt_active() && rd_eglt_multictx()) {
+        void* real = rd_glx_real_of(ctx);
+        rd_glx_ctx_slot = rd_glx_slot_of(ctx);
+        if (g_glx_have_current && pthread_equal(g_glx_current_tid, pthread_self()) && prev_fake == ctx)
+            return 1;   // same logical context already bound on this thread
+        int ok = rimdroid_eglt_make_current_on ? rimdroid_eglt_make_current_on(real, real == g_glx_presenter) : 0;
+        if (ok) { g_glx_current_tid = pthread_self(); g_glx_have_current = 1; }
+        else {
+            // NEVER rate-limited: a refused bind leaves this thread with no context, so every GL
+            // call it makes next is dropped on the floor. That is the signature we are hunting —
+            // if the threaded red textures come from lost uploads, this line names the moment.
+            g_glx_have_current = 0;
+            printf_log(LOG_NONE, "RIMDROID glXMakeCurrent(multictx) BIND FAILED fake=%p real=%p window=%d tid=%ld — thread now has NO context\n",
+                       ctx, real, real == g_glx_presenter, (long)syscall(SYS_gettid));
+            fflush(NULL);
+        }
+        static int n2=0; if(ok && n2<8){n2++; printf_log(LOG_NONE, "RIMDROID glXMakeCurrent(multictx) fake=%p real=%p window=%d tid=%ld -> OK\n",
+                                                         ctx, real, real == g_glx_presenter, (long)syscall(SYS_gettid));}
+        return ok ? 1 : 0;
+    }
     // All Unity context handles alias ONE real ZFA context. Skip the full zfaMakeCurrent
     // (kopper window rebind) when this thread already has it current — Unity alternates its
     // logical contexts rapidly around scene transitions, and re-running kopper's drawable
@@ -197,9 +295,29 @@ EXPORT void my_glXSwapBuffers(x64emu_t* emu, void* dpy, uintptr_t drawable)
         fflush(NULL);
         last_dpy = dpy; last_draw = drawable; last_tid = tid;
     }
+    // Multi-context mode: only the presenter holds the window surface. First swap from a context
+    // promotes it; if the window is still bound elsewhere (old presenter's thread hasn't released
+    // yet), skip ONE present — the next MakeCurrent/unbind over there frees it and we converge.
+    if (rd_eglt_active() && rd_eglt_multictx()) {
+        void* real = rd_glx_real_of(g_glx_ctx_current);
+        if (real != g_glx_presenter) {
+            if (rimdroid_eglt_make_current_on && rimdroid_eglt_make_current_on(real, 1)) {
+                g_glx_presenter = real;
+                printf_log(LOG_NONE, "RIMDROID glXSwapBuffers: presenter -> real %p (tid=%ld)\n", real, tid);
+            } else {
+                // Also never rate-limited now: a present skipped here means the window surface is
+                // still owned by another thread's context — the same ownership conflict that a
+                // refused MakeCurrent reports, seen from the presenting side.
+                printf_log(LOG_NONE, "RIMDROID glXSwapBuffers: window busy elsewhere — present skipped (real=%p presenter=%p tid=%ld)\n",
+                           real, g_glx_presenter, tid);
+                fflush(NULL);
+                return;
+            }
+        }
+    }
     // Mesa flushes the THREAD-CURRENT context; a swap from a thread that never bound (or
     // after an unbind) crashes inside zfaFlushFront (NULL+0xbc). Rebind on this thread first.
-    if (!g_glx_have_current || !pthread_equal(g_glx_current_tid, pthread_self())) {
+    else if (!g_glx_have_current || !pthread_equal(g_glx_current_tid, pthread_self())) {
         int ok = rd_bridge_make_current();
         if (ok) { g_glx_current_tid = pthread_self(); g_glx_have_current = 1; }
         static int n = 0;
