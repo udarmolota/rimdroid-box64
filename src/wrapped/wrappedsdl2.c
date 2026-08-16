@@ -817,6 +817,14 @@ static int rd_glt_on(void) {   /* a GL translator is active this launch (env set
     if (on < 0) { const char* e = getenv("RIMDROID_GLT"); on = (e && e[0]) ? 1 : 0; }
     return on;
 }
+static int rd_glt_fontfix_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("RIMDROID_GLT_FONTFIX");
+        on = (e && e[0] == '1' && rd_glt_on()) ? 1 : 0;
+    }
+    return on;
+}
 static void rd_unpack_tighten(void) {
     if (!rd_glt_on()) return;
     if (!p_rd_real_glPixelStorei)
@@ -1246,6 +1254,40 @@ static void rd_glTexSubImage2D(uint32_t target, int32_t level, int32_t xo, int32
         p_rd_real_glTexSubImage2D = (void(*)(uint32_t,int32_t,int32_t,int32_t,int32_t,int32_t,uint32_t,uint32_t,const void*))dlsym(g_zfa_handle, "glTexSubImage2D");
     rd_dump_texture("Sub", level, xo, yo, w, h, fmt, type, px);
     if (p_rd_real_glTexSubImage2D) p_rd_real_glTexSubImage2D(target, level, xo, yo, w, h, fmt, type, px);
+
+    // MobileGlues 2.0 accepts Unity 2019's dynamic Alpha8/R8 atlas updates but
+    // leaves the backend texture unchanged. Replay only that transfer directly
+    // in GLES, preserving the real binding. The launcher enables this solely
+    // for RimWorld 1.5 + MobileGlues.
+    if (rd_glt_fontfix_on() && target == RD_GL_TEXTURE_2D && level == 0
+        && fmt == 0x1903u /*GL_RED*/ && type == 0x1401u /*GL_UNSIGNED_BYTE*/ && px) {
+        static void (*driver_getiv)(uint32_t,int32_t*) = NULL;
+        static void (*driver_bindtexture)(uint32_t,uint32_t) = NULL;
+        static void (*driver_texsubimage2d)(uint32_t,int32_t,int32_t,int32_t,int32_t,int32_t,uint32_t,uint32_t,const void*) = NULL;
+        static int resolved = 0;
+        if (!resolved) {
+            resolved = 1;
+            void* h = dlopen("libGLESv2.so", RTLD_NOW | RTLD_LOCAL);
+            if (h) {
+                driver_getiv = (void(*)(uint32_t,int32_t*))dlsym(h, "glGetIntegerv");
+                driver_bindtexture = (void(*)(uint32_t,uint32_t))dlsym(h, "glBindTexture");
+                driver_texsubimage2d = (void(*)(uint32_t,int32_t,int32_t,int32_t,int32_t,int32_t,uint32_t,uint32_t,const void*))dlsym(h, "glTexSubImage2D");
+            }
+        }
+        if (driver_getiv && driver_bindtexture && driver_texsubimage2d) {
+            int32_t pbo = 0, old_texture = 0;
+            uint32_t texture = rd_cur_tex2d();
+            driver_getiv(0x88EFu /*GL_PIXEL_UNPACK_BUFFER_BINDING*/, &pbo);
+            driver_getiv(0x8069u /*GL_TEXTURE_BINDING_2D*/, &old_texture);
+            if (!pbo && texture) {
+                if ((uint32_t)old_texture != texture)
+                    driver_bindtexture(RD_GL_TEXTURE_2D, texture);
+                driver_texsubimage2d(target, level, xo, yo, w, h, fmt, type, px);
+                if ((uint32_t)old_texture != texture)
+                    driver_bindtexture(RD_GL_TEXTURE_2D, (uint32_t)old_texture);
+            }
+        }
+    }
     rd_upload_exit(rd_up_tid);
 }
 static void rd_glCompressedTexSubImage2D(uint32_t target, int32_t level, int32_t xo, int32_t yo, int32_t w, int32_t h, uint32_t fmt, int32_t imageSize, const void* data) {
