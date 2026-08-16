@@ -1054,12 +1054,67 @@ static const void* rd_upload_bounce(int32_t w, int32_t h, uint32_t fmt, uint32_t
     if ((row & 7) && h > 1) return px;
     return rd_glt_bounce_bytes(px, row * (size_t)h, w, h, fmt, type);
 }
+// ---- Glyph-atlas dump (2026-08-16) -----------------------------------------------------------
+// The 1.5 fonts are soft under MobileGlues and sharp under Zink, at the same resolution, windowed
+// or fullscreen, with or without mip sampling — every geometry explanation has been tested and
+// failed. So stop reasoning about sizes and look at the glyph data itself: is the atlas already
+// soft in memory, or is it crisp and softened on the way to the screen? Those are different bugs
+// with nothing in common.
+//
+// Unity's dynamic font atlas is the single-channel texture in the stream (alpha/red only — glyph
+// coverage, no colour), so that is what gets written out, as raw 8-bit rows plus the dimensions in
+// the file name. RIMDROID_GLT_DUMPTEX=1; first RD_DUMP_MAX single-channel uploads only, so a run
+// cannot fill the device.
+#define RD_DUMP_MAX 12
+static int rd_dumptex_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("RIMDROID_GLT_DUMPTEX");
+        on = (e && e[0] == '1') ? 1 : 0;
+        if (on) { printf_log(LOG_NONE, "RIMDROID GLT DUMPTEX on: single-channel uploads are written to the cache dir\n"); fflush(NULL); }
+    }
+    return on;
+}
+static void rd_dump_texture(const char* what, int level, int32_t xo, int32_t yo, int32_t w, int32_t h,
+                            uint32_t fmt, uint32_t type, const void* px) {
+    if (!rd_dumptex_on() || !px || w <= 0 || h <= 0) return;
+    if (type != 0x1401u) return;                  /* 8-bit channels only */
+    /* Inventory first: the first attempt guessed at the atlas and caught two utility textures
+     * instead (a black one and a flat grey one). So log every 8-bit upload's shape and format —
+     * one line each, capped — and let the real glyph atlas identify itself in that list. */
+    static int seen = 0;
+    if (seen < 60) {
+        seen++;
+        printf_log(LOG_NONE, "RIMDROID GLT TEXLIST %s tex=%u lvl=%d %dx%d at %d,%d fmt=0x%x\n",
+                   what, rd_cur_tex2d(), level, w, h, xo, yo, fmt);
+        fflush(NULL);
+    }
+    /* Dump the plausible atlases: single-channel of any size >= 256, or anything >= 512. A font
+     * atlas is one of those; the world atlases arrive compressed and never reach this path. */
+    int single = (fmt == 0x1906u || fmt == 0x1909u || fmt == 0x1903u);
+    if (!((single && w >= 256 && h >= 256) || (w >= 512 && h >= 512))) return;
+    static int n = 0;
+    if (n >= RD_DUMP_MAX) return;
+    const char* dir = getenv("RIMDROID_CACHE_DIR");
+    if (!dir || !dir[0]) return;
+    size_t chans = (fmt == 0x1908u || fmt == 0x80E1u) ? 4u : (fmt == 0x1907u ? 3u : (fmt == 0x190Au ? 2u : 1u));
+    char path[512];
+    snprintf(path, sizeof(path), "%s/rd_glyphs_%02d_%s_tex%u_lvl%d_%dx%d_at%dx%d_fmt%x_ch%zu.raw",
+             dir, n, what, rd_cur_tex2d(), level, w, h, xo, yo, fmt, chans);
+    FILE* f = fopen(path, "wb");
+    if (!f) return;
+    fwrite(px, 1, (size_t)w * (size_t)h * chans, f);   /* rows are tight: rd_unpack_tighten ran already */
+    fclose(f);
+    n++;
+    printf_log(LOG_NONE, "RIMDROID GLT DUMPTEX #%d -> %s\n", n, path); fflush(NULL);
+}
 static void rd_glTexImage2D(uint32_t target, int32_t level, int32_t ifmt, int32_t w, int32_t h, int32_t border, uint32_t fmt, uint32_t type, const void* px) {
     int rd_up_tid = rd_upload_enter("TexImage2D", rd_cur_tex2d(), level, w, h);
     if (px) { rd_unpack_tighten(); px = rd_upload_bounce(w, h, fmt, type, px); }
     if (level == 0) rd_tex_account((uint32_t)ifmt, 1, w, h);
     if ((w >= 2048 || h >= 2048 || w < 0 || h < 0) && rd_texlog_n < 48)
         { rd_texlog_n++; printf_log(LOG_NONE, "RIMDROID GLSANITY glTexImage2D target=0x%x level=%d ifmt=0x%x %dx%d fmt=0x%x type=0x%x px=%p\n", target, level, ifmt, w, h, fmt, type, px); fflush(NULL); }
+    rd_dump_texture("Image", level, 0, 0, w, h, fmt, type, px);
     if (p_rd_real_glTexImage2D) p_rd_real_glTexImage2D(target, level, ifmt, w, h, border, fmt, type, px);
     rd_upload_exit(rd_up_tid);
 }
@@ -1189,6 +1244,7 @@ static void rd_glTexSubImage2D(uint32_t target, int32_t level, int32_t xo, int32
     // special-case path, which does not populate p_rd_real (see the AddBridge call below).
     if (!p_rd_real_glTexSubImage2D && &g_zfa_handle && g_zfa_handle)
         p_rd_real_glTexSubImage2D = (void(*)(uint32_t,int32_t,int32_t,int32_t,int32_t,int32_t,uint32_t,uint32_t,const void*))dlsym(g_zfa_handle, "glTexSubImage2D");
+    rd_dump_texture("Sub", level, xo, yo, w, h, fmt, type, px);
     if (p_rd_real_glTexSubImage2D) p_rd_real_glTexSubImage2D(target, level, xo, yo, w, h, fmt, type, px);
     rd_upload_exit(rd_up_tid);
 }
@@ -2857,13 +2913,16 @@ static void rd_fill_display_mode(void* mode) {
 EXPORT int my2_SDL_GetDesktopDisplayMode(int displayIndex, void* mode) {
     rd_fill_display_mode(mode);
     static int n = 0;
-    if (n < 4) { n++; printf_log(LOG_NONE, "RIMDROID GetDesktopDisplayMode(%d) => 1024x768@60\n", displayIndex); }
+    // Report what rd_fill_display_mode actually wrote. The old text said 1024x768 — a leftover from
+    // the 2026-05-30 experiment that this code stopped doing months ago, and it cost a wrong
+    // hypothesis during the 1.5 font hunt: the log claimed a fake desktop size the shim never sends.
+    if (n < 4) { n++; printf_log(LOG_NONE, "RIMDROID GetDesktopDisplayMode(%d) => %dx%d@60\n", displayIndex, g_window_w, g_window_h); }
     return 0;
 }
 EXPORT int my2_SDL_GetCurrentDisplayMode(int displayIndex, void* mode) {
     rd_fill_display_mode(mode);
     static int n = 0;
-    if (n < 4) { n++; printf_log(LOG_NONE, "RIMDROID GetCurrentDisplayMode(%d) => 1024x768@60\n", displayIndex); }
+    if (n < 4) { n++; printf_log(LOG_NONE, "RIMDROID GetCurrentDisplayMode(%d) => %dx%d@60\n", displayIndex, g_window_w, g_window_h); }
     return 0;
 }
 
