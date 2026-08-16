@@ -1997,143 +1997,42 @@ EXPORT int my_statfs64(const char* path, void* buf)
 #endif
 
 #ifdef ANDROID
+// Bionic has no qsort_r, so guest qsort/qsort_r land here. Route them through bionic's own
+// qsort() and smuggle the (comparator, arg) pair in a thread-local, saved/restored around the
+// call so a guest comparator that itself sorts (a nested qsort on the same thread) cannot
+// clobber the outer sort's context. History — do NOT regress either way:
+//  - box64's original hand-rolled Android qsort_r was BROKEN (pivot = pointer INTO the array,
+//    clobbered mid-partition; j<=hi off-by-one) and mis-built Mono's IMT tables → the pawn
+//    save corruption (fixed 9c20eb6fa; causal chain proven by a shadow-sorter experiment,
+//    retired 2026-08-16 — grep QSORTDIV in old logs).
+//  - the first FIXED replacement was a textbook recursive Lomuto (pivot = last element, no
+//    depth limit, no insertion cutoff): O(n^2) compares and O(n) native recursion on
+//    nearly-sorted input. Under box64 every compare is a guest-callback round-trip, so
+//    RimWorld 1.6 map generation (large, often pointer-keyed = ASLR-ordered arrays) could
+//    hang the main thread until Android ANR-killed the game — "freezes, sound keeps playing,
+//    then drops out", phasic across boots. Bionic's qsort has neither pathology.
 typedef int (*__compar_d_fn_t)(const void*, const void*, void*);
 
-static size_t qsort_r_partition(void* base, size_t size, __compar_d_fn_t compar, void* arg, size_t lo, size_t hi)
-{
-    void* tmp = alloca(size);
-    void* pivot = alloca(size);
-    memcpy(pivot, ((char*)base) + hi * size, size);
-    size_t i = lo;
-    for (size_t j = lo; j < hi; j++)
-    {
-        void* base_i = ((char*)base) + i * size;
-        void* base_j = ((char*)base) + j * size;
-        if (compar(base_j, pivot, arg) < 0)
-        {
-            memcpy(tmp, base_i, size);
-            memcpy(base_i, base_j, size);
-            memcpy(base_j, tmp, size);
-            i++;
-        }
-    }
-    void* base_i = ((char *)base) + i * size;
-    void* base_hi = ((char *)base) + hi * size;
-    memcpy(tmp, base_i, size);
-    memcpy(base_i, base_hi, size);
-    memcpy(base_hi, tmp, size);
-    return i;
-}
+typedef struct rd_qsort_ctx_s {
+    __compar_d_fn_t fn;
+    void*           arg;
+} rd_qsort_ctx_t;
+static __thread rd_qsort_ctx_t rd_qsort_ctx;
 
-static void qsort_r_helper(void* base, size_t size, __compar_d_fn_t compar, void* arg, ssize_t lo, ssize_t hi)
+static int rd_qsort_trampoline(const void* a, const void* b)
 {
-    if (lo < hi)
-    {
-        size_t p = qsort_r_partition(base, size, compar, arg, lo, hi);
-        qsort_r_helper(base, size, compar, arg, lo, p - 1);
-        qsort_r_helper(base, size, compar, arg, p + 1, hi);
-    }
+    return rd_qsort_ctx.fn(a, b, rd_qsort_ctx.arg);
 }
 
 static void qsort_r(void* base, size_t nmemb, size_t size, __compar_d_fn_t compar, void* arg)
 {
     if (nmemb < 2 || !size)
         return;
-    qsort_r_helper(base, size, compar, arg, 0, nmemb - 1);
-}
-
-// ---- RimDroid SHADOW SORTER (diagnostic, 2026-07-14) ----------------------------------------
-// Causal experiment for "did the broken Android qsort BUILD the corrupted IMT tables?" (the pawn
-// save bug): the real array is sorted with the FIXED algorithm above (the game stays safe); a copy
-// is then sorted with the ORIGINAL BROKEN algorithm (verbatim pre-9c20eb6fa: pivot = raw pointer
-// INTO the array at lo, clobbered mid-partition; j<=hi off-by-one). If the legacy result is
-// genuinely MIS-SORTED (has an inversion under the guest comparator — not just an equal-keys
-// permutation of the fixed result), we log the GUEST CALLER: a libmono IMT/interface-build caller
-// on real data = the direct causal chain "broken sort → wrong Mono dispatch table → ExposeData
-// mis-dispatch". Grep "RIMDROID QSORTDIV".
-static size_t rd_qsort_legacy_partition(void* base, size_t size, __compar_d_fn_t compar, void* arg, size_t lo, size_t hi)
-{
-    void* tmp = alloca(size);
-    void* pivot = ((char*)base) + lo * size;            // BROKEN on purpose: pointer INTO the array
-    size_t i = lo;
-    for (size_t j = lo; j <= hi; j++)                   // BROKEN on purpose: includes hi
-    {
-        void* base_i = ((char*)base) + i * size;
-        void* base_j = ((char*)base) + j * size;
-        if (compar(base_j, pivot, arg) < 0)
-        {
-            memcpy(tmp, base_i, size);
-            memcpy(base_i, base_j, size);
-            memcpy(base_j, tmp, size);
-            i++;
-        }
-    }
-    void* base_i = ((char *)base) + i * size;
-    void* base_hi = ((char *)base) + hi * size;
-    memcpy(tmp, base_i, size);
-    memcpy(base_i, base_hi, size);
-    memcpy(base_hi, tmp, size);
-    return i;
-}
-static void rd_qsort_legacy_helper(void* base, size_t size, __compar_d_fn_t compar, void* arg, ssize_t lo, ssize_t hi)
-{
-    if (lo < hi)
-    {
-        size_t p = rd_qsort_legacy_partition(base, size, compar, arg, lo, hi);
-        rd_qsort_legacy_helper(base, size, compar, arg, lo, p - 1);
-        rd_qsort_legacy_helper(base, size, compar, arg, p + 1, hi);
-    }
-}
-static void rd_qsort_legacy(void* base, size_t nmemb, size_t size, __compar_d_fn_t compar, void* arg)
-{
-    if (nmemb < 2 || !size)
-        return;
-    rd_qsort_legacy_helper(base, size, compar, arg, 0, nmemb - 1);
-}
-
-static void rd_qsort_shadow(x64emu_t* emu, void* base, size_t nmemb, size_t size, __compar_d_fn_t compar, void* arg)
-{
-    static int rd_qdiv_logged = 0;    // stop logging after 32 divergences
-    static int rd_shadow_calls = 0;   // stop shadowing after 20000 calls (bounds the 2x sort cost)
-    int shadow = (nmemb >= 3 && nmemb <= 4096 && size > 0 && size <= 64
-                  && rd_qdiv_logged < 32 && rd_shadow_calls < 20000);
-    void* copy = NULL;
-    size_t bytes = nmemb * size;
-    if (shadow) {
-        rd_shadow_calls++;
-        copy = malloc(bytes);
-        if (copy) memcpy(copy, base, bytes);
-    }
-    qsort_r(base, nmemb, size, compar, arg);   // the REAL sort — always the fixed algorithm
-    if (!copy) return;
-    rd_qsort_legacy(copy, nmemb, size, compar, arg);
-    if (memcmp(copy, base, bytes) != 0) {
-        // Divergence — report only if the legacy output is truly UNSORTED (has an inversion),
-        // not merely a different valid ordering of equal keys.
-        ssize_t inv = -1;
-        for (size_t k = 0; k + 1 < nmemb; k++)
-            if (compar((char*)copy + k*size, (char*)copy + (k+1)*size, arg) > 0) { inv = (ssize_t)k; break; }
-        if (inv >= 0) {
-            rd_qdiv_logged++;
-            uintptr_t sp = R_RSP;
-            uintptr_t caller = (sp >= 0x10000 && !(sp & 0x7)) ? *(uintptr_t*)sp : 0;   // guest return addr
-            printf_log(LOG_NONE, "RIMDROID QSORTDIV n=%zu size=%zu inv@%zd caller=%p(%s)\n",
-                nmemb, size, inv, (void*)caller, caller ? getAddrFunctionName(caller) : "?");
-            if (size == 8) {   // pointer/qword arrays (IMT builder entries are pointers): dump around the inversion
-                char b1[256], b2[256]; int p1 = 0, p2 = 0;
-                size_t s = (inv > 2) ? (size_t)(inv - 2) : 0;
-                size_t e = (s + 6 > nmemb) ? nmemb : s + 6;
-                for (size_t k = s; k < e; k++) {
-                    p1 += snprintf(b1 + p1, sizeof(b1) - (size_t)p1, "%llx ", (unsigned long long)((uint64_t*)copy)[k]);
-                    p2 += snprintf(b2 + p2, sizeof(b2) - (size_t)p2, "%llx ", (unsigned long long)((uint64_t*)base)[k]);
-                }
-                printf_log(LOG_NONE, "RIMDROID QSORTDIV old[%zu..%zu]= %s\n", s, e - 1, b1);
-                printf_log(LOG_NONE, "RIMDROID QSORTDIV new[%zu..%zu]= %s\n", s, e - 1, b2);
-            }
-            fflush(NULL);
-        }
-    }
-    free(copy);
+    rd_qsort_ctx_t saved = rd_qsort_ctx;   // nesting support: keep the outer sort's context
+    rd_qsort_ctx.fn = compar;
+    rd_qsort_ctx.arg = arg;
+    qsort(base, nmemb, size, rd_qsort_trampoline);
+    rd_qsort_ctx = saved;
 }
 #endif
 
@@ -2152,21 +2051,14 @@ EXPORT void my_qsort(x64emu_t* emu, void* base, size_t nmemb, size_t size, void*
 {
     compare_r_t args;
     args.emu = emu; args.f = (uintptr_t)fnc; args.r = 0; args.data = NULL;
-#ifdef ANDROID
-    rd_qsort_shadow(emu, base, nmemb, size, (__compar_d_fn_t)my_compare_r_cb, &args);
-#else
+    // glibc's qsort_r on Linux; the bionic-qsort adapter above on Android.
     qsort_r(base, nmemb, size, (__compar_d_fn_t)my_compare_r_cb, &args);
-#endif
 }
 EXPORT void my_qsort_r(x64emu_t* emu, void* base, size_t nmemb, size_t size, void* fnc, void* data)
 {
     compare_r_t args;
     args.emu = emu; args.f = (uintptr_t)fnc; args.r = 1; args.data = data;
-#ifdef ANDROID
-    rd_qsort_shadow(emu, base, nmemb, size, (__compar_d_fn_t)my_compare_r_cb, &args);
-#else
     qsort_r(base, nmemb, size, (__compar_d_fn_t)my_compare_r_cb, &args);
-#endif
 }
 EXPORT void* my_bsearch(x64emu_t* emu, void* key, void* base, size_t nmemb, size_t size, void* fnc)
 {
