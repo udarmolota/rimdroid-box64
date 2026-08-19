@@ -220,6 +220,39 @@ int AllocLoadElfMemory32(box64context_t* context, elfheader_t* head, int mainbin
 #else
  ;
 #endif
+// RimDroid: when a fixed-address image cannot be placed, say WHAT already occupies the range. On Android
+// a non-root app cannot read the system tombstone, so without this an EEXIST here is a dead end.
+static void rd_log_maps_overlapping(uintptr_t start, uintptr_t end)
+{
+    FILE* f = fopen("/proc/self/maps", "r");
+    if(!f) return;
+    char line[512];
+    int shown = 0;
+    while(fgets(line, sizeof(line), f)) {
+        unsigned long b = 0, e = 0;
+        if(sscanf(line, "%lx-%lx", &b, &e) != 2) continue;
+        if(e <= start || b >= end) continue;
+        size_t l = strlen(line);
+        while(l && (line[l-1] == '\n' || line[l-1] == '\r')) line[--l] = 0;
+        printf_log(LOG_NONE, "    in use: %s\n", line);
+        if(++shown >= 8) break;
+    }
+    if(!shown) printf_log(LOG_NONE, "    (nothing in /proc/self/maps overlaps that range)\n");
+    fclose(f);
+}
+
+// The launcher can pre-reserve the low range a non-PIE game needs, before anything else in the process
+// (notably the GPU driver) can take it, and publish it as RIMDROID_ELF_RESERVE="0xBASE-0xEND". Mapping
+// over that with MAP_FIXED only replaces our own PROT_NONE placeholder, so it is safe.
+static int rd_range_is_reserved(uintptr_t start, uintptr_t end)
+{
+    const char* env = getenv("RIMDROID_ELF_RESERVE");
+    unsigned long b = 0, e = 0;
+    if(!env || !*env) return 0;
+    if(sscanf(env, "%lx-%lx", &b, &e) != 2) return 0;
+    return (start >= (uintptr_t)b) && (end <= (uintptr_t)e);
+}
+
 int AllocLoadElfMemory(box64context_t* context, elfheader_t* head, int mainbin)
 {
     if(box64_is32bits)
@@ -263,10 +296,18 @@ int AllocLoadElfMemory(box64context_t* context, elfheader_t* head, int mainbin)
             InternalMunmap(raw, sz);
             image = raw = InternalMmap((void*)head->vaddr, sz, 0,
                 MAP_ANONYMOUS|MAP_PRIVATE|MAP_NORESERVE|MAP_FIXED_NOREPLACE, -1, 0);
-            if(image==MAP_FAILED)
+            if(image==MAP_FAILED && rd_range_is_reserved(head->vaddr, head->vaddr+sz)) {
+                // Our own placeholder is in the way — take it over.
+                image = raw = InternalMmap((void*)head->vaddr, sz, 0,
+                    MAP_ANONYMOUS|MAP_PRIVATE|MAP_NORESERVE|MAP_FIXED, -1, 0);
+                printf_log(LOG_NONE, "Warning: elf \"%s\" @%p taken from the launcher-reserved range (%s)\n",
+                    head->name, (void*)head->vaddr, (image==MAP_FAILED)?"failed":"ok");
+            }
+            if(image==MAP_FAILED) {
                 printf_log(LOG_NONE, "Error: fixed-address (non-PIE) elf \"%s\" requires @%p, kernel refused it: error=%d/%s (range already in use)\n",
                     head->name, (void*)head->vaddr, errno, strerror(errno));
-            else
+                rd_log_maps_overlapping((uintptr_t)head->vaddr, (uintptr_t)head->vaddr+sz);
+            } else
                 printf_log(LOG_NONE, "Warning: kernel ignored the load-address hint for \"%s\", forced @%p via MAP_FIXED_NOREPLACE\n",
                     head->name, (void*)head->vaddr);
         }
