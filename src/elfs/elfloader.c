@@ -4,6 +4,9 @@
 #include <string.h>
 #include <elf.h>
 #include <sys/mman.h>
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <sys/types.h>
@@ -249,6 +252,24 @@ int AllocLoadElfMemory(box64context_t* context, elfheader_t* head, int mainbin)
         image = (void*)(((uintptr_t)raw+max_align)&~max_align);
     } else {
         image = raw = InternalMmap((void*)head->vaddr, sz, 0, MAP_ANONYMOUS|MAP_PRIVATE|MAP_NORESERVE, -1, 0);
+        // The address passed to mmap is only a HINT: some kernels ignore it and return a high address
+        // (seen on Huawei Kirin 8000 / Android 12). For an ET_EXEC (non-PIE) image that is fatal — its
+        // absolute addresses are baked into the code, so running it relocated jumps into unmapped
+        // memory (SIGSEGV at the original vaddr, e.g. RIP=0x400630 with nothing mapped there).
+        // Insist with MAP_FIXED_NOREPLACE: it never clobbers an existing mapping, it only fails with
+        // EEXIST when the range is genuinely taken — which then reports a clear error right here
+        // instead of an unexplained crash once the guest starts running.
+        if(head->e_type==ET_EXEC && image!=MAP_FAILED && image!=(void*)head->vaddr) {
+            InternalMunmap(raw, sz);
+            image = raw = InternalMmap((void*)head->vaddr, sz, 0,
+                MAP_ANONYMOUS|MAP_PRIVATE|MAP_NORESERVE|MAP_FIXED_NOREPLACE, -1, 0);
+            if(image==MAP_FAILED)
+                printf_log(LOG_NONE, "Error: fixed-address (non-PIE) elf \"%s\" requires @%p, kernel refused it: error=%d/%s (range already in use)\n",
+                    head->name, (void*)head->vaddr, errno, strerror(errno));
+            else
+                printf_log(LOG_NONE, "Warning: kernel ignored the load-address hint for \"%s\", forced @%p via MAP_FIXED_NOREPLACE\n",
+                    head->name, (void*)head->vaddr);
+        }
         if(head->vaddr&(box64_pagesize-1)) {
             // load address might be lower
             if((uintptr_t)image == (head->vaddr&~(box64_pagesize-1))) {
