@@ -1531,20 +1531,36 @@ dynarec_log(/*LOG_DEBUG*/LOG_INFO, "%04d|Repeated SIGSEGV with Access error on %
     relockMutex(Locks);
     // --- RimDroid: log SIGSEGV fault info to dedicated file ---
     if(sig == X64_SIGSEGV) {
-        const char* _sh = getenv("HOME");
-        char _sp[512];
-        snprintf(_sp, sizeof(_sp), "%s/sigsegv_fault.log", _sh ? _sh : "/data/local/tmp");
-        int _sfd = open(_sp, O_WRONLY|O_CREAT|O_APPEND, 0644);
-        if(_sfd >= 0) {
-            char _sbuf[512];
-            int _sn = snprintf(_sbuf, sizeof(_sbuf),
-                "SIGSEGV: addr=%p code=%d x64_RIP=0x%lx x64_RSP=0x%lx native_pc=%p tid=%d handler=0x%lx\n",
-                (void*)info->si_addr, info->si_code,
-                (unsigned long)x64pc, (unsigned long)R_RSP,
-                pc, tid,
-                (unsigned long)my_context->signals[sig]);
-            write(_sfd, _sbuf, _sn);
-            close(_sfd);
+        // Repeat-suppressor (2026-08-30): Boehm GC writes into dynarec-protected pages as its
+        // normal SMC dance, so a GC-heavy modded game repeats ONE faulting RIP hundreds of
+        // thousands of times — a Tecno field report grew this file to 91 MB / 704k lines, with
+        // an open/write/close from the signal path on every fault. Log the first 32 hits of a
+        // repeating RIP, then every 1024th with a running count. A fatal fault still lands:
+        // its RIP differs from the storm's, so it starts a fresh count. Plain (unsynchronised)
+        // statics on purpose: a cross-thread race only miscounts a diagnostic line.
+        static uintptr_t _rd_last_rip = 0;
+        static unsigned long _rd_rip_n = 0;
+        if ((uintptr_t)x64pc == _rd_last_rip) _rd_rip_n++;
+        else { _rd_last_rip = (uintptr_t)x64pc; _rd_rip_n = 1; }
+        if (_rd_rip_n <= 32 || (_rd_rip_n & 1023) == 0) {
+            const char* _sh = getenv("HOME");
+            char _sp[512];
+            snprintf(_sp, sizeof(_sp), "%s/sigsegv_fault.log", _sh ? _sh : "/data/local/tmp");
+            int _sfd = open(_sp, O_WRONLY|O_CREAT|O_APPEND, 0644);
+            if(_sfd >= 0) {
+                char _rep[40];
+                _rep[0] = 0;
+                if (_rd_rip_n > 32) snprintf(_rep, sizeof(_rep), " (x%lu)", _rd_rip_n);
+                char _sbuf[512];
+                int _sn = snprintf(_sbuf, sizeof(_sbuf),
+                    "SIGSEGV: addr=%p code=%d x64_RIP=0x%lx x64_RSP=0x%lx native_pc=%p tid=%d handler=0x%lx%s\n",
+                    (void*)info->si_addr, info->si_code,
+                    (unsigned long)x64pc, (unsigned long)R_RSP,
+                    pc, tid,
+                    (unsigned long)my_context->signals[sig], _rep);
+                write(_sfd, _sbuf, _sn);
+                close(_sfd);
+            }
         }
     }
     // ----------------------------------------------------------
