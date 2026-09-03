@@ -2806,6 +2806,7 @@ EXPORT void my2_SDL_FilterEvents(x64emu_t* emu, void* filter, void* userdata) {
 extern __attribute__((weak)) void* g_egl_display;
 extern __attribute__((weak)) void* g_egl_surface;
 extern __attribute__((weak)) void* g_egl_context;
+extern __attribute__((weak)) void  rimdroid_eglt_swap(void);
 
 // ZINK_ZFA renderer: ZFA context created by rimdroid.c in the parent (Zink over
 // Vulkan/Turnip).  When g_zfa_context is set we route the GL context calls to
@@ -3087,6 +3088,9 @@ EXPORT void my2_SDL_GL_SwapWindow(void* win) {
         return;
     }
     if (g_egl_display && g_egl_surface) {
+        // The helper also replaces an EGLSurface whose Android BufferQueue was recreated while
+        // the game was backgrounded. Keep the direct fallback for standalone box64 builds.
+        if (rimdroid_eglt_swap) { rimdroid_eglt_swap(); return; }
         void* h = rimdroid_libegl();
         if (h) {
             typedef unsigned int (*fn_t)(void*, void*);
