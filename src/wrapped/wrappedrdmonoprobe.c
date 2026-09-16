@@ -27,6 +27,7 @@ const char* rdmonoprobeName = "librdmonoprobe.so";
 static uintptr_t reverse_icall_iFii_fct_##A = 0; \
 static int reverse_icall_iFii_##A(int left, int right) \
 { \
+    printf_log(LOG_NONE, "RIMDROID P2 reverse icall slot=%d left=0x%x right=0x%x\n", A, left, right); \
     return (int)RunFunctionFmt(reverse_icall_iFii_fct_##A, "ii", left, right); \
 }
 REVERSE_ICALL_SLOTS()
@@ -51,7 +52,10 @@ static void* find_reverse_icall_iFii(void* fct)
 EXPORT void my_mono_add_internal_call(x64emu_t* emu, const char* name, void* method)
 {
     (void)emu;
-    my->mono_add_internal_call((void*)name, find_reverse_icall_iFii(method));
+    void* host_method = find_reverse_icall_iFii(method);
+    printf_log(LOG_NONE, "RIMDROID P2 register icall name=%s guest=%p host=%p\n",
+        name ? name : "(null)", method, host_method);
+    my->mono_add_internal_call((void*)name, host_method);
 }
 
 /*
