@@ -3,6 +3,9 @@
 #endif
 
 GO("libc.musl-x86_64.so.1", libcmusl)
+// Experimental RimDroid probe only. This is deliberately not libmonobdwgc-2.0.so:
+// the game keeps using its existing x86 Mono until the ABI gates pass.
+GO("librdmonoprobe.so", rdmonoprobe)
 GO("librt.so.1", librt)
 GO("libbsd.so.0", libbsd)
 GO("libEGL.so.1", libegl)
