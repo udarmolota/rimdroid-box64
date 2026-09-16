@@ -85,6 +85,20 @@ static int64_t reverse_icall_IFIIIIIIIII(
         a, b, c, d, e, f, g, h, i);
 }
 
+#define NARROW_IDENTITY(NAME, CTYPE, FMT) \
+    static uintptr_t reverse_icall_##NAME##_fct; \
+    static CTYPE reverse_icall_##NAME(CTYPE value) \
+    { \
+        return (CTYPE)RunFunctionFmt(reverse_icall_##NAME##_fct, FMT, value); \
+    }
+
+NARROW_IDENTITY(cFc, int8_t, "c")
+NARROW_IDENTITY(CFC, uint8_t, "C")
+NARROW_IDENTITY(wFw, int16_t, "w")
+NARROW_IDENTITY(WFW, uint16_t, "W")
+
+#undef NARROW_IDENTITY
+
 static void* select_reverse_icall(const char* name, void* method)
 {
     void* native = GetNativeFnc((uintptr_t)method);
@@ -109,6 +123,22 @@ static void* select_reverse_icall(const char* name, void* method)
     if (strstr(name, "::NativeSumNine")) {
         reverse_icall_IFIIIIIIIII_fct = (uintptr_t)method;
         return reverse_icall_IFIIIIIIIII;
+    }
+    if (strstr(name, "::NativeSByteIdentity")) {
+        reverse_icall_cFc_fct = (uintptr_t)method;
+        return reverse_icall_cFc;
+    }
+    if (strstr(name, "::NativeByteIdentity")) {
+        reverse_icall_CFC_fct = (uintptr_t)method;
+        return reverse_icall_CFC;
+    }
+    if (strstr(name, "::NativeInt16Identity")) {
+        reverse_icall_wFw_fct = (uintptr_t)method;
+        return reverse_icall_wFw;
+    }
+    if (strstr(name, "::NativeUInt16Identity")) {
+        reverse_icall_WFW_fct = (uintptr_t)method;
+        return reverse_icall_WFW;
     }
     return find_reverse_icall_iFii(method);
 }
