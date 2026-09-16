@@ -3,6 +3,7 @@
 
 #include "wrappedlibs.h"
 
+#include "wrapper.h"
 #include "librarian/library_private.h"
 
 const char* rdmonoprobeName = "librdmonoprobe.so";
