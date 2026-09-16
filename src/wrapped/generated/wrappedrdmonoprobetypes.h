@@ -11,6 +11,9 @@
 #define ADDED_FUNCTIONS()
 #endif
 
-#define SUPER() ADDED_FUNCTIONS()
+typedef void (*vFpp_t)(void*, void*);
+
+#define SUPER() ADDED_FUNCTIONS() \
+    GO(mono_add_internal_call, vFpp_t)
 
 #endif // __wrappedrdmonoprobeTYPES_H_
