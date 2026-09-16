@@ -1,5 +1,7 @@
 #include <dlfcn.h>
+#include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "wrappedlibs.h"
 
@@ -49,10 +51,72 @@ static void* find_reverse_icall_iFii(void* fct)
 
 #undef REVERSE_ICALL_SLOTS
 
+static uintptr_t reverse_icall_IFII_fct;
+static int64_t reverse_icall_IFII(int64_t left, int64_t right)
+{
+    return (int64_t)RunFunctionFmt(reverse_icall_IFII_fct, "II", left, right);
+}
+
+static uintptr_t reverse_icall_pFp_fct;
+static void* reverse_icall_pFp(void* value)
+{
+    return (void*)RunFunctionFmt(reverse_icall_pFp_fct, "p", value);
+}
+
+static uintptr_t reverse_icall_dFdd_fct;
+static double reverse_icall_dFdd(double left, double right)
+{
+    return RunFunctionFmtD(reverse_icall_dFdd_fct, "dd", left, right);
+}
+
+static uintptr_t reverse_icall_dFff_fct;
+static double reverse_icall_dFff(float left, float right)
+{
+    return RunFunctionFmtD(reverse_icall_dFff_fct, "ff", left, right);
+}
+
+static uintptr_t reverse_icall_IFIIIIIIIII_fct;
+static int64_t reverse_icall_IFIIIIIIIII(
+    int64_t a, int64_t b, int64_t c, int64_t d, int64_t e,
+    int64_t f, int64_t g, int64_t h, int64_t i)
+{
+    return (int64_t)RunFunctionFmt(
+        reverse_icall_IFIIIIIIIII_fct, "IIIIIIIII",
+        a, b, c, d, e, f, g, h, i);
+}
+
+static void* select_reverse_icall(const char* name, void* method)
+{
+    void* native = GetNativeFnc((uintptr_t)method);
+    if (native) return native;
+
+    if (strstr(name, "::NativeAddLong")) {
+        reverse_icall_IFII_fct = (uintptr_t)method;
+        return reverse_icall_IFII;
+    }
+    if (strstr(name, "::NativePointerIdentity")) {
+        reverse_icall_pFp_fct = (uintptr_t)method;
+        return reverse_icall_pFp;
+    }
+    if (strstr(name, "::NativeAddDouble")) {
+        reverse_icall_dFdd_fct = (uintptr_t)method;
+        return reverse_icall_dFdd;
+    }
+    if (strstr(name, "::NativeAddFloatArgs")) {
+        reverse_icall_dFff_fct = (uintptr_t)method;
+        return reverse_icall_dFff;
+    }
+    if (strstr(name, "::NativeSumNine")) {
+        reverse_icall_IFIIIIIIIII_fct = (uintptr_t)method;
+        return reverse_icall_IFIIIIIIIII;
+    }
+    return find_reverse_icall_iFii(method);
+}
+
 EXPORT void my_mono_add_internal_call(x64emu_t* emu, const char* name, void* method)
 {
     (void)emu;
-    void* host_method = find_reverse_icall_iFii(method);
+    void* host_method = select_reverse_icall(name, method);
     printf_log(LOG_NONE, "RIMDROID P2 register icall name=%s guest=%p host=%p\n",
         name ? name : "(null)", method, host_method);
     my->mono_add_internal_call((void*)name, host_method);
