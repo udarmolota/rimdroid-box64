@@ -99,6 +99,22 @@ NARROW_IDENTITY(WFW, uint16_t, "W")
 
 #undef NARROW_IDENTITY
 
+static uintptr_t reverse_icall_vFp_fct;
+static void reverse_icall_vFp(void* value)
+{
+    RunFunctionFmt(reverse_icall_vFp_fct, "p", value);
+}
+
+static uintptr_t reverse_icall_vFv_fct[2];
+static void reverse_icall_vFv_0(void)
+{
+    RunFunctionFmt(reverse_icall_vFv_fct[0], "");
+}
+static void reverse_icall_vFv_1(void)
+{
+    RunFunctionFmt(reverse_icall_vFv_fct[1], "");
+}
+
 static void* select_reverse_icall(const char* name, void* method)
 {
     void* native = GetNativeFnc((uintptr_t)method);
@@ -139,6 +155,18 @@ static void* select_reverse_icall(const char* name, void* method)
     if (strstr(name, "::NativeUInt16Identity")) {
         reverse_icall_WFW_fct = (uintptr_t)method;
         return reverse_icall_WFW;
+    }
+    if (strstr(name, "::NativePublishObject")) {
+        reverse_icall_vFp_fct = (uintptr_t)method;
+        return reverse_icall_vFp;
+    }
+    if (strstr(name, "::NativeInstallGuestRoot")) {
+        reverse_icall_vFv_fct[0] = (uintptr_t)method;
+        return reverse_icall_vFv_0;
+    }
+    if (strstr(name, "::NativeClearGuestRoot")) {
+        reverse_icall_vFv_fct[1] = (uintptr_t)method;
+        return reverse_icall_vFv_1;
     }
     return find_reverse_icall_iFii(method);
 }
