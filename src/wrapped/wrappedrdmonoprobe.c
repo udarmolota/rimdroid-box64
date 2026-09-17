@@ -12,6 +12,8 @@
 #include "x64emu.h"
 #include "callback.h"
 #include "box64context.h"
+#include "emu/x64emu_private.h"
+#include "regs.h"
 
 const char* rdmonoprobeName = "librdmonoprobe.so";
 #define LIBNAME rdmonoprobe
@@ -169,6 +171,96 @@ static void* select_reverse_icall(const char* name, void* method)
         return reverse_icall_vFv_1;
     }
     return find_reverse_icall_iFii(method);
+}
+
+/*
+ * P3: foreign GC roots.
+ *
+ * ARM64 Mono's Boehm GC scans native thread stacks, but an x86 guest keeps object references in Box64
+ * state it cannot see: the emulated registers and a separately mapped guest stack. The baseline probe
+ * proved the loss (-201: an object referenced only from a guest stack slot was collected).
+ *
+ * Mono already chains the root hook (boehm-gc.c keeps the previous GC_push_other_roots and calls it), so
+ * after mono_jit_init_version we chain once more on top of Mono's callback instead of replacing it, and
+ * push the guest registers and the live part of the guest stack.
+ *
+ * Scope is deliberately the probe's single guest thread. Real Unity needs a per-thread registry with
+ * thread-exit handling. The callback runs with the world stopped and the GC allocation lock held: it must
+ * not lock, allocate or print, because a suspended thread may own whatever it would wait on.
+ */
+typedef void (*rd_gc_push_other_roots_t)(void);
+static rd_gc_push_other_roots_t rd_gc_prev_push_other_roots;
+static void (*rd_gc_push_all)(void*, void*);
+static void* (*rd_gc_call_with_alloc_lock)(void* (*)(void*), void*);
+static x64emu_t* volatile rd_gc_guest_emu;
+static volatile unsigned long rd_gc_guest_pushes;
+
+static void rd_gc_push_guest_roots(void)
+{
+    if (rd_gc_prev_push_other_roots)
+        rd_gc_prev_push_other_roots();
+    x64emu_t* emu = rd_gc_guest_emu;
+    if (!emu || !rd_gc_push_all)
+        return;
+    rd_gc_guest_pushes++;
+    rd_gc_push_all(&emu->regs[0], &emu->regs[16]);
+    rd_gc_push_all(&emu->xmm[0], &emu->xmm[16]);
+    uintptr_t bottom = (uintptr_t)emu->init_stack;
+    uintptr_t top = bottom + emu->size_stack;
+    uintptr_t sp = (uintptr_t)emu->regs[_SP].q[0] - 128;   /* SysV red zone below RSP */
+    uintptr_t lo = (sp >= bottom && sp < top) ? sp : bottom;
+    if (lo < top)
+        rd_gc_push_all((void*)lo, (void*)top);
+}
+
+static void* rd_gc_clear_guest_emu_locked(void* unused)
+{
+    (void)unused;
+    rd_gc_guest_emu = NULL;
+    return NULL;
+}
+
+static void rd_gc_install_guest_roots(x64emu_t* emu)
+{
+    const char* off = getenv("RIMDROID_P3_NO_GUEST_ROOTS");
+    if (off && off[0] == '1') {
+        printf_log(LOG_NONE, "RIMDROID P3 guest GC roots DISABLED (RIMDROID_P3_NO_GUEST_ROOTS=1)\n");
+        return;
+    }
+    const char* path = getenv("RIMDROID_NATIVE_MONO_PATH");
+    void* h = (path && *path) ? dlopen(path, RTLD_NOW | RTLD_NOLOAD) : NULL;
+    rd_gc_push_other_roots_t (*get_push)(void) = h ? dlsym(h, "GC_get_push_other_roots") : NULL;
+    void (*set_push)(rd_gc_push_other_roots_t) = h ? dlsym(h, "GC_set_push_other_roots") : NULL;
+    rd_gc_push_all = h ? dlsym(h, "GC_push_all") : NULL;
+    rd_gc_call_with_alloc_lock = h ? dlsym(h, "GC_call_with_alloc_lock") : NULL;
+    if (!get_push || !set_push || !rd_gc_push_all || !rd_gc_call_with_alloc_lock) {
+        printf_log(LOG_NONE, "RIMDROID P3 guest GC roots NOT installed: missing GC hooks (h=%p get=%p set=%p push=%p lock=%p)\n",
+            h, get_push, set_push, rd_gc_push_all, rd_gc_call_with_alloc_lock);
+        return;
+    }
+    rd_gc_guest_emu = emu;
+    rd_gc_prev_push_other_roots = get_push();
+    set_push(rd_gc_push_guest_roots);
+    printf_log(LOG_NONE, "RIMDROID P3 guest GC roots installed prev=%p emu=%p stack=[%p,%p)\n",
+        rd_gc_prev_push_other_roots, emu, emu->init_stack,
+        (void*)((uintptr_t)emu->init_stack + emu->size_stack));
+}
+
+EXPORT void* my_mono_jit_init_version(x64emu_t* emu, const char* domain_name, const char* runtime_version)
+{
+    void* domain = my->mono_jit_init_version((void*)domain_name, (void*)runtime_version);
+    if (domain)
+        rd_gc_install_guest_roots(emu);
+    return domain;
+}
+
+EXPORT void my_mono_jit_cleanup(x64emu_t* emu, void* domain)
+{
+    (void)emu;
+    if (rd_gc_guest_emu && rd_gc_call_with_alloc_lock)
+        rd_gc_call_with_alloc_lock(rd_gc_clear_guest_emu_locked, NULL);
+    printf_log(LOG_NONE, "RIMDROID P3 guest GC roots pushed %lu time(s)\n", rd_gc_guest_pushes);
+    my->mono_jit_cleanup(domain);
 }
 
 EXPORT void my_mono_add_internal_call(x64emu_t* emu, const char* name, void* method)
