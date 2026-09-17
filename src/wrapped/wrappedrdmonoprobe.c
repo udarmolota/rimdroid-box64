@@ -184,6 +184,12 @@ EXPORT void my_mono_raise_exception(x64emu_t* emu, void* exception)
     my->mono_raise_exception(exception);
 }
 
+static uintptr_t reverse_icall_smc_iFi_fct;
+static int reverse_icall_smc_iFi(int round)
+{
+    return (int)RunFunctionFmt(reverse_icall_smc_iFi_fct, "i", round);
+}
+
 /* Transition cost benchmark thunks: dedicated slots with no logging on the hot path. */
 static uintptr_t reverse_icall_bench_iFi_fct;
 static int reverse_icall_bench_iFi(int value)
@@ -251,6 +257,10 @@ static void* select_reverse_icall(const char* name, void* method)
     if (strstr(name, "::NativeInstallGuestRoot")) {
         reverse_icall_vFv_fct[0] = (uintptr_t)method;
         return reverse_icall_vFv_0;
+    }
+    if (strstr(name, "::NativeSmcRound")) {
+        reverse_icall_smc_iFi_fct = (uintptr_t)method;
+        return reverse_icall_smc_iFi;
     }
     if (strstr(name, "::NativeBenchIdentity")) {
         reverse_icall_bench_iFi_fct = (uintptr_t)method;
@@ -348,8 +358,36 @@ static void rd_gc_install_guest_roots(x64emu_t* emu)
         (void*)((uintptr_t)emu->init_stack + emu->size_stack));
 }
 
+/*
+ * P5: signal ownership. Mono installs its SIGSEGV/SIGBUS/SIGILL/SIGABRT handlers during JIT init,
+ * replacing the ones Box64 installed at startup, and Box64 depends on SIGSEGV (write-protected
+ * translated code, guest faults). Mono only keeps the previous handler when signal chaining is on
+ * before init, and only hands a fault outside JIT code to it when crash chaining is OFF; with crash
+ * chaining on it reports a native crash first. So force chaining on and crash chaining off before
+ * init, whatever the embedder would pass. RIMDROID_P5_NO_SIGNAL_CHAINING=1 skips this for the baseline.
+ */
+static void rd_p5_configure_signal_chaining(void)
+{
+    const char* off = getenv("RIMDROID_P5_NO_SIGNAL_CHAINING");
+    if (off && off[0] == '1') {
+        printf_log(LOG_NONE, "RIMDROID P5 signal chaining NOT configured (RIMDROID_P5_NO_SIGNAL_CHAINING=1)\n");
+        return;
+    }
+    const char* path = getenv("RIMDROID_NATIVE_MONO_PATH");
+    void* h = (path && *path) ? dlopen(path, RTLD_NOW | RTLD_NOLOAD) : NULL;
+    void (*set_signal_chaining)(int) = h ? dlsym(h, "mono_set_signal_chaining") : NULL;
+    void (*set_crash_chaining)(int) = h ? dlsym(h, "mono_set_crash_chaining") : NULL;
+    if (set_signal_chaining)
+        set_signal_chaining(1);
+    if (set_crash_chaining)
+        set_crash_chaining(0);
+    printf_log(LOG_NONE, "RIMDROID P5 signal chaining on, crash chaining off (set=%p crash=%p)\n",
+        set_signal_chaining, set_crash_chaining);
+}
+
 EXPORT void* my_mono_jit_init_version(x64emu_t* emu, const char* domain_name, const char* runtime_version)
 {
+    rd_p5_configure_signal_chaining();
     void* domain = my->mono_jit_init_version((void*)domain_name, (void*)runtime_version);
     if (domain) {
         const char* path = getenv("RIMDROID_NATIVE_MONO_PATH");
