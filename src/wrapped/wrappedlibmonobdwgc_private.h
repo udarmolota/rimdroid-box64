@@ -3,7 +3,7 @@
 #endif
 
 // Unity 2022.3.35f1 UnityPlayer -> native ARM64 Unity Mono (RimDroid experiment).
-// The 286 functions UnityPlayer resolves from libmonobdwgc-2.0.so. Signatures come from the Unity
+// The 289 functions UnityPlayer resolves from libmonobdwgc-2.0.so (286 mono_* and 3 unity_*). Signatures come from the Unity
 // Mono sources (tools/mono-arm64); GOM entries are hand-written in wrappedlibmonobdwgc.c.
 
 GOM(mono_add_internal_call, vFEpp)
@@ -292,3 +292,6 @@ GO(mono_unity_type_is_static, iFp)
 GO(mono_unity_vtable_get_static_field_data, pFp)
 GO(mono_value_box, pFppp)
 GO(mono_verifier_set_mode, vFi)
+GO(unity_mono_method_is_generic, iFp)
+GO(unity_mono_method_is_inflated, iFp)
+GO(unity_mono_reflection_method_get_method, pFp)
