@@ -6,6 +6,9 @@ GO("libc.musl-x86_64.so.1", libcmusl)
 // Experimental RimDroid probe only. This is deliberately not libmonobdwgc-2.0.so:
 // the game keeps using its existing x86 Mono until the ABI gates pass.
 GO("librdmonoprobe.so", rdmonoprobe)
+// Native ARM64 Unity Mono for UnityPlayer. Inactive unless RIMDROID_NATIVE_MONO_PATH is set: the wrapper
+// refuses to load and the emulated x86 Mono is used as before.
+GO("libmonobdwgc-2.0.so", libmonobdwgc)
 GO("librt.so.1", librt)
 GO("libbsd.so.0", libbsd)
 GO("libEGL.so.1", libegl)

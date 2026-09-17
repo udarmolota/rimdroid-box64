@@ -573,6 +573,8 @@ library_t *NewLibrary(const char* path, box64context_t* context, elfheader_t* ve
         precise = 0;    // allow native version for tcmalloc_minimum
     if(!notwrapped && precise && strstr(path, "libSDL2-2.0.so"))
         precise = 0;    // force wrapped mode for SDL2: my2_SDL_DYNAPI_entry must intercept jump table
+    if(!notwrapped && precise && strstr(path, "libmonobdwgc-2.0.so") && getenv("RIMDROID_NATIVE_MONO_PATH"))
+        precise = 0;    // RimDroid experiment: UnityPlayer gets native ARM64 Unity Mono (wrappedlibmonobdwgc.c)
     /*
     if(!notwrapped && precise && strstr(path, "libEGL.so"))
         precise = 0;    // allow native version for EGL

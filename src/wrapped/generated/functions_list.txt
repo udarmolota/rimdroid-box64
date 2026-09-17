@@ -1687,6 +1687,9 @@
 #() pFppLi
 #() pFppLu
 #() pFppLL
+#() pFppLLL
+#() pFpuipi
+#() pFpuipip
 #() pFppLp
 #() pFpppi
 #() pFpppu

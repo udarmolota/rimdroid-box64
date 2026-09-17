@@ -181,11 +181,17 @@ emuthread_t* get_thread(void* t)
 static pthread_key_t thread_key;
 static int thread_key_ready = 0;
 
+// RimDroid: native ARM64 Mono (wrappedlibmonobdwgc.c) scans registered emulators as GC roots and must
+// forget one before it is freed.
+void (*rd_emu_destroy_hook)(x64emu_t* emu) = NULL;
+
 void emuthread_destroy(void* p)
 {
 	emuthread_t *et = (emuthread_t*)p;
 	if(!et)
 		return;
+	if(rd_emu_destroy_hook && et->emu)
+		rd_emu_destroy_hook(et->emu);
 	#ifdef BOX32
 	if(et->is32bits && !et->join && et->fnc)
 		to_hash_d(et->self);
@@ -238,8 +244,11 @@ void thread_set_emu(x64emu_t* emu)
 	if(!et) {
 		et = (emuthread_t*)box_calloc(1, sizeof(emuthread_t));
 	} else {
-		if(et->emu != emu)
+		if(et->emu != emu) {
+			if(rd_emu_destroy_hook && et->emu)
+				rd_emu_destroy_hook(et->emu);
 			FreeX64Emu(&et->emu);
+		}
 	}
 	et->emu = emu;
 	et->emu->type = EMUTYPE_MAIN;
