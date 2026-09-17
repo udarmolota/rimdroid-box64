@@ -117,6 +117,73 @@ static void reverse_icall_vFv_1(void)
     RunFunctionFmt(reverse_icall_vFv_fct[1], "");
 }
 
+/*
+ * P4: managed exceptions raised by x86 internal calls.
+ *
+ * A native mono_raise_exception unwinds straight to the managed catch block using Mono's LMF chain.
+ * Everything in between is dropped without running: this thunk, RunFunctionFmt, DynaCall and the
+ * dynarec frames. DynaCall never restores the guest registers, the guest stack pointer is left inside
+ * the dead x86 frames, and the emulator state is left mid-call. It works once and corrupts the guest.
+ *
+ * The bridge never lets that unwind cross Box64. When the guest raises inside a reverse internal call,
+ * the exception becomes Mono's pending exception and the emulator returns from this call early:
+ * emu->quit makes the dynarec exit right after the mono_raise_exception bridge, DynaCall then restores
+ * RBX/RDI/RSI/RBP/RSP/RIP, and this thunk restores R12-R15, which DynaCall does not save. The internal
+ * call returns normally, and Mono's wrapper for foreign internal calls throws the pending exception at
+ * its interruption checkpoint, inside managed code, where unwinding is native-only again.
+ *
+ * RIMDROID_P4_NO_EXCEPTION_BRIDGE=1 restores the raw native raise so one build can show both outcomes.
+ * Real Unity needs this in every reverse thunk, not only the probe's.
+ */
+static __thread int rd_p4_reverse_depth;
+static __thread int rd_p4_raised;
+static int (*rd_p4_set_pending_exception)(void*, int);
+static int rd_p4_bridge_disabled = -1;
+
+static int rd_p4_bridge_enabled(void)
+{
+    if (rd_p4_bridge_disabled < 0) {
+        const char* off = getenv("RIMDROID_P4_NO_EXCEPTION_BRIDGE");
+        rd_p4_bridge_disabled = (off && off[0] == '1') ? 1 : 0;
+    }
+    return !rd_p4_bridge_disabled;
+}
+
+static uintptr_t reverse_icall_throw_iFi_fct;
+static int reverse_icall_throw_iFi(int marker)
+{
+    x64emu_t* emu = thread_get_emu();
+    uint64_t saved_r12 = emu->regs[_R12].q[0];
+    uint64_t saved_r13 = emu->regs[_R13].q[0];
+    uint64_t saved_r14 = emu->regs[_R14].q[0];
+    uint64_t saved_r15 = emu->regs[_R15].q[0];
+    int outer_raised = rd_p4_raised;
+    rd_p4_raised = 0;
+    rd_p4_reverse_depth++;
+    int ret = (int)RunFunctionFmt(reverse_icall_throw_iFi_fct, "i", marker);
+    rd_p4_reverse_depth--;
+    if (rd_p4_raised) {
+        emu->regs[_R12].q[0] = saved_r12;
+        emu->regs[_R13].q[0] = saved_r13;
+        emu->regs[_R14].q[0] = saved_r14;
+        emu->regs[_R15].q[0] = saved_r15;
+        ret = 0;   /* discarded: the wrapper throws the pending exception */
+    }
+    rd_p4_raised = outer_raised;
+    return ret;
+}
+
+EXPORT void my_mono_raise_exception(x64emu_t* emu, void* exception)
+{
+    if (rd_p4_bridge_enabled() && rd_p4_reverse_depth > 0 && rd_p4_set_pending_exception) {
+        rd_p4_set_pending_exception(exception, 1);
+        rd_p4_raised = 1;
+        emu->quit = 1;
+        return;
+    }
+    my->mono_raise_exception(exception);
+}
+
 static void* select_reverse_icall(const char* name, void* method)
 {
     void* native = GetNativeFnc((uintptr_t)method);
@@ -165,6 +232,10 @@ static void* select_reverse_icall(const char* name, void* method)
     if (strstr(name, "::NativeInstallGuestRoot")) {
         reverse_icall_vFv_fct[0] = (uintptr_t)method;
         return reverse_icall_vFv_0;
+    }
+    if (strstr(name, "::NativeThrowFromGuest")) {
+        reverse_icall_throw_iFi_fct = (uintptr_t)method;
+        return reverse_icall_throw_iFi;
     }
     if (strstr(name, "::NativeClearGuestRoot")) {
         reverse_icall_vFv_fct[1] = (uintptr_t)method;
@@ -249,8 +320,15 @@ static void rd_gc_install_guest_roots(x64emu_t* emu)
 EXPORT void* my_mono_jit_init_version(x64emu_t* emu, const char* domain_name, const char* runtime_version)
 {
     void* domain = my->mono_jit_init_version((void*)domain_name, (void*)runtime_version);
-    if (domain)
+    if (domain) {
+        const char* path = getenv("RIMDROID_NATIVE_MONO_PATH");
+        void* h = (path && *path) ? dlopen(path, RTLD_NOW | RTLD_NOLOAD) : NULL;
+        rd_p4_set_pending_exception = h ? dlsym(h, "mono_runtime_set_pending_exception") : NULL;
+        printf_log(LOG_NONE, "RIMDROID P4 exception bridge %s (set_pending=%p)\n",
+            rd_p4_bridge_enabled() ? "enabled" : "DISABLED (RIMDROID_P4_NO_EXCEPTION_BRIDGE=1)",
+            rd_p4_set_pending_exception);
         rd_gc_install_guest_roots(emu);
+    }
     return domain;
 }
 
