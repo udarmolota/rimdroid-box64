@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "wrappedlibs.h"
 
@@ -357,8 +358,83 @@ EXPORT void my_mono_set_crash_chaining(x64emu_t* emu, int chain)
     my->mono_set_crash_chaining(value);
 }
 
+/*
+ * Native libraries for P/Invoke.
+ *
+ * Managed code asks for libraries the game ships as x86_64 files: etc/mono/config maps System.Native to
+ * $mono_libdir/libmono-native.so (MonoBleedingEdge/x86_64), and Steamworks.NET wants steam_api, which
+ * Unity's own dl fallback (ignored above: it hands out x86 handles) would find in Plugins. Native Mono
+ * cannot dlopen those, and RimWorld quits when steam_api is missing. Mono calls dl fallback handlers after
+ * its own dlopen fails, so this one looks for a file of the same name next to the native Mono runtime:
+ * the ARM64 libmono-native.so, a libsteam_api.so stub, and whatever else gets an ARM64 build later.
+ */
+static char rd_native_lib_dir[1024];
+
+static void* rd_dl_try(const char* file)
+{
+    char path[1280];
+    snprintf(path, sizeof(path), "%s/%s", rd_native_lib_dir, file);
+    if (access(path, R_OK))
+        return NULL;
+    void* handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    printf_log(LOG_NONE, "[RD-MONO] native library %s -> %s%s%s\n", file, path,
+        handle ? "" : " FAILED: ", handle ? "" : dlerror());
+    return handle;
+}
+
+static void* rd_dl_fallback_load(const char* name, int flags, char** err, void* user_data)
+{
+    (void)flags; (void)user_data;
+    // err stays NULL: Mono frees it with its own allocator, which Unity replaces.
+    if (err) *err = NULL;
+    if (!name || !*name || !rd_native_lib_dir[0])
+        return NULL;
+    const char* base = strrchr(name, '/');
+    base = base ? base + 1 : name;
+    if (!*base || strlen(base) > 200)
+        return NULL;
+    void* handle = rd_dl_try(base);
+    if (!handle && !strstr(base, ".so")) {
+        char file[256];
+        snprintf(file, sizeof(file), "%s%s.so", strncmp(base, "lib", 3) ? "lib" : "", base);
+        handle = rd_dl_try(file);
+    }
+    return handle;
+}
+
+static void* rd_dl_fallback_symbol(void* handle, const char* name, char** err, void* user_data)
+{
+    (void)user_data;
+    if (err) *err = NULL;
+    return dlsym(handle, name);
+}
+
+static void* rd_dl_fallback_close(void* handle, void* user_data)
+{
+    (void)user_data;
+    dlclose(handle);
+    return NULL;
+}
+
+static void rd_dl_install_native_fallback(void)
+{
+    static int installed;
+    if (installed)
+        return;
+    installed = 1;
+    const char* path = getenv("RIMDROID_NATIVE_MONO_PATH");
+    const char* slash = path ? strrchr(path, '/') : NULL;
+    if (!slash || (size_t)(slash - path) >= sizeof(rd_native_lib_dir))
+        return;
+    memcpy(rd_native_lib_dir, path, slash - path);
+    rd_native_lib_dir[slash - path] = 0;
+    my->mono_dl_fallback_register(rd_dl_fallback_load, rd_dl_fallback_symbol, rd_dl_fallback_close, NULL);
+    printf_log(LOG_NONE, "[RD-MONO] native P/Invoke libraries are taken from %s\n", rd_native_lib_dir);
+}
+
 EXPORT void* my_mono_jit_init_version(x64emu_t* emu, const char* domain_name, const char* runtime_version)
 {
+    rd_dl_install_native_fallback();
     if (rd_signal_override()) {
         my->mono_set_signal_chaining(1);
         my->mono_set_crash_chaining(0);
