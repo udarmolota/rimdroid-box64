@@ -173,7 +173,7 @@ static int reverse_icall_throw_iFi(int marker)
     return ret;
 }
 
-EXPORT void my_mono_raise_exception(x64emu_t* emu, void* exception)
+EXPORT void my_rdprobe_mono_raise_exception(x64emu_t* emu, void* exception)
 {
     if (rd_p4_bridge_enabled() && rd_p4_reverse_depth > 0 && rd_p4_set_pending_exception) {
         rd_p4_set_pending_exception(exception, 1);
@@ -385,7 +385,7 @@ static void rd_p5_configure_signal_chaining(void)
         set_signal_chaining, set_crash_chaining);
 }
 
-EXPORT void* my_mono_jit_init_version(x64emu_t* emu, const char* domain_name, const char* runtime_version)
+EXPORT void* my_rdprobe_mono_jit_init_version(x64emu_t* emu, const char* domain_name, const char* runtime_version)
 {
     rd_p5_configure_signal_chaining();
     void* domain = my->mono_jit_init_version((void*)domain_name, (void*)runtime_version);
@@ -401,7 +401,7 @@ EXPORT void* my_mono_jit_init_version(x64emu_t* emu, const char* domain_name, co
     return domain;
 }
 
-EXPORT void my_mono_jit_cleanup(x64emu_t* emu, void* domain)
+EXPORT void my_rdprobe_mono_jit_cleanup(x64emu_t* emu, void* domain)
 {
     (void)emu;
     if (rd_gc_guest_emu && rd_gc_call_with_alloc_lock)
@@ -410,7 +410,7 @@ EXPORT void my_mono_jit_cleanup(x64emu_t* emu, void* domain)
     my->mono_jit_cleanup(domain);
 }
 
-EXPORT void my_mono_add_internal_call(x64emu_t* emu, const char* name, void* method)
+EXPORT void my_rdprobe_mono_add_internal_call(x64emu_t* emu, const char* name, void* method)
 {
     (void)emu;
     void* host_method = select_reverse_icall(name, method);
@@ -425,6 +425,10 @@ EXPORT void my_mono_add_internal_call(x64emu_t* emu, const char* name, void* met
  * so the probe asks for this synthetic name and explicitly supplies the native
  * library through RIMDROID_NATIVE_MONO_PATH.
  */
+// The libmonobdwgc wrapper defines the my_mono_* versions of these functions; the probe's live
+// under their own prefix.
+#define ALTMY my_rdprobe_
+
 #ifndef STATICBUILD
 #define PRE_INIT \
     if (1) { \
