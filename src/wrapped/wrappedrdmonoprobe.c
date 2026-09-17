@@ -184,6 +184,25 @@ EXPORT void my_mono_raise_exception(x64emu_t* emu, void* exception)
     my->mono_raise_exception(exception);
 }
 
+/* Transition cost benchmark thunks: dedicated slots with no logging on the hot path. */
+static uintptr_t reverse_icall_bench_iFi_fct;
+static int reverse_icall_bench_iFi(int value)
+{
+    return (int)RunFunctionFmt(reverse_icall_bench_iFi_fct, "i", value);
+}
+
+static uintptr_t reverse_icall_now_IFv_fct;
+static int64_t reverse_icall_now_IFv(void)
+{
+    return (int64_t)RunFunctionFmt(reverse_icall_now_IFv_fct, "");
+}
+
+static uintptr_t reverse_icall_report_vFIIi_fct;
+static void reverse_icall_report_vFIIi(int64_t reverse_icall_ns, int64_t managed_call_ns, int calls)
+{
+    RunFunctionFmt(reverse_icall_report_vFIIi_fct, "IIi", reverse_icall_ns, managed_call_ns, calls);
+}
+
 static void* select_reverse_icall(const char* name, void* method)
 {
     void* native = GetNativeFnc((uintptr_t)method);
@@ -232,6 +251,18 @@ static void* select_reverse_icall(const char* name, void* method)
     if (strstr(name, "::NativeInstallGuestRoot")) {
         reverse_icall_vFv_fct[0] = (uintptr_t)method;
         return reverse_icall_vFv_0;
+    }
+    if (strstr(name, "::NativeBenchIdentity")) {
+        reverse_icall_bench_iFi_fct = (uintptr_t)method;
+        return reverse_icall_bench_iFi;
+    }
+    if (strstr(name, "::NativeNowNs")) {
+        reverse_icall_now_IFv_fct = (uintptr_t)method;
+        return reverse_icall_now_IFv;
+    }
+    if (strstr(name, "::NativeReportBench")) {
+        reverse_icall_report_vFIIi_fct = (uintptr_t)method;
+        return reverse_icall_report_vFIIi;
     }
     if (strstr(name, "::NativeThrowFromGuest")) {
         reverse_icall_throw_iFi_fct = (uintptr_t)method;
