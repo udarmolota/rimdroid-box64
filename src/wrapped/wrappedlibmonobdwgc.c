@@ -13,6 +13,7 @@
  *   - SIGSEGV shared between Mono and Box64: signal chaining forced on, crash chaining off (P5)
  */
 #include <dlfcn.h>
+#include <errno.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -402,11 +403,57 @@ static void* rd_dl_fallback_load(const char* name, int flags, char** err, void* 
     return handle;
 }
 
+/*
+ * Harmony (MonoMod) refuses to run on Android: its PlatformDetection reports OSKind.Android when both
+ * /data and /system/build.prop exist, and PlatformTriple throws NotImplementedException for that OS.
+ * Box64 already hides this one path from the emulated world (wrappedlibc.c), so under the x86 Mono
+ * MonoMod sees plain Linux. Native Mono reaches the file system through libmono-native instead, so the
+ * same path is hidden in the two stat entry points File.Exists goes through. Every P/Invoke symbol of
+ * a library loaded by this fallback is resolved by rd_dl_fallback_symbol, which is where they are
+ * swapped. MonoMod then picks Linux + Arm64, which Harmony 2.4 and later support.
+ */
+static int (*rd_real_stat2)(const char*, void*);
+static int (*rd_real_lstat2)(const char*, void*);
+
+static int rd_path_is_hidden(const char* path)
+{
+    return path && !strcmp(path, "/system/build.prop");
+}
+
+static int rd_SystemNative_Stat2(const char* path, void* output)
+{
+    if (rd_path_is_hidden(path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    return rd_real_stat2(path, output);
+}
+
+static int rd_SystemNative_LStat2(const char* path, void* output)
+{
+    if (rd_path_is_hidden(path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    return rd_real_lstat2(path, output);
+}
+
 static void* rd_dl_fallback_symbol(void* handle, const char* name, char** err, void* user_data)
 {
     (void)user_data;
     if (err) *err = NULL;
-    return dlsym(handle, name);
+    void* symbol = dlsym(handle, name);
+    if (symbol && name) {
+        if (!strcmp(name, "SystemNative_Stat2")) {
+            rd_real_stat2 = symbol;
+            return rd_SystemNative_Stat2;
+        }
+        if (!strcmp(name, "SystemNative_LStat2")) {
+            rd_real_lstat2 = symbol;
+            return rd_SystemNative_LStat2;
+        }
+    }
+    return symbol;
 }
 
 static void* rd_dl_fallback_close(void* handle, void* user_data)
