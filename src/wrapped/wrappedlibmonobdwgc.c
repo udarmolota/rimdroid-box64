@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #include "wrappedlibs.h"
@@ -590,6 +591,68 @@ static void* rd_dl_try(const char* file)
     return handle;
 }
 
+/*
+ * glibc system libraries. Managed code written for desktop Linux P/Invokes "libc" (etc/mono/config maps it
+ * to libc.so.6) and friends; under the x86 Mono Box64 answered with its wrapped glibc. Android has none of
+ * these sonames: hand out the bionic library instead. Harmony depends on it: MonoMod detects the OS and
+ * CPU with uname() and allocates its detour memory with mmap/mprotect/sysconf from "libc"; without it
+ * PlatformDetection fails and every patch throws NotImplementedException.
+ * The few symbols whose glibc ABI differs from bionic are translated in rd_dl_fallback_symbol.
+ */
+static void* rd_glibc_libc_handle;
+
+static void* rd_dl_try_glibc(const char* base)
+{
+    static const struct { const char* glibc; const char* bionic; } map[] = {
+        { "libc", "libc.so" }, { "libc.so", "libc.so" }, { "libc.so.6", "libc.so" },
+        { "libpthread.so.0", "libc.so" }, { "librt.so.1", "libc.so" },
+        { "libdl", "libdl.so" }, { "libdl.so.2", "libdl.so" },
+        { "libm", "libm.so" }, { "libm.so.6", "libm.so" },
+    };
+    for (size_t i = 0; i < sizeof(map) / sizeof(map[0]); ++i) {
+        if (strcmp(base, map[i].glibc))
+            continue;
+        void* handle = dlopen(map[i].bionic, RTLD_NOW | RTLD_LOCAL);
+        printf_log(LOG_NONE, "[RD-MONO] native library %s -> Android %s%s%s\n", base, map[i].bionic,
+            handle ? "" : " FAILED: ", handle ? "" : dlerror());
+        if (handle && !strcmp(map[i].bionic, "libc.so"))
+            rd_glibc_libc_handle = handle;
+        return handle;
+    }
+    return NULL;
+}
+
+/* glibc's errno accessor; bionic calls it __errno. */
+static int* rd_glibc_errno_location(void)
+{
+    return &errno;
+}
+
+/* glibc numbers sysconf names differently from bionic; translate the ones desktop code asks for. */
+static long rd_glibc_sysconf(int name)
+{
+    switch (name) {
+        case 0: return sysconf(_SC_ARG_MAX);
+        case 2: return sysconf(_SC_CLK_TCK);
+        case 4: return sysconf(_SC_OPEN_MAX);
+        case 30: return sysconf(_SC_PAGESIZE);
+        case 31: return sysconf(_SC_RTSIG_MAX);
+        case 83: return sysconf(_SC_NPROCESSORS_CONF);
+        case 84: return sysconf(_SC_NPROCESSORS_ONLN);
+        case 85: return sysconf(_SC_PHYS_PAGES);
+        case 86: return sysconf(_SC_AVPHYS_PAGES);
+    }
+    printf_log(LOG_NONE, "[RD-MONO] libc sysconf(%d): glibc name not translated, returning -1\n", name);
+    errno = EINVAL;
+    return -1;
+}
+
+/* MonoMod declares the offset as a 32-bit int; make sure the upper half of the 64-bit off_t is clean. */
+static void* rd_glibc_mmap(void* addr, size_t length, int prot, int flags, int fd, int offset)
+{
+    return mmap(addr, length, prot, flags, fd, (off_t)offset);
+}
+
 static void* rd_dl_fallback_load(const char* name, int flags, char** err, void* user_data)
 {
     (void)flags; (void)user_data;
@@ -607,6 +670,8 @@ static void* rd_dl_fallback_load(const char* name, int flags, char** err, void* 
         snprintf(file, sizeof(file), "%s%s.so", strncmp(base, "lib", 3) ? "lib" : "", base);
         handle = rd_dl_try(file);
     }
+    if (!handle)
+        handle = rd_dl_try_glibc(base);
     return handle;
 }
 
@@ -624,7 +689,14 @@ static int (*rd_real_lstat2)(const char*, void*);
 
 static int rd_path_is_hidden(const char* path)
 {
-    return path && !strcmp(path, "/system/build.prop");
+    static int reported;
+    if (!path || strcmp(path, "/system/build.prop"))
+        return 0;
+    if (!reported) {
+        reported = 1;
+        printf_log(LOG_NONE, "[RD-MONO] hiding /system/build.prop from managed code (MonoMod platform detection)\n");
+    }
+    return 1;
 }
 
 static int rd_SystemNative_Stat2(const char* path, void* output)
@@ -649,6 +721,19 @@ static void* rd_dl_fallback_symbol(void* handle, const char* name, char** err, v
 {
     (void)user_data;
     if (err) *err = NULL;
+    if (handle && handle == rd_glibc_libc_handle && name) {
+        void* translated = NULL;
+        if (!strcmp(name, "__errno_location"))
+            translated = (void*)rd_glibc_errno_location;
+        else if (!strcmp(name, "sysconf"))
+            translated = (void*)rd_glibc_sysconf;
+        else if (!strcmp(name, "mmap"))
+            translated = (void*)rd_glibc_mmap;
+        void* plain = translated ? NULL : dlsym(handle, name);
+        printf_log(LOG_NONE, "[RD-MONO] libc symbol %s -> %s\n", name,
+            translated ? "glibc ABI shim" : (plain ? "bionic" : "MISSING"));
+        return translated ? translated : plain;
+    }
     void* symbol = dlsym(handle, name);
     if (symbol && name) {
         if (!strcmp(name, "SystemNative_Stat2")) {
