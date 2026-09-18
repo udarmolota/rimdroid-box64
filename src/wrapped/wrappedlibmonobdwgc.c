@@ -76,8 +76,24 @@ static __thread x64emu_t* rd_gc_registered_emu;
 
 extern void (*rd_emu_destroy_hook)(x64emu_t* emu);
 
+/*
+ * Statistics (RIMDROID_MONO_STATS=1), see rd_stats_report() below. Off: one predictable branch per
+ * internal call. Time comes straight from the virtual counter (a few nanoseconds per read, no syscall);
+ * single calls are shorter than a counter tick, only the sums are meaningful.
+ */
+static int rd_stats_on;
+static uint64_t rd_st_gc_hook_ticks;
+
+static inline uint64_t rd_ticks(void)
+{
+    uint64_t value;
+    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(value));
+    return value;
+}
+
 static void rd_gc_push_guest_roots(void)
 {
+    uint64_t stats_t0 = rd_stats_on ? rd_ticks() : 0;
     if (rd_gc_prev_push_other_roots)
         rd_gc_prev_push_other_roots();
     unsigned long bytes = 0;
@@ -94,6 +110,8 @@ static void rd_gc_push_guest_roots(void)
     }
     rd_gc_bytes_last = bytes;
     rd_gc_collections++;
+    if (rd_stats_on)
+        rd_st_gc_hook_ticks += rd_ticks() - stats_t0;
 }
 
 static void* rd_gc_add_locked(void* arg)
@@ -195,12 +213,18 @@ static int (*rd_set_pending_exception)(void*, int);
 typedef struct rd_icall_frame_s {
     x64emu_t* emu;
     uint64_t r12, r13, r14, r15;
+    uint64_t stats_t0;
     int outer_raised;
+    int index;
 } rd_icall_frame_t;
 
-static inline void rd_icall_enter(rd_icall_frame_t* frame)
+static void rd_stats_icall(rd_icall_frame_t* frame, int outermost);
+
+static inline void rd_icall_enter(rd_icall_frame_t* frame, int index)
 {
     x64emu_t* emu = thread_get_emu();
+    frame->index = index;
+    frame->stats_t0 = rd_stats_on ? rd_ticks() : 0;
     frame->emu = emu;
     frame->r12 = emu->regs[_R12].q[0];
     frame->r13 = emu->regs[_R13].q[0];
@@ -225,6 +249,8 @@ static inline int rd_icall_leave(rd_icall_frame_t* frame)
         emu->regs[_R15].q[0] = frame->r15;
     }
     rd_icall_raised = frame->outer_raised;
+    if (rd_stats_on)
+        rd_stats_icall(frame, rd_icall_depth == 0);
     return raised;
 }
 
@@ -245,6 +271,185 @@ static int rd_defer_exception(x64emu_t* emu, void* exception)
 }
 
 #include "wrappedlibmonobdwgc_icalls.h"
+
+/*
+ * RIMDROID_MONO_STATS=1: where does a frame go?
+ *
+ * Every 2 s the main thread prints one line to the box64 log: internal calls per second and per frame,
+ * the time spent inside them (bridge + the x86 callee), the time inside mono_runtime_invoke (all managed
+ * code the engine runs on the main thread, internal calls included), collections, the GC's own total time,
+ * the time of our root hook and the heap size. Every 10 s it adds the internal calls that were called most
+ * and that cost most in that window, which is the list to optimize or to answer without crossing at all.
+ * Per-call arrays are updated without locks: the main thread makes nearly all calls and a lost update from
+ * a job thread does not matter to a profile. Nested calls are inclusive.
+ */
+#define RD_ST_TOP 15
+static uint32_t rd_st_hits[RD_MONO_ICALL_COUNT];
+static uint32_t rd_st_hits_prev[RD_MONO_ICALL_COUNT];
+static uint64_t rd_st_call_ticks[RD_MONO_ICALL_COUNT];
+static uint64_t rd_st_call_ticks_prev[RD_MONO_ICALL_COUNT];
+static __thread int rd_st_is_main;
+static __thread int rd_st_invoke_depth;
+static uint64_t rd_st_calls_main, rd_st_ticks_main;
+static uint64_t rd_st_calls_other, rd_st_ticks_other;
+static uint64_t rd_st_invokes, rd_st_invoke_ticks;
+static uint64_t rd_st_freq, rd_st_last_report, rd_st_reports;
+/* Presented-frame counter of the RimDroid app (rimdroid.c), resolved like rimdroid_frame_tick in wrappedsdl2.c. */
+extern __attribute__((weak)) volatile uint64_t g_rimdroid_frame_count;
+static volatile uint64_t* rd_st_frame_count;
+static unsigned long (*rd_st_gc_no)(void);
+static size_t (*rd_st_gc_heap_size)(void);
+static unsigned long (*rd_st_gc_total_ms)(void);
+static struct {
+    uint64_t calls_main, ticks_main, calls_other, ticks_other, invokes, invoke_ticks, gc_hook_ticks, frames;
+    unsigned long gc_no, gc_ms;
+} rd_st_prev;
+
+static double rd_st_ms(uint64_t ticks)
+{
+    return rd_st_freq ? (double)ticks * 1000.0 / (double)rd_st_freq : 0.0;
+}
+
+static void rd_stats_top(const char* title, int by_ticks, double seconds)
+{
+    int top[RD_ST_TOP];
+    uint64_t key[RD_ST_TOP];
+    int used = 0;
+    for (int i = 0; i < RD_MONO_ICALL_COUNT; ++i) {
+        uint64_t k = by_ticks ? rd_st_call_ticks[i] - rd_st_call_ticks_prev[i]
+                              : (uint64_t)(rd_st_hits[i] - rd_st_hits_prev[i]);
+        if (!k)
+            continue;
+        int pos = used;
+        while (pos > 0 && key[pos - 1] < k)
+            --pos;
+        if (pos >= RD_ST_TOP)
+            continue;
+        int last = used < RD_ST_TOP ? used : RD_ST_TOP - 1;
+        for (int j = last; j > pos; --j) {
+            key[j] = key[j - 1];
+            top[j] = top[j - 1];
+        }
+        key[pos] = k;
+        top[pos] = i;
+        if (used < RD_ST_TOP)
+            ++used;
+    }
+    printf_log(LOG_NONE, "[RD-MONO-STATS] top %s, last %.0f s:\n", title, seconds);
+    for (int j = 0; j < used; ++j) {
+        int i = top[j];
+        uint32_t hits = rd_st_hits[i] - rd_st_hits_prev[i];
+        double ms = rd_st_ms(rd_st_call_ticks[i] - rd_st_call_ticks_prev[i]);
+        printf_log(LOG_NONE, "[RD-MONO-STATS]   %9u calls %9.1f ms %7.0f ns/call  %s (%s)\n",
+            hits, ms, hits ? ms * 1e6 / hits : 0.0, rd_mono_icalls[i].name, rd_mono_icalls[i].abi);
+    }
+}
+
+static void rd_stats_report(uint64_t now)
+{
+    double seconds = (double)(now - rd_st_last_report) / (double)rd_st_freq;
+    rd_st_last_report = now;
+    uint64_t frames_now = rd_st_frame_count ? *rd_st_frame_count : 0;
+    unsigned long gc_no = rd_st_gc_no ? rd_st_gc_no() : 0;
+    unsigned long gc_ms = rd_st_gc_total_ms ? rd_st_gc_total_ms() : 0;
+    uint64_t calls_main = rd_st_calls_main - rd_st_prev.calls_main;
+    uint64_t calls_other = rd_st_calls_other - rd_st_prev.calls_other;
+    uint64_t frames = frames_now - rd_st_prev.frames;
+    uint64_t invokes = rd_st_invokes - rd_st_prev.invokes;
+    double icall_ms = rd_st_ms(rd_st_ticks_main - rd_st_prev.ticks_main);
+    double other_ms = rd_st_ms(rd_st_ticks_other - rd_st_prev.ticks_other);
+    double invoke_ms = rd_st_ms(rd_st_invoke_ticks - rd_st_prev.invoke_ticks);
+    double hook_ms = rd_st_ms(rd_st_gc_hook_ticks - rd_st_prev.gc_hook_ticks);
+    double per_frame = frames ? 1.0 / (double)frames : 0.0;
+    printf_log(LOG_NONE, "[RD-MONO-STATS] %.1fs fps=%.0f | icalls main %.0f/s (%.0f/frame) other %.0f/s | "
+        "in icalls main %.1f ms/s (%.2f ms/frame, %.0f ns/call) other %.1f ms/s | "
+        "managed+icalls (runtime_invoke) %.1f ms/s (%.2f ms/frame, %.0f/s) | "
+        "gc %lu, gc total %lu ms, root hook %.2f ms, heap %lu MB\n",
+        seconds, frames / seconds,
+        calls_main / seconds, calls_main * per_frame, calls_other / seconds,
+        icall_ms / seconds, icall_ms * per_frame, calls_main ? icall_ms * 1e6 / calls_main : 0.0, other_ms / seconds,
+        invoke_ms / seconds, invoke_ms * per_frame, invokes / seconds,
+        gc_no - rd_st_prev.gc_no, gc_ms - rd_st_prev.gc_ms, hook_ms,
+        rd_st_gc_heap_size ? (unsigned long)(rd_st_gc_heap_size() >> 20) : 0UL);
+    rd_st_prev.calls_main = rd_st_calls_main;
+    rd_st_prev.ticks_main = rd_st_ticks_main;
+    rd_st_prev.calls_other = rd_st_calls_other;
+    rd_st_prev.ticks_other = rd_st_ticks_other;
+    rd_st_prev.invokes = rd_st_invokes;
+    rd_st_prev.invoke_ticks = rd_st_invoke_ticks;
+    rd_st_prev.gc_hook_ticks = rd_st_gc_hook_ticks;
+    rd_st_prev.frames = frames_now;
+    rd_st_prev.gc_no = gc_no;
+    rd_st_prev.gc_ms = gc_ms;
+    if (++rd_st_reports % 5 == 0) {
+        rd_stats_top("by time", 1, seconds * 5);
+        rd_stats_top("by calls", 0, seconds * 5);
+        memcpy(rd_st_hits_prev, rd_st_hits, sizeof(rd_st_hits));
+        memcpy(rd_st_call_ticks_prev, rd_st_call_ticks, sizeof(rd_st_call_ticks));
+    }
+}
+
+static void rd_stats_icall(rd_icall_frame_t* frame, int outermost)
+{
+    uint64_t now = rd_ticks();
+    uint64_t spent = now - frame->stats_t0;
+    rd_st_hits[frame->index]++;
+    rd_st_call_ticks[frame->index] += spent;
+    if (!rd_st_is_main) {
+        __atomic_fetch_add(&rd_st_calls_other, 1, __ATOMIC_RELAXED);
+        if (outermost)
+            __atomic_fetch_add(&rd_st_ticks_other, spent, __ATOMIC_RELAXED);
+        return;
+    }
+    rd_st_calls_main++;
+    if (!outermost)
+        return;
+    rd_st_ticks_main += spent;
+    if ((rd_st_calls_main & 0x3ff) == 0 && now - rd_st_last_report >= 2 * rd_st_freq)
+        rd_stats_report(now);
+}
+
+/* The thread that initializes Mono is Unity's main thread. */
+static void rd_stats_init(void)
+{
+    const char* on = getenv("RIMDROID_MONO_STATS");
+    if (!on || on[0] != '1')
+        return;
+    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(rd_st_freq));
+    if (!rd_st_freq)
+        return;
+    rd_st_gc_no = rd_native_sym("GC_get_gc_no");
+    rd_st_gc_heap_size = rd_native_sym("GC_get_heap_size");
+    rd_st_gc_total_ms = rd_native_sym("GC_get_full_gc_total_time");
+    void (*start_measurement)(void) = rd_native_sym("GC_start_performance_measurement");
+    if (start_measurement)
+        start_measurement();
+    rd_st_frame_count = &g_rimdroid_frame_count;
+    rd_st_is_main = 1;
+    rd_st_last_report = rd_ticks();
+    rd_stats_on = 1;
+    printf_log(LOG_NONE, "[RD-MONO-STATS] on: counter %lu Hz, frame counter %s, %d internal call thunks\n",
+        (unsigned long)rd_st_freq, rd_st_frame_count ? "found" : "NOT found (per-frame values stay 0)",
+        RD_MONO_ICALL_COUNT);
+}
+
+/* Time inside the outermost mono_runtime_invoke on the main thread = managed code plus its internal calls. */
+static inline uint64_t rd_stats_invoke_enter(void)
+{
+    if (!rd_stats_on || !rd_st_is_main || rd_st_invoke_depth++ > 0)
+        return 0;
+    return rd_ticks();
+}
+
+static inline void rd_stats_invoke_leave(uint64_t t0)
+{
+    if (!rd_stats_on || !rd_st_is_main)
+        return;
+    if (--rd_st_invoke_depth > 0 || !t0)
+        return;
+    rd_st_invokes++;
+    rd_st_invoke_ticks += rd_ticks() - t0;
+}
 
 static unsigned long rd_icall_bound;
 static unsigned long rd_icall_missing;
@@ -293,10 +498,12 @@ static void* rd_finish_invoke(x64emu_t* emu, void* ret, void* exception)
 
 EXPORT void* my_mono_runtime_invoke(x64emu_t* emu, void* method, void* obj, void* params, void** exc)
 {
-    if (exc)
-        return my->mono_runtime_invoke(method, obj, params, exc);
+    uint64_t stats_t0 = rd_stats_invoke_enter();
     void* exception = NULL;
-    void* ret = my->mono_runtime_invoke(method, obj, params, &exception);
+    void* ret = my->mono_runtime_invoke(method, obj, params, exc ? exc : &exception);
+    rd_stats_invoke_leave(stats_t0);
+    if (exc)
+        return ret;
     return rd_finish_invoke(emu, ret, exception);
 }
 
@@ -494,6 +701,7 @@ EXPORT void* my_mono_jit_init_version(x64emu_t* emu, const char* domain_name, co
         if (!rd_set_pending_exception)
             printf_log(LOG_NONE, "[RD-MONO] mono_runtime_set_pending_exception missing: exceptions from x86 internal calls will corrupt the guest\n");
         rd_gc_install(emu);
+        rd_stats_init();
     }
     printf_log(LOG_NONE, "[RD-MONO] mono_jit_init_version -> domain %p\n", domain);
     return domain;
