@@ -296,14 +296,23 @@ int AllocLoadElfMemory(box64context_t* context, elfheader_t* head, int mainbin)
             InternalMunmap(raw, sz);
             image = raw = InternalMmap((void*)head->vaddr, sz, 0,
                 MAP_ANONYMOUS|MAP_PRIVATE|MAP_NORESERVE|MAP_FIXED_NOREPLACE, -1, 0);
-            if(image==MAP_FAILED && rd_range_is_reserved(head->vaddr, head->vaddr+sz)) {
+            // MAP_FIXED_NOREPLACE only exists since Linux 4.17. Older kernels do not know the
+            // flag and silently downgrade it to a plain hint, so a busy address hands back a
+            // DIFFERENT mapping instead of failing with EEXIST — and the launcher's own PROT_NONE
+            // placeholder is precisely what makes this address busy. Seen on a Xiaomi M2103K19PG
+            // (Dimensity 700, Android 13), where the game then ran relocated and faulted on its very
+            // first instruction; PriDroid hit the same on an Exynos 9825 (kernel 4.14). So "landed
+            // somewhere else" must be handled exactly like "failed": in both cases the range we need
+            // is still ours to take. Same fix as in pridroid-box64.
+            if(image!=(void*)head->vaddr && rd_range_is_reserved(head->vaddr, head->vaddr+sz)) {
                 // Our own placeholder is in the way — take it over.
+                if(image!=MAP_FAILED) InternalMunmap(raw, sz);
                 image = raw = InternalMmap((void*)head->vaddr, sz, 0,
                     MAP_ANONYMOUS|MAP_PRIVATE|MAP_NORESERVE|MAP_FIXED, -1, 0);
                 printf_log(LOG_NONE, "Warning: elf \"%s\" @%p taken from the launcher-reserved range (%s)\n",
-                    head->name, (void*)head->vaddr, (image==MAP_FAILED)?"failed":"ok");
+                    head->name, (void*)head->vaddr, (image==(void*)head->vaddr)?"ok":"failed");
             }
-            if(image==MAP_FAILED) {
+            if(image==MAP_FAILED || image!=(void*)head->vaddr) {
                 printf_log(LOG_NONE, "Error: fixed-address (non-PIE) elf \"%s\" requires @%p, kernel refused it: error=%d/%s (range already in use)\n",
                     head->name, (void*)head->vaddr, errno, strerror(errno));
                 rd_log_maps_overlapping((uintptr_t)head->vaddr, (uintptr_t)head->vaddr+sz);
